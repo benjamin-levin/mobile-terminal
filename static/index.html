@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
+    <title>Mobile Terminal</title>
+    <link rel="stylesheet" href="/vendor/@xterm/xterm/css/xterm.css">
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="topbar-row">
+          <div id="tabsScroller" class="top-tabs-shell">
+            <div id="tabsStrip" class="tabs-strip top-tabs"></div>
+          </div>
+          <button id="openSessionButton" class="action-button compact-button" type="button">O</button>
+          <button id="newTabButton" class="action-button compact-button" type="button">+</button>
+          <div class="topbar-actions">
+            <button id="settingsButton" class="ghost-button compact-button" type="button">Settings</button>
+          </div>
+        </div>
+      </header>
+
+      <main class="terminal-stage">
+        <section class="terminal-panel">
+          <div id="terminal"></div>
+        </section>
+      </main>
+
+      <footer id="shortcutsPanel" class="shortcuts-panel">
+        <div id="composerPanel" class="composer-panel hidden">
+          <textarea
+            id="composerInput"
+            class="composer-input"
+            inputmode="text"
+            autocapitalize="off"
+            autocomplete="off"
+            autocorrect="on"
+            spellcheck="false"
+            rows="1"
+            placeholder="Type here, then press Enter"
+          ></textarea>
+        </div>
+        <div id="shortcutBar" class="shortcut-bar"></div>
+      </footer>
+    </div>
+
+    <div id="tabMenu" class="tab-menu hidden">
+      <button id="renameTabButton" class="tab-menu-button" type="button">Rename Tab</button>
+      <button id="detachOthersButton" class="tab-menu-button" type="button">Detach Others</button>
+      <button id="closeTabButton" class="tab-menu-button" type="button">Close Tab</button>
+      <button id="killSessionButton" class="tab-menu-button" type="button">Kill Session</button>
+    </div>
+
+    <div id="sessionMenu" class="tab-menu hidden"></div>
+
+    <div id="settingsMenu" class="tab-menu hidden">
+      <button id="displayButton" class="tab-menu-button" type="button">Display</button>
+      <button id="editShortcutsButton" class="tab-menu-button" type="button">Shortcuts</button>
+    </div>
+
+    <div id="loginOverlay" class="overlay hidden">
+      <form id="loginForm" class="sheet" autocomplete="off">
+        <p class="eyebrow">Secure access</p>
+        <h2>Connect to this computer</h2>
+        <p class="helper-text">Enter the access token printed by `server.py` on this machine.</p>
+        <label class="field-label" for="tokenInput">Access token</label>
+        <input id="tokenInput" name="token" class="text-input" type="password" inputmode="text">
+        <button class="primary-button" type="submit">Connect</button>
+        <p id="loginMessage" class="helper-text helper-error"></p>
+      </form>
+    </div>
+
+    <div id="editorOverlay" class="overlay hidden">
+      <div class="sheet editor-sheet">
+        <div class="editor-header">
+          <div>
+            <p class="eyebrow">Shortcut editor</p>
+            <h2>Mobile shortcut buttons</h2>
+          </div>
+          <button id="closeEditorButton" class="ghost-button" type="button">Done</button>
+        </div>
+        <p class="helper-text">Use sequences like <code>{PASTE}</code>, <code>{CTRL+C}</code>, <code>{CTRL+X}{TAB}</code>, <code>{UP}</code>, or <code>{TEXT:git status}{ENTER}</code>.</p>
+        <div id="shortcutEditorList" class="shortcut-editor-list"></div>
+        <div class="editor-actions">
+          <button id="addShortcutButton" class="action-button" type="button">Add Shortcut</button>
+          <button id="saveShortcutsButton" class="primary-button" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="displayOverlay" class="overlay hidden">
+      <div class="sheet display-sheet">
+        <div class="editor-header">
+          <div>
+            <p class="eyebrow">Display settings</p>
+            <h2>Scale and text size</h2>
+          </div>
+          <button id="closeDisplayButton" class="ghost-button" type="button">Done</button>
+        </div>
+        <div class="display-control">
+          <div class="display-label-row">
+            <label class="field-label" for="uiScaleInput">UI size</label>
+            <output id="uiScaleValue" class="value-chip">100%</output>
+          </div>
+          <input id="uiScaleInput" class="range-input display-range-input" type="range" min="0.5" max="1.4" step="0.05" value="1">
+          <p class="helper-text">Changes button, panel, label, and spacing scale.</p>
+        </div>
+        <div class="display-control">
+          <div class="display-label-row">
+            <label class="field-label" for="terminalFontInput">Terminal text</label>
+            <output id="terminalFontValue" class="value-chip">15px</output>
+          </div>
+          <input id="terminalFontInput" class="range-input display-range-input" type="range" min="5" max="24" step="1" value="15">
+          <p class="helper-text">Changes the terminal character size without changing the rest of the UI.</p>
+        </div>
+        <div id="displayPreview" class="display-preview">
+          <div id="displayUiPreview" class="display-preview-ui">
+            <span class="display-preview-chip">UI Preview</span>
+            <button class="display-preview-button" type="button">Sample Button</button>
+          </div>
+          <pre id="displayTerminalPreview" class="display-preview-terminal">$ ls
+Desktop  Downloads  mobile-terminal</pre>
+        </div>
+        <div class="editor-actions">
+          <button id="resetDisplayButton" class="action-button" type="button">Reset</button>
+          <button id="saveDisplayButton" class="primary-button" type="button">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/vendor/@xterm/xterm/lib/xterm.js"></script>
+    <script src="/vendor/@xterm/addon-fit/lib/addon-fit.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
