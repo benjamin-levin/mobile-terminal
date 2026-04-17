@@ -519,13 +519,22 @@
     sendMessage({ type: "composer-history", direction });
   }
 
+  function shortcutHistoryDirection(sequence) {
+    const upper = sequence.trim().toUpperCase();
+    if (upper === "{UP}") {
+      return "up";
+    }
+    if (upper === "{DOWN}") {
+      return "down";
+    }
+    return "";
+  }
+
   function shortcutShouldFlushComposer(sequence) {
     const upper = sequence.toUpperCase();
     return (
       upper.includes("{TAB}") ||
       upper.includes("{ENTER}") ||
-      upper.includes("{UP}") ||
-      upper.includes("{DOWN}") ||
       upper.includes("{LEFT}") ||
       upper.includes("{RIGHT}") ||
       upper.includes("{HOME}") ||
@@ -1020,6 +1029,14 @@
         if (mobileComposerMode && normalizedSequence === "{ENTER}") {
           sendMessage({ type: "composer-enter" });
           clearComposer(false);
+          if (preserveComposerFocus) {
+            window.requestAnimationFrame(() => openComposer(true));
+          }
+          return;
+        }
+        const historyDirection = mobileComposerMode ? shortcutHistoryDirection(shortcut.sequence) : "";
+        if (historyDirection) {
+          navigateComposerHistory(historyDirection);
           if (preserveComposerFocus) {
             window.requestAnimationFrame(() => openComposer(true));
           }

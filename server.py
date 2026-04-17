@@ -28,8 +28,11 @@ NODE_MODULES_ROOT = ROOT / "node_modules"
 WS_PATH = "/_ws"
 SETTINGS_PATH = ROOT / "mobile-terminal-settings.json"
 MOBILE_COMPOSER_HISTORY_LIMIT = 200
+COMPOSER_CAPTURE_CONTEXT_ROWS = 12
 LEFT_ARROW = "\u001b[D"
 RIGHT_ARROW = "\u001b[C"
+UP_ARROW = "\u001b[A"
+DOWN_ARROW = "\u001b[B"
 
 
 def tmux_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -374,6 +377,17 @@ def build_composer_sync_sequence(
     return sequence, target_cursor
 
 
+def unique_non_empty(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique_values: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        unique_values.append(value)
+    return unique_values
+
+
 def load_settings() -> dict[str, Any]:
     if not SETTINGS_PATH.is_file():
         return default_settings()
@@ -663,7 +677,7 @@ class AppServer:
             tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
         bridge.write("\r")
 
-    def navigate_mobile_composer_history(
+    def fallback_mobile_composer_history(
         self,
         bridge: TmuxBridge,
         session_name: str,
@@ -702,6 +716,91 @@ class AppServer:
         next_state["historyIndex"] = history_index
         return next_state
 
+    def capture_visible_mobile_composer_text(self, session_name: str) -> str | None:
+        state = self.mobile_composer_state(session_name)
+        candidates = unique_non_empty(
+            [
+                state["draft"],
+                state["pendingDraft"],
+                *reversed(state["history"][-MOBILE_COMPOSER_HISTORY_LIMIT:]),
+            ]
+        )
+        if not candidates:
+            return None
+
+        cursor_result = tmux_capture(
+            "display-message",
+            "-p",
+            "-t",
+            session_name,
+            "#{cursor_y}\t#{pane_height}",
+            check=False,
+        )
+        capture_result = tmux_capture(
+            "capture-pane",
+            "-p",
+            "-N",
+            "-t",
+            session_name,
+            check=False,
+        )
+        if cursor_result.returncode != 0 or capture_result.returncode != 0:
+            return None
+
+        try:
+            cursor_y_raw, _pane_height_raw = cursor_result.stdout.strip().split("\t", 1)
+            cursor_y = max(0, int(cursor_y_raw))
+        except (TypeError, ValueError):
+            return None
+
+        rows = capture_result.stdout.replace("\r", "").split("\n")
+        if rows and rows[-1] == "":
+            rows.pop()
+        if not rows:
+            return None
+
+        clamped_cursor_y = min(cursor_y, len(rows) - 1)
+        context_end = clamped_cursor_y + 1
+        context_start = max(0, context_end - COMPOSER_CAPTURE_CONTEXT_ROWS)
+        context_text = "".join(rows[context_start:context_end])
+        if not context_text:
+            return None
+
+        best_match = ""
+        for candidate in candidates:
+            if candidate in context_text and len(candidate) > len(best_match):
+                best_match = candidate
+        return best_match or None
+
+    async def navigate_mobile_composer_history(
+        self,
+        bridge: TmuxBridge,
+        session_name: str,
+        direction: str,
+    ) -> dict[str, Any] | None:
+        arrow = {"up": UP_ARROW, "down": DOWN_ARROW}.get(direction)
+        if not arrow:
+            return None
+
+        if pane_in_mode(session_name):
+            tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
+        bridge.write(arrow)
+
+        state = self.mobile_composer_state(session_name)
+        for delay in (0.03, 0.07, 0.12):
+            await asyncio.sleep(delay)
+            visible_text = self.capture_visible_mobile_composer_text(session_name)
+            if visible_text is None:
+                continue
+            state["draft"] = visible_text
+            state["cursor"] = len(visible_text)
+            state["tracked"] = True
+            state["pendingDraft"] = visible_text
+            state["historyIndex"] = None
+            return state
+
+        return self.fallback_mobile_composer_history(bridge, session_name, direction)
+
     async def handle_command(
         self,
         connection: ServerConnection,
@@ -726,7 +825,7 @@ class AppServer:
             return
 
         if message_type == "composer-history":
-            next_state = self.navigate_mobile_composer_history(
+            next_state = await self.navigate_mobile_composer_history(
                 bridge,
                 session_name,
                 str(payload.get("direction", "")).lower(),
