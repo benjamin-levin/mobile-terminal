@@ -681,7 +681,7 @@
         }
         touchScrollState.lastY = nextY;
         event.preventDefault();
-        scrollTerminalByPixels(deltaY);
+        scrollTerminalByPixels(-deltaY);
       },
       { passive: false },
     );
