@@ -146,6 +146,7 @@
   };
   let speechFlushTimer = null;
   const mobileComposerMode = window.matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
+  let suppressComposerSync = false;
 
   function loadNumericSetting(storageKey, fallback, min, max) {
     const raw = Number.parseFloat(localStorage.getItem(storageKey) || "");
@@ -426,8 +427,8 @@
       return;
     }
     composerInput.focus({ preventScroll: true });
-    const length = composerInput.value.length;
-    composerInput.setSelectionRange(length, length);
+    const cursor = composerInput.selectionEnd ?? composerInput.value.length;
+    composerInput.setSelectionRange(cursor, cursor);
   }
 
   function closeComposer() {
@@ -439,26 +440,54 @@
     composerPanel.classList.add("hidden");
   }
 
-  function clearComposer() {
+  function setComposerValue(value, cursor = null) {
     if (!mobileComposerMode) {
       return;
     }
-    composerInput.value = "";
+    const nextValue = String(value || "").replace(/\r?\n/g, "");
+    const numericCursor = Number.isFinite(Number(cursor)) ? Number(cursor) : nextValue.length;
+    const nextCursor = Math.max(0, Math.min(nextValue.length, numericCursor));
+    suppressComposerSync = true;
+    composerInput.value = nextValue;
+    autoSizeComposer();
+    try {
+      composerInput.setSelectionRange(nextCursor, nextCursor);
+    } catch (_error) {
+      // Ignore transient selection errors while the textarea is unfocused.
+    }
+    window.requestAnimationFrame(() => {
+      suppressComposerSync = false;
+    });
+  }
+
+  function syncComposerState() {
+    if (!mobileComposerMode || suppressComposerSync) {
+      return;
+    }
+    sendMessage({
+      type: "composer-sync",
+      value: composerInput.value,
+      cursor: composerInput.selectionEnd ?? composerInput.value.length,
+    });
+  }
+
+  function clearComposer(sync = false) {
+    if (!mobileComposerMode) {
+      return;
+    }
+    setComposerValue("", 0);
     composerInput.style.height = "";
     resetSpeechInputState();
+    if (sync) {
+      syncComposerState();
+    }
   }
 
   function flushComposerText() {
     if (!mobileComposerMode) {
       return "";
     }
-    const value = composerInput.value;
-    if (!value) {
-      return "";
-    }
-    sendMessage({ type: "input", data: value });
-    clearComposer();
-    return value;
+    return composerInput.value;
   }
 
   function commitComposerLine() {
@@ -466,9 +495,28 @@
       sendMessage({ type: "input", data: "\r" });
       return;
     }
-    flushComposerText();
-    sendMessage({ type: "input", data: "\r" });
+    sendMessage({ type: "composer-enter" });
+    clearComposer(false);
     openComposer(true);
+  }
+
+  function resetComposerTracking(clearValue = false) {
+    if (!mobileComposerMode) {
+      return;
+    }
+    sendMessage({ type: "composer-reset" });
+    if (clearValue) {
+      clearComposer(false);
+    }
+  }
+
+  function navigateComposerHistory(direction) {
+    if (!mobileComposerMode) {
+      sendMessage({ type: "input", data: direction === "down" ? specialMap.DOWN : specialMap.UP });
+      return;
+    }
+    openComposer(true);
+    sendMessage({ type: "composer-history", direction });
   }
 
   function shortcutShouldFlushComposer(sequence) {
@@ -522,7 +570,7 @@
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return;
     }
-    if (payload && payload.type === "input") {
+    if (payload && (payload.type === "input" || payload.type === "composer-sync" || payload.type === "composer-enter")) {
       followOutput = true;
     }
     socket.send(JSON.stringify(payload));
@@ -961,15 +1009,24 @@
         if (Date.now() < suppressShortcutClickUntil) {
           return;
         }
-        if (shortcut.sequence.trim().toUpperCase() === "{PASTE}") {
+        const normalizedSequence = shortcut.sequence.trim().toUpperCase();
+        if (normalizedSequence === "{PASTE}") {
           pasteFromClipboard();
           if (preserveComposerFocus) {
             window.requestAnimationFrame(() => openComposer(true));
           }
           return;
         }
+        if (mobileComposerMode && normalizedSequence === "{ENTER}") {
+          sendMessage({ type: "composer-enter" });
+          clearComposer(false);
+          if (preserveComposerFocus) {
+            window.requestAnimationFrame(() => openComposer(true));
+          }
+          return;
+        }
         if (mobileComposerMode && shortcutShouldFlushComposer(shortcut.sequence)) {
-          flushComposerText();
+          resetComposerTracking(true);
         }
         const sequence = expandShortcutSequence(shortcut.sequence);
         if (!sequence) {
@@ -1122,6 +1179,12 @@
     }
     if (payload.type === "notice") {
       showToast(payload.message);
+      return;
+    }
+    if (payload.type === "composer-state") {
+      if (mobileComposerMode) {
+        setComposerValue(payload.value || "", payload.cursor);
+      }
       return;
     }
     if (payload.type === "sessions") {
@@ -1310,7 +1373,7 @@
     syncOpenTabsToSessions();
     followOutput = true;
     resetSpeechInputState();
-    clearComposer();
+    resetComposerTracking(true);
     term.reset();
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
       reconnectForSessionSwitch = true;
@@ -1528,7 +1591,7 @@
     closeTabMenu();
     closeSessionMenu();
     closeSettingsMenu();
-    clearComposer();
+    resetComposerTracking(true);
     sendMessage({ type: "new-tab" });
   });
 
@@ -1604,21 +1667,44 @@
     window.setTimeout(scheduleLayoutRefresh, 60);
   });
   composerInput.addEventListener("input", () => {
+    const value = composerInput.value;
+    if (/\r|\n/.test(value)) {
+      const cursor = composerInput.selectionEnd ?? value.length;
+      const nextValue = value.replace(/\r?\n/g, "");
+      const nextCursor = value.slice(0, cursor).replace(/\r?\n/g, "").length;
+      composerInput.value = nextValue;
+      try {
+        composerInput.setSelectionRange(nextCursor, nextCursor);
+      } catch (_error) {
+        // Ignore transient selection errors while the textarea is unfocused.
+      }
+    }
     autoSizeComposer();
+    syncComposerState();
   });
   composerInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       if (event.shiftKey) {
-        window.setTimeout(autoSizeComposer, 0);
+        event.preventDefault();
         return;
       }
       event.preventDefault();
       commitComposerLine();
       return;
     }
+    if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey) {
+      event.preventDefault();
+      navigateComposerHistory("up");
+      return;
+    }
+    if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey) {
+      event.preventDefault();
+      navigateComposerHistory("down");
+      return;
+    }
     if (event.key === "Escape") {
       event.preventDefault();
-      clearComposer();
+      clearComposer(true);
       closeComposer();
     }
   });

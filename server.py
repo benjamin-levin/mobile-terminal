@@ -27,6 +27,9 @@ STATIC_ROOT = ROOT / "static"
 NODE_MODULES_ROOT = ROOT / "node_modules"
 WS_PATH = "/_ws"
 SETTINGS_PATH = ROOT / "mobile-terminal-settings.json"
+MOBILE_COMPOSER_HISTORY_LIMIT = 200
+LEFT_ARROW = "\u001b[D"
+RIGHT_ARROW = "\u001b[C"
 
 
 def tmux_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -327,6 +330,50 @@ def normalize_settings(raw_settings: Any) -> dict[str, Any]:
     }
 
 
+def default_mobile_composer_state() -> dict[str, Any]:
+    return {
+        "history": [],
+        "draft": "",
+        "cursor": 0,
+        "historyIndex": None,
+        "pendingDraft": "",
+        "tracked": False,
+    }
+
+
+def clamp_cursor(value: str, cursor: Any) -> int:
+    try:
+        position = int(cursor)
+    except (TypeError, ValueError):
+        position = len(value)
+    return max(0, min(len(value), position))
+
+
+def build_composer_sync_sequence(
+    previous_value: str,
+    previous_cursor: int,
+    next_value: str,
+    next_cursor: int,
+) -> tuple[str, int]:
+    current_value = previous_value or ""
+    target_value = next_value or ""
+    current_cursor = clamp_cursor(current_value, previous_cursor)
+    target_cursor = clamp_cursor(target_value, next_cursor)
+
+    move_right = max(0, len(current_value) - current_cursor)
+    move_left = max(0, len(target_value) - target_cursor)
+    sequence = ""
+    if move_right:
+        sequence += RIGHT_ARROW * move_right
+    if current_value:
+        sequence += "\u007f" * len(current_value)
+    if target_value:
+        sequence += target_value
+    if move_left:
+        sequence += LEFT_ARROW * move_left
+    return sequence, target_cursor
+
+
 def load_settings() -> dict[str, Any]:
     if not SETTINGS_PATH.is_file():
         return default_settings()
@@ -496,6 +543,7 @@ class AppServer:
         self.allowed_clients = allowed_clients
         self.tailscale_mode = tailscale_mode
         self.settings = load_settings()
+        self.mobile_composer_states: dict[str, dict[str, Any]] = {}
 
     async def send_json(self, connection: ServerConnection, payload: dict[str, Any]) -> None:
         await connection.send(json.dumps(payload))
@@ -546,6 +594,114 @@ class AppServer:
         )
         return self.settings
 
+    def mobile_composer_state(self, session_name: str) -> dict[str, Any]:
+        state = self.mobile_composer_states.get(session_name)
+        if state is None:
+            state = default_mobile_composer_state()
+            self.mobile_composer_states[session_name] = state
+        return state
+
+    async def send_composer_state(self, connection: ServerConnection, session_name: str) -> None:
+        state = self.mobile_composer_state(session_name)
+        await self.send_json(
+            connection,
+            {
+                "type": "composer-state",
+                "value": state["draft"],
+                "cursor": state["cursor"],
+                "tracked": state["tracked"],
+            },
+        )
+
+    def reset_mobile_composer_tracking(self, session_name: str) -> None:
+        state = self.mobile_composer_state(session_name)
+        state["draft"] = ""
+        state["cursor"] = 0
+        state["historyIndex"] = None
+        state["pendingDraft"] = ""
+        state["tracked"] = False
+
+    def sync_mobile_composer(
+        self,
+        bridge: TmuxBridge,
+        session_name: str,
+        value: str,
+        cursor: Any,
+        *,
+        reset_history_index: bool = True,
+    ) -> dict[str, Any]:
+        state = self.mobile_composer_state(session_name)
+        next_value = value.replace("\r", "").replace("\n", "")
+        sequence, next_cursor = build_composer_sync_sequence(
+            state["draft"],
+            state["cursor"],
+            next_value,
+            cursor,
+        )
+        if pane_in_mode(session_name):
+            tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
+        if sequence:
+            bridge.write(sequence)
+        state["draft"] = next_value
+        state["cursor"] = next_cursor
+        if reset_history_index:
+            state["historyIndex"] = None
+            state["pendingDraft"] = next_value
+        state["tracked"] = True
+        return state
+
+    def commit_mobile_composer(self, bridge: TmuxBridge, session_name: str) -> None:
+        state = self.mobile_composer_state(session_name)
+        line = state["draft"]
+        if line:
+            history = state["history"]
+            history.append(line)
+            if len(history) > MOBILE_COMPOSER_HISTORY_LIMIT:
+                del history[:-MOBILE_COMPOSER_HISTORY_LIMIT]
+        self.reset_mobile_composer_tracking(session_name)
+        if pane_in_mode(session_name):
+            tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
+        bridge.write("\r")
+
+    def navigate_mobile_composer_history(
+        self,
+        bridge: TmuxBridge,
+        session_name: str,
+        direction: str,
+    ) -> dict[str, Any] | None:
+        state = self.mobile_composer_state(session_name)
+        history = state["history"]
+        if not history:
+            return None
+
+        history_index = state["historyIndex"]
+        if direction == "up":
+            if history_index is None:
+                state["pendingDraft"] = state["draft"] if state["tracked"] else ""
+                history_index = len(history) - 1
+            elif history_index > 0:
+                history_index -= 1
+        elif direction == "down":
+            if history_index is None:
+                return None
+            if history_index < len(history) - 1:
+                history_index += 1
+            else:
+                history_index = None
+        else:
+            return None
+
+        next_value = state["pendingDraft"] if history_index is None else history[history_index]
+        next_state = self.sync_mobile_composer(
+            bridge,
+            session_name,
+            next_value,
+            len(next_value),
+            reset_history_index=False,
+        )
+        next_state["historyIndex"] = history_index
+        return next_state
+
     async def handle_command(
         self,
         connection: ServerConnection,
@@ -555,10 +711,41 @@ class AppServer:
     ) -> None:
         session_name = state["session"]
         message_type = payload.get("type")
+        if message_type == "composer-sync":
+            self.sync_mobile_composer(
+                bridge,
+                session_name,
+                str(payload.get("value", "")),
+                payload.get("cursor"),
+            )
+            return
+
+        if message_type == "composer-enter":
+            self.commit_mobile_composer(bridge, session_name)
+            await self.send_composer_state(connection, session_name)
+            return
+
+        if message_type == "composer-history":
+            next_state = self.navigate_mobile_composer_history(
+                bridge,
+                session_name,
+                str(payload.get("direction", "")).lower(),
+            )
+            if next_state is not None:
+                await self.send_composer_state(connection, session_name)
+            return
+
+        if message_type == "composer-reset":
+            self.reset_mobile_composer_tracking(session_name)
+            await self.send_composer_state(connection, session_name)
+            return
+
         if message_type == "input":
             if pane_in_mode(session_name):
                 tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
             bridge.write(payload.get("data", ""))
+            if payload.get("data"):
+                self.reset_mobile_composer_tracking(session_name)
             return
 
         if message_type == "resize":
@@ -622,6 +809,8 @@ class AppServer:
                     )
                     return
                 tmux_capture("rename-session", "-t", target_name, name, check=False)
+                if target_name in self.mobile_composer_states:
+                    self.mobile_composer_states[name] = self.mobile_composer_states.pop(target_name)
                 if target_name == session_name:
                     state["session"] = name
                 await self.send_json(
@@ -799,6 +988,7 @@ class AppServer:
             await self.send_tabs(connection, state["session"])
             await self.send_sessions(connection, state["session"])
             await self.send_settings(connection)
+            await self.send_composer_state(connection, state["session"])
 
             async for raw_message in connection:
                 if not isinstance(raw_message, str):
