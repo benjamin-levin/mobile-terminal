@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / "static"
 NODE_MODULES_ROOT = ROOT / "node_modules"
 WS_PATH = "/_ws"
+SETTINGS_PATH = ROOT / "mobile-terminal-settings.json"
 
 
 def tmux_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -259,6 +260,88 @@ def next_session_name(existing: set[str] | None = None) -> str:
         counter += 1
 
 
+def default_settings() -> dict[str, Any]:
+    return {
+        "shortcuts": [
+            {"label": "Esc", "sequence": "{ESC}", "visible": True},
+            {"label": "📋", "sequence": "{PASTE}", "visible": True},
+            {"label": "Tab", "sequence": "{TAB}", "visible": True},
+            {"label": "⬆️", "sequence": "{UP}", "visible": True},
+            {"label": "⬇️", "sequence": "{DOWN}", "visible": True},
+            {"label": "⬅️", "sequence": "{LEFT}", "visible": False},
+            {"label": "➡️", "sequence": "{RIGHT}", "visible": False},
+            {"label": "^+C", "sequence": "{CTRL+C}", "visible": True},
+            {"label": "Ctrl+L", "sequence": "{CTRL+L}", "visible": False},
+            {"label": "Ctrl+R", "sequence": "{CTRL+R}", "visible": False},
+            {"label": "Ctrl+X Tab", "sequence": "{CTRL+X}{TAB}", "visible": False},
+            {"label": "↩️", "sequence": "{ENTER}", "visible": True},
+            {"label": "▶️", "sequence": "{TEXT:/resume}{ENTER}", "visible": True},
+        ],
+        "uiScale": 0.85,
+        "terminalFontSize": 10,
+    }
+
+
+def normalize_shortcuts(raw_shortcuts: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_shortcuts, list):
+        return default_settings()["shortcuts"]
+    normalized: list[dict[str, Any]] = []
+    for item in raw_shortcuts:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label", "")).strip()
+        sequence = str(item.get("sequence", "")).strip()
+        if not label or not sequence:
+            continue
+        normalized.append(
+            {
+                "label": label[:40],
+                "sequence": sequence[:120],
+                "visible": item.get("visible", True) is not False,
+            }
+        )
+    return normalized or default_settings()["shortcuts"]
+
+
+def normalize_settings(raw_settings: Any) -> dict[str, Any]:
+    defaults = default_settings()
+    if not isinstance(raw_settings, dict):
+        return defaults
+
+    try:
+        ui_scale = float(raw_settings.get("uiScale", defaults["uiScale"]))
+    except (TypeError, ValueError):
+        ui_scale = defaults["uiScale"]
+    ui_scale = min(1.4, max(0.5, ui_scale))
+
+    try:
+        terminal_font_size = int(raw_settings.get("terminalFontSize", defaults["terminalFontSize"]))
+    except (TypeError, ValueError):
+        terminal_font_size = defaults["terminalFontSize"]
+    terminal_font_size = min(24, max(5, terminal_font_size))
+
+    return {
+        "shortcuts": normalize_shortcuts(raw_settings.get("shortcuts")),
+        "uiScale": ui_scale,
+        "terminalFontSize": terminal_font_size,
+    }
+
+
+def load_settings() -> dict[str, Any]:
+    if not SETTINGS_PATH.is_file():
+        return default_settings()
+    try:
+        return normalize_settings(json.loads(SETTINGS_PATH.read_text()))
+    except (OSError, json.JSONDecodeError):
+        return default_settings()
+
+
+def save_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_settings(settings)
+    SETTINGS_PATH.write_text(json.dumps(normalized, indent=2) + "\n")
+    return normalized
+
+
 def safe_join(path: str) -> tuple[Path | None, str | None]:
     clean_path = urlsplit(path).path
     if clean_path == "/":
@@ -412,6 +495,7 @@ class AppServer:
         self.require_token = require_token
         self.allowed_clients = allowed_clients
         self.tailscale_mode = tailscale_mode
+        self.settings = load_settings()
 
     async def send_json(self, connection: ServerConnection, payload: dict[str, Any]) -> None:
         await connection.send(json.dumps(payload))
@@ -451,6 +535,17 @@ class AppServer:
         )
         return sessions
 
+    async def send_settings(self, connection: ServerConnection) -> dict[str, Any]:
+        await self.send_json(
+            connection,
+            {
+                "type": "settings",
+                "settings": self.settings,
+                "persisted": SETTINGS_PATH.is_file(),
+            },
+        )
+        return self.settings
+
     async def handle_command(
         self,
         connection: ServerConnection,
@@ -483,6 +578,15 @@ class AppServer:
 
         if message_type == "request-sessions":
             await self.send_sessions(connection, session_name)
+            return
+
+        if message_type == "request-settings":
+            await self.send_settings(connection)
+            return
+
+        if message_type == "save-settings":
+            self.settings = save_settings(payload.get("settings", {}))
+            await self.send_settings(connection)
             return
 
         if message_type == "new-tab":
@@ -694,6 +798,7 @@ class AppServer:
                 )
             await self.send_tabs(connection, state["session"])
             await self.send_sessions(connection, state["session"])
+            await self.send_settings(connection)
 
             async for raw_message in connection:
                 if not isinstance(raw_message, str):

@@ -5,24 +5,26 @@
   const STORAGE_TERMINAL_FONT_KEY = "mobile-terminal.terminal-font";
   const STORAGE_ACTIVE_SESSION_KEY = "mobile-terminal.active-session";
   const STORAGE_OPEN_TABS_KEY = "mobile-terminal.open-tabs";
-  const DEFAULT_UI_SCALE = 1;
-  const DEFAULT_TERMINAL_FONT = 15;
+  const DEFAULT_UI_SCALE = 0.85;
+  const DEFAULT_TERMINAL_FONT = 10;
   const KEYBOARD_THRESHOLD = 80;
   const UI_SCALE_FIT_WIDTH = 430;
   const UI_SCALE_FIT_HEIGHT = 700;
   const decoder = new TextDecoder();
   const defaultShortcuts = [
-    { label: "Paste", sequence: "{PASTE}" },
-    { label: "Tab", sequence: "{TAB}" },
-    { label: "Esc", sequence: "{ESC}" },
-    { label: "Up", sequence: "{UP}" },
-    { label: "Down", sequence: "{DOWN}" },
-    { label: "Left", sequence: "{LEFT}" },
-    { label: "Right", sequence: "{RIGHT}" },
-    { label: "Ctrl+C", sequence: "{CTRL+C}" },
-    { label: "Ctrl+L", sequence: "{CTRL+L}" },
-    { label: "Ctrl+R", sequence: "{CTRL+R}" },
-    { label: "Ctrl+X Tab", sequence: "{CTRL+X}{TAB}" },
+    { label: "Esc", sequence: "{ESC}", visible: true },
+    { label: "📋", sequence: "{PASTE}", visible: true },
+    { label: "Tab", sequence: "{TAB}", visible: true },
+    { label: "⬆️", sequence: "{UP}", visible: true },
+    { label: "⬇️", sequence: "{DOWN}", visible: true },
+    { label: "⬅️", sequence: "{LEFT}", visible: false },
+    { label: "➡️", sequence: "{RIGHT}", visible: false },
+    { label: "^+C", sequence: "{CTRL+C}", visible: true },
+    { label: "Ctrl+L", sequence: "{CTRL+L}", visible: false },
+    { label: "Ctrl+R", sequence: "{CTRL+R}", visible: false },
+    { label: "Ctrl+X Tab", sequence: "{CTRL+X}{TAB}", visible: false },
+    { label: "↩️", sequence: "{ENTER}", visible: true },
+    { label: "▶️", sequence: "{TEXT:/resume}{ENTER}", visible: true },
   ];
   const specialMap = {
     TAB: "\t",
@@ -130,6 +132,7 @@
   let activeSessionName = "";
   let followOutput = true;
   let reconnectForSessionSwitch = false;
+  let hostSettingsReady = false;
   let sessionMenuOpen = false;
   let settingsMenuOpen = false;
   let touchScrollState = null;
@@ -174,7 +177,7 @@
     } catch (_error) {
       // Ignore bad local storage payloads.
     }
-    return defaultShortcuts.map((shortcut) => ({ ...shortcut, visible: true }));
+    return defaultShortcuts.map((shortcut) => ({ ...shortcut }));
   }
 
   function loadOpenTabs() {
@@ -202,6 +205,26 @@
     localStorage.setItem(STORAGE_SHORTCUTS_KEY, JSON.stringify(shortcuts));
     renderShortcutBar();
     scheduleLayoutRefresh();
+    saveHostSettings();
+  }
+
+  function saveHostSettings() {
+    sendMessage({
+      type: "save-settings",
+      settings: {
+        shortcuts,
+        uiScale,
+        terminalFontSize,
+      },
+    });
+  }
+
+  function hasLocalSettingsOverride() {
+    return [
+      STORAGE_SHORTCUTS_KEY,
+      STORAGE_UI_SCALE_KEY,
+      STORAGE_TERMINAL_FONT_KEY,
+    ].some((storageKey) => localStorage.getItem(storageKey) !== null);
   }
 
   function showToast(message) {
@@ -1108,6 +1131,35 @@
       }
       return;
     }
+    if (payload.type === "settings") {
+      const nextSettings = payload.settings || {};
+      const hostPersisted = payload.persisted === true;
+      if (!hostPersisted && !hostSettingsReady && hasLocalSettingsOverride()) {
+        hostSettingsReady = true;
+        saveHostSettings();
+        return;
+      }
+      const nextShortcuts = Array.isArray(nextSettings.shortcuts)
+        ? nextSettings.shortcuts.map(normalizeShortcut).filter(Boolean)
+        : null;
+      if (nextShortcuts && nextShortcuts.length) {
+        shortcuts = nextShortcuts;
+        localStorage.setItem(STORAGE_SHORTCUTS_KEY, JSON.stringify(shortcuts));
+        renderShortcutBar();
+      }
+      if (Number.isFinite(Number(nextSettings.uiScale))) {
+        applyUiScale(Number(nextSettings.uiScale), false);
+        localStorage.setItem(STORAGE_UI_SCALE_KEY, String(uiScale));
+      }
+      if (Number.isFinite(Number(nextSettings.terminalFontSize))) {
+        applyTerminalFontSize(Number(nextSettings.terminalFontSize), false);
+        localStorage.setItem(STORAGE_TERMINAL_FONT_KEY, String(terminalFontSize));
+      }
+      hostSettingsReady = true;
+      updateDisplayDraft(uiScale, terminalFontSize);
+      scheduleLayoutRefresh();
+      return;
+    }
     if (payload.type === "session-created") {
       addOpenTab(payload.session || "");
       switchSession(payload.session || "");
@@ -1435,6 +1487,7 @@
     if (applyChanges) {
       applyUiScale(draftUiScale);
       applyTerminalFontSize(draftTerminalFontSize);
+      saveHostSettings();
     } else {
       updateDisplayDraft(uiScale, terminalFontSize);
     }
@@ -1677,6 +1730,7 @@
     updateViewportMetrics();
     sendMessage({ type: "request-tabs" });
     sendMessage({ type: "request-sessions" });
+    sendMessage({ type: "request-settings" });
   });
   document.addEventListener("click", (event) => {
     if (
