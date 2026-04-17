@@ -136,6 +136,10 @@
   let sessionMenuOpen = false;
   let settingsMenuOpen = false;
   let touchScrollState = null;
+  let touchInertiaFrameId = null;
+  let touchInertiaVelocity = 0;
+  let touchInertiaLastAt = 0;
+  let scrollLineRemainder = 0;
   let tabDragState = null;
   let suppressTabClickUntil = 0;
   let shortcutDragState = null;
@@ -147,6 +151,11 @@
   let speechFlushTimer = null;
   const mobileComposerMode = window.matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
   let suppressComposerSync = false;
+  const TOUCH_INERTIA_MIN_VELOCITY = 0.02;
+  const TOUCH_INERTIA_MAX_VELOCITY = 3;
+  const TOUCH_INERTIA_FRICTION_PER_MS = 0.9965;
+  const TOUCH_INERTIA_MAX_FRAME_MS = 34;
+  const TOUCH_VELOCITY_BLEND = 0.35;
 
   function loadNumericSetting(storageKey, fallback, min, max) {
     const raw = Number.parseFloat(localStorage.getItem(storageKey) || "");
@@ -611,6 +620,47 @@
     });
   }
 
+  function cancelTouchInertia() {
+    if (touchInertiaFrameId !== null) {
+      window.cancelAnimationFrame(touchInertiaFrameId);
+      touchInertiaFrameId = null;
+    }
+    touchInertiaVelocity = 0;
+    touchInertiaLastAt = 0;
+  }
+
+  function stepTouchInertia(timestamp) {
+    if (!touchInertiaLastAt) {
+      touchInertiaLastAt = timestamp;
+      touchInertiaFrameId = window.requestAnimationFrame(stepTouchInertia);
+      return;
+    }
+    const deltaMs = Math.min(TOUCH_INERTIA_MAX_FRAME_MS, Math.max(1, timestamp - touchInertiaLastAt));
+    touchInertiaLastAt = timestamp;
+    scrollTerminalByPixels(touchInertiaVelocity * deltaMs);
+    touchInertiaVelocity *= Math.pow(TOUCH_INERTIA_FRICTION_PER_MS, deltaMs);
+    if (Math.abs(touchInertiaVelocity) < TOUCH_INERTIA_MIN_VELOCITY) {
+      cancelTouchInertia();
+      return;
+    }
+    touchInertiaFrameId = window.requestAnimationFrame(stepTouchInertia);
+  }
+
+  function startTouchInertia(initialVelocity) {
+    const clampedVelocity = Math.max(
+      -TOUCH_INERTIA_MAX_VELOCITY,
+      Math.min(TOUCH_INERTIA_MAX_VELOCITY, initialVelocity),
+    );
+    if (Math.abs(clampedVelocity) < TOUCH_INERTIA_MIN_VELOCITY) {
+      cancelTouchInertia();
+      return;
+    }
+    cancelTouchInertia();
+    touchInertiaVelocity = clampedVelocity;
+    touchInertiaLastAt = 0;
+    touchInertiaFrameId = window.requestAnimationFrame(stepTouchInertia);
+  }
+
   function scrollTerminalByPixels(pixelDelta) {
     if (!term.rows || !Number.isFinite(pixelDelta) || pixelDelta === 0) {
       return;
@@ -619,11 +669,18 @@
     if (!lineHeight) {
       return;
     }
-    const lineDelta = pixelDelta / lineHeight;
+    const lineDelta = scrollLineRemainder + pixelDelta / lineHeight;
     if (Math.abs(lineDelta) < 0.35) {
+      scrollLineRemainder = lineDelta;
       return;
     }
-    const lines = Math.round(lineDelta);
+    const roundedLines = Math.round(lineDelta);
+    const lines = Math.max(-12, Math.min(12, roundedLines));
+    if (lines === 0) {
+      scrollLineRemainder = lineDelta;
+      return;
+    }
+    scrollLineRemainder = lineDelta - lines;
     sendMessage({ type: "scroll-history", lines });
     if (lines > 0) {
       followOutput = false;
@@ -649,6 +706,7 @@
         if (!event.deltaY) {
           return;
         }
+        cancelTouchInertia();
         event.preventDefault();
         event.stopImmediatePropagation();
         scrollTerminalByPixels(-event.deltaY);
@@ -659,11 +717,17 @@
     terminalRoot.addEventListener(
       "touchstart",
       (event) => {
+        cancelTouchInertia();
         if (event.touches.length !== 1) {
           touchScrollState = null;
           return;
         }
-        touchScrollState = { lastY: event.touches[0].clientY };
+        touchScrollState = {
+          lastY: event.touches[0].clientY,
+          lastAt: performance.now(),
+          velocity: 0,
+          lastMoveAt: 0,
+        };
       },
       { passive: true },
     );
@@ -679,18 +743,37 @@
         if (Math.abs(deltaY) < 2) {
           return;
         }
+        const now = performance.now();
+        const scrollPixels = -deltaY;
+        const deltaMs = Math.max(1, now - touchScrollState.lastAt);
+        const velocity = scrollPixels / deltaMs;
+        touchScrollState.velocity =
+          touchScrollState.velocity * (1 - TOUCH_VELOCITY_BLEND) + velocity * TOUCH_VELOCITY_BLEND;
         touchScrollState.lastY = nextY;
+        touchScrollState.lastAt = now;
+        touchScrollState.lastMoveAt = now;
         event.preventDefault();
-        scrollTerminalByPixels(-deltaY);
+        scrollTerminalByPixels(scrollPixels);
       },
       { passive: false },
     );
 
-    const resetTouchScroll = () => {
+    const finishTouchScroll = () => {
+      if (
+        touchScrollState &&
+        touchScrollState.lastMoveAt &&
+        performance.now() - touchScrollState.lastMoveAt < 80
+      ) {
+        startTouchInertia(touchScrollState.velocity);
+      }
       touchScrollState = null;
     };
-    terminalRoot.addEventListener("touchend", resetTouchScroll, { passive: true });
-    terminalRoot.addEventListener("touchcancel", resetTouchScroll, { passive: true });
+    const cancelTouchScroll = () => {
+      touchScrollState = null;
+      cancelTouchInertia();
+    };
+    terminalRoot.addEventListener("touchend", finishTouchScroll, { passive: true });
+    terminalRoot.addEventListener("touchcancel", cancelTouchScroll, { passive: true });
   }
 
   function installTabStripScrollHandlers() {
