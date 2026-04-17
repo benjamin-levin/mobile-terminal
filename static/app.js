@@ -510,12 +510,12 @@
     }
   }
 
-  function navigateComposerHistory(direction) {
+  function navigateComposerHistory(direction, focus = true) {
     if (!mobileComposerMode) {
       sendMessage({ type: "input", data: direction === "down" ? specialMap.DOWN : specialMap.UP });
       return;
     }
-    openComposer(true);
+    openComposer(focus);
     sendMessage({ type: "composer-history", direction });
   }
 
@@ -1036,10 +1036,7 @@
         }
         const historyDirection = mobileComposerMode ? shortcutHistoryDirection(shortcut.sequence) : "";
         if (historyDirection) {
-          navigateComposerHistory(historyDirection);
-          if (preserveComposerFocus) {
-            window.requestAnimationFrame(() => openComposer(true));
-          }
+          navigateComposerHistory(historyDirection, preserveComposerFocus);
           return;
         }
         if (mobileComposerMode && shortcutShouldFlushComposer(shortcut.sequence)) {

@@ -204,7 +204,7 @@ def scroll_session_history(session_name: str, lines: int) -> None:
     if count == 0:
         return
     if not pane_in_mode(session_name):
-        tmux_capture("copy-mode", "-t", session_name, check=False)
+        tmux_capture("copy-mode", "-e", "-t", session_name, check=False)
     command = "scroll-up" if lines > 0 else "scroll-down"
     tmux_capture("send-keys", "-t", session_name, "-X", "-N", str(count), command, check=False)
 
@@ -782,12 +782,10 @@ class AppServer:
         if not arrow:
             return None
 
-        if pane_in_mode(session_name):
-            tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
         bridge.write(arrow)
 
         state = self.mobile_composer_state(session_name)
-        for delay in (0.03, 0.07, 0.12):
+        for delay in (0.05, 0.15, 0.3):
             await asyncio.sleep(delay)
             visible_text = self.capture_visible_mobile_composer_text(session_name)
             if visible_text is None:
