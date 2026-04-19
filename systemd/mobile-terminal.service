@@ -5,9 +5,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/powerhouse/mobile-terminal
-EnvironmentFile=-/home/powerhouse/mobile-terminal/mobile-terminal.env
-ExecStart=/usr/bin/python3 /home/powerhouse/mobile-terminal/server.py
+WorkingDirectory=@WORKDIR@
+EnvironmentFile=-@ENV_FILE@
+ExecStart=@PYTHON@ @WORKDIR@/server.py
 Restart=always
 RestartSec=3
 StandardOutput=journal

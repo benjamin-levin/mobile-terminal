@@ -7,6 +7,7 @@ import ipaddress
 import json
 import mimetypes
 import os
+import re
 import secrets
 import signal
 import struct
@@ -29,10 +30,15 @@ WS_PATH = "/_ws"
 SETTINGS_PATH = ROOT / "mobile-terminal-settings.json"
 MOBILE_COMPOSER_HISTORY_LIMIT = 200
 COMPOSER_CAPTURE_CONTEXT_ROWS = 12
+COMPOSER_CAPTURE_LOGICAL_LINES = 48
+COMPOSER_CAPTURE_MAX_CHARS = 12000
+COMPOSER_REFRESH_DELAYS = (0.02, 0.05, 0.09, 0.14, 0.2, 0.28, 0.38, 0.5)
 LEFT_ARROW = "\u001b[D"
 RIGHT_ARROW = "\u001b[C"
 UP_ARROW = "\u001b[A"
 DOWN_ARROW = "\u001b[B"
+BRACKETED_PASTE_START = "\u001b[200~"
+BRACKETED_PASTE_END = "\u001b[201~"
 
 
 def tmux_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -116,6 +122,7 @@ def ensure_session(session_name: str, shell: str, cwd: str) -> None:
             cwd,
             f"{shell} -l",
         )
+    tmux_capture("set-option", "-g", "-p", "allow-passthrough", "on", check=False)
     for option, value in (("status", "off"), ("mouse", "on")):
         tmux_capture("set-option", "-t", session_name, option, value, check=False)
 
@@ -341,6 +348,8 @@ def default_mobile_composer_state() -> dict[str, Any]:
         "historyIndex": None,
         "pendingDraft": "",
         "tracked": False,
+        "revision": 0,
+        "source": "reset",
     }
 
 
@@ -371,7 +380,10 @@ def build_composer_sync_sequence(
     if current_value:
         sequence += "\u007f" * len(current_value)
     if target_value:
-        sequence += target_value
+        if "\n" in target_value:
+            sequence += BRACKETED_PASTE_START + target_value + BRACKETED_PASTE_END
+        else:
+            sequence += target_value
     if move_left:
         sequence += LEFT_ARROW * move_left
     return sequence, target_cursor
@@ -386,6 +398,20 @@ def unique_non_empty(values: list[str]) -> list[str]:
         seen.add(value)
         unique_values.append(value)
     return unique_values
+
+
+def strip_prompt_prefix(line: str) -> str | None:
+    clean_line = line.replace("\r", "").rstrip()
+    if not clean_line:
+        return None
+    for pattern in (
+        r"^\s*[›❯]\s?(.*)$",
+        r"^.*(?:^|\s)[$#>]\s?(.*)$",
+    ):
+        match = re.match(pattern, clean_line)
+        if match:
+            return match.group(1)
+    return None
 
 
 def load_settings() -> dict[str, Any]:
@@ -624,6 +650,8 @@ class AppServer:
                 "value": state["draft"],
                 "cursor": state["cursor"],
                 "tracked": state["tracked"],
+                "revision": state["revision"],
+                "source": state["source"],
             },
         )
 
@@ -634,6 +662,7 @@ class AppServer:
         state["historyIndex"] = None
         state["pendingDraft"] = ""
         state["tracked"] = False
+        state["source"] = "reset"
 
     def sync_mobile_composer(
         self,
@@ -642,10 +671,11 @@ class AppServer:
         value: str,
         cursor: Any,
         *,
+        revision: int | None = None,
         reset_history_index: bool = True,
     ) -> dict[str, Any]:
         state = self.mobile_composer_state(session_name)
-        next_value = value.replace("\r", "").replace("\n", "")
+        next_value = value.replace("\r\n", "\n").replace("\r", "\n")
         sequence, next_cursor = build_composer_sync_sequence(
             state["draft"],
             state["cursor"],
@@ -658,13 +688,16 @@ class AppServer:
             bridge.write(sequence)
         state["draft"] = next_value
         state["cursor"] = next_cursor
+        if revision is not None:
+            state["revision"] = max(state["revision"], revision)
         if reset_history_index:
             state["historyIndex"] = None
             state["pendingDraft"] = next_value
         state["tracked"] = True
+        state["source"] = "composer-sync"
         return state
 
-    def commit_mobile_composer(self, bridge: TmuxBridge, session_name: str) -> None:
+    def commit_mobile_composer(self, bridge: TmuxBridge, session_name: str, revision: int | None = None) -> None:
         state = self.mobile_composer_state(session_name)
         line = state["draft"]
         if line:
@@ -672,6 +705,8 @@ class AppServer:
             history.append(line)
             if len(history) > MOBILE_COMPOSER_HISTORY_LIMIT:
                 del history[:-MOBILE_COMPOSER_HISTORY_LIMIT]
+        if revision is not None:
+            state["revision"] = max(state["revision"], revision)
         self.reset_mobile_composer_tracking(session_name)
         if pane_in_mode(session_name):
             tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
@@ -682,6 +717,7 @@ class AppServer:
         bridge: TmuxBridge,
         session_name: str,
         direction: str,
+        revision: int | None = None,
     ) -> dict[str, Any] | None:
         state = self.mobile_composer_state(session_name)
         history = state["history"]
@@ -711,12 +747,52 @@ class AppServer:
             session_name,
             next_value,
             len(next_value),
+            revision=revision,
             reset_history_index=False,
         )
         next_state["historyIndex"] = history_index
+        next_state["source"] = "history-fallback"
         return next_state
 
-    def capture_visible_mobile_composer_text(self, session_name: str) -> str | None:
+    def extract_terminal_composer_text(self, session_name: str) -> tuple[str, str] | None:
+        capture_result = tmux_capture(
+            "capture-pane",
+            "-p",
+            "-J",
+            "-N",
+            "-t",
+            session_name,
+            check=False,
+        )
+        if capture_result.returncode != 0:
+            return None
+
+        logical_lines = [line.replace("\r", "") for line in capture_result.stdout.split("\n")]
+        while logical_lines and logical_lines[-1] == "":
+            logical_lines.pop()
+        if not logical_lines:
+            return None
+
+        candidate_lines = logical_lines[-COMPOSER_CAPTURE_LOGICAL_LINES:]
+        for index in range(len(candidate_lines) - 1, -1, -1):
+            stripped_line = strip_prompt_prefix(candidate_lines[index])
+            if stripped_line is None:
+                continue
+            block_lines = [stripped_line, *candidate_lines[index + 1 :]]
+            block = "\n".join(line.rstrip() for line in block_lines).rstrip()
+            if not block:
+                return None
+            if len(block) > COMPOSER_CAPTURE_MAX_CHARS:
+                block = block[-COMPOSER_CAPTURE_MAX_CHARS :]
+            return block, "terminal-extract"
+
+        return None
+
+    def capture_visible_mobile_composer_text(self, session_name: str) -> tuple[str, str] | None:
+        extracted = self.extract_terminal_composer_text(session_name)
+        if extracted is not None:
+            return extracted
+
         state = self.mobile_composer_state(session_name)
         candidates = unique_non_empty(
             [
@@ -770,34 +846,62 @@ class AppServer:
         for candidate in candidates:
             if candidate in context_text and len(candidate) > len(best_match):
                 best_match = candidate
-        return best_match or None
+        if not best_match:
+            return None
+        return best_match, "history-substring"
+
+    async def refresh_mobile_composer_from_terminal(
+        self,
+        session_name: str,
+        revision: int | None = None,
+    ) -> dict[str, Any] | None:
+        state = self.mobile_composer_state(session_name)
+        baseline_draft = state["draft"]
+        previous_delay = 0.0
+        for index, delay in enumerate(COMPOSER_REFRESH_DELAYS):
+            await asyncio.sleep(max(0.0, delay - previous_delay))
+            previous_delay = delay
+            visible_state = self.capture_visible_mobile_composer_text(session_name)
+            if visible_state is None:
+                continue
+            visible_text, source = visible_state
+            if visible_text == baseline_draft and index < len(COMPOSER_REFRESH_DELAYS) - 1:
+                continue
+            state["draft"] = visible_text
+            state["cursor"] = len(visible_text)
+            state["tracked"] = True
+            if revision is not None:
+                state["revision"] = max(state["revision"], revision)
+            state["source"] = source
+            return state
+        return None
 
     async def navigate_mobile_composer_history(
         self,
         bridge: TmuxBridge,
         session_name: str,
         direction: str,
+        revision: int | None = None,
     ) -> dict[str, Any] | None:
         arrow = {"up": UP_ARROW, "down": DOWN_ARROW}.get(direction)
         if not arrow:
             return None
 
-        bridge.write(arrow)
-
         state = self.mobile_composer_state(session_name)
-        for delay in (0.05, 0.15, 0.3):
-            await asyncio.sleep(delay)
-            visible_text = self.capture_visible_mobile_composer_text(session_name)
-            if visible_text is None:
-                continue
-            state["draft"] = visible_text
-            state["cursor"] = len(visible_text)
-            state["tracked"] = True
-            state["pendingDraft"] = visible_text
-            state["historyIndex"] = None
-            return state
+        if direction == "up" and state["historyIndex"] is None:
+            state["pendingDraft"] = state["draft"]
+        bridge.write(arrow)
+        next_state = await self.refresh_mobile_composer_from_terminal(session_name, revision=revision)
+        if next_state is not None:
+            next_state["historyIndex"] = None
+            return next_state
 
-        return self.fallback_mobile_composer_history(bridge, session_name, direction)
+        return self.fallback_mobile_composer_history(
+            bridge,
+            session_name,
+            direction,
+            revision=revision,
+        )
 
     async def handle_command(
         self,
@@ -808,17 +912,45 @@ class AppServer:
     ) -> None:
         session_name = state["session"]
         message_type = payload.get("type")
+        try:
+            revision = int(payload.get("revision", 0))
+        except (TypeError, ValueError):
+            revision = 0
         if message_type == "composer-sync":
             self.sync_mobile_composer(
                 bridge,
                 session_name,
                 str(payload.get("value", "")),
                 payload.get("cursor"),
+                revision=revision,
             )
             return
 
+        if message_type == "composer-semantic-sync":
+            composer_state = self.mobile_composer_state(session_name)
+            composer_state["revision"] = max(composer_state["revision"], revision)
+            source = str(payload.get("source", "semantic-osc133") or "semantic-osc133")
+            tracked = payload.get("tracked", True) is not False
+            if not tracked:
+                self.reset_mobile_composer_tracking(session_name)
+                composer_state = self.mobile_composer_state(session_name)
+                composer_state["revision"] = max(composer_state["revision"], revision)
+                composer_state["source"] = source
+                await self.send_composer_state(connection, session_name)
+                return
+
+            next_value = str(payload.get("value", "")).replace("\r\n", "\n").replace("\r", "\n")
+            composer_state["draft"] = next_value
+            composer_state["cursor"] = clamp_cursor(next_value, payload.get("cursor"))
+            composer_state["historyIndex"] = None
+            composer_state["pendingDraft"] = next_value
+            composer_state["tracked"] = True
+            composer_state["source"] = source
+            await self.send_composer_state(connection, session_name)
+            return
+
         if message_type == "composer-enter":
-            self.commit_mobile_composer(bridge, session_name)
+            self.commit_mobile_composer(bridge, session_name, revision=revision)
             await self.send_composer_state(connection, session_name)
             return
 
@@ -827,12 +959,24 @@ class AppServer:
                 bridge,
                 session_name,
                 str(payload.get("direction", "")).lower(),
+                revision=revision,
+            )
+            if next_state is not None:
+                await self.send_composer_state(connection, session_name)
+            return
+
+        if message_type == "composer-refresh":
+            next_state = await self.refresh_mobile_composer_from_terminal(
+                session_name,
+                revision=revision,
             )
             if next_state is not None:
                 await self.send_composer_state(connection, session_name)
             return
 
         if message_type == "composer-reset":
+            composer_state = self.mobile_composer_state(session_name)
+            composer_state["revision"] = max(composer_state["revision"], revision)
             self.reset_mobile_composer_tracking(session_name)
             await self.send_composer_state(connection, session_name)
             return

@@ -116,6 +116,7 @@
   const fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
   term.open(document.getElementById("terminal"));
+  installSemanticPromptHandlers();
 
   let socket = null;
   let reconnectTimer = null;
@@ -151,11 +152,38 @@
   let speechFlushTimer = null;
   const mobileComposerMode = window.matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
   let suppressComposerSync = false;
+  let composerRevision = 0;
+  let latestAppliedComposerRevision = 0;
+  let semanticPromptState = {
+    seenMarker: false,
+    commandActive: false,
+    commandStart: null,
+    syncScheduled: false,
+    forceSync: false,
+    lastSignature: "",
+  };
+  let terminalBufferSyncState = {
+    pending: false,
+    syncScheduled: false,
+    forceSync: false,
+    lastSignature: "",
+    timers: [],
+  };
   const TOUCH_INERTIA_MIN_VELOCITY = 0.02;
   const TOUCH_INERTIA_MAX_VELOCITY = 3;
   const TOUCH_INERTIA_FRICTION_PER_MS = 0.9965;
   const TOUCH_INERTIA_MAX_FRAME_MS = 34;
   const TOUCH_VELOCITY_BLEND = 0.35;
+  const SHORTCUT_REPEAT_DELAY_MS = 320;
+  const SHORTCUT_REPEAT_INTERVAL_MS = 70;
+  const TERMINAL_BUFFER_SYNC_DELAYS_MS = [20, 60, 120, 220];
+  const EXTRACTOR_DEBUG_ENABLED = false;
+  const BOX_VERTICAL_CHARS = new Set(["│", "┃", "║", "|"]);
+  const BOX_HORIZONTAL_CHARS = new Set(["─", "━", "═", "-"]);
+  const BOX_TOP_LEFT_CHARS = new Set(["╭", "┌", "╔", "+"]);
+  const BOX_TOP_RIGHT_CHARS = new Set(["╮", "┐", "╗", "+"]);
+  const BOX_BOTTOM_LEFT_CHARS = new Set(["╰", "└", "╚", "+"]);
+  const BOX_BOTTOM_RIGHT_CHARS = new Set(["╯", "┘", "╝", "+"]);
 
   function loadNumericSetting(storageKey, fallback, min, max) {
     const raw = Number.parseFloat(localStorage.getItem(storageKey) || "");
@@ -174,6 +202,76 @@
       sequence: String(shortcut.sequence).trim(),
       visible: shortcut.visible !== false,
     };
+  }
+
+  function resetSemanticPromptState() {
+    semanticPromptState = {
+      seenMarker: false,
+      commandActive: false,
+      commandStart: null,
+      syncScheduled: false,
+      forceSync: false,
+      lastSignature: "",
+    };
+  }
+
+  function resetTerminalBufferSyncState() {
+    terminalBufferSyncState.timers.forEach((timer) => window.clearTimeout(timer));
+    terminalBufferSyncState = {
+      pending: false,
+      syncScheduled: false,
+      forceSync: false,
+      lastSignature: "",
+      timers: [],
+    };
+  }
+
+  let extractorDebugPanel = null;
+
+  function ensureExtractorDebugPanel() {
+    if (!EXTRACTOR_DEBUG_ENABLED || extractorDebugPanel) {
+      return;
+    }
+    extractorDebugPanel = document.createElement("pre");
+    extractorDebugPanel.className = "extractor-debug-panel";
+    document.body.appendChild(extractorDebugPanel);
+  }
+
+  function formatRowSpans(rowSpans, startY) {
+    return rowSpans
+      .map((span, index) => {
+        if (!span) {
+          return `${startY + index}: -`;
+        }
+        return `${startY + index}: ${span.start}-${span.end}`;
+      })
+      .join("\n");
+  }
+
+  function updateExtractorDebugPanel(debugState) {
+    if (!EXTRACTOR_DEBUG_ENABLED || !mobileComposerMode) {
+      return;
+    }
+    ensureExtractorDebugPanel();
+    if (!extractorDebugPanel) {
+      return;
+    }
+    if (!debugState) {
+      extractorDebugPanel.textContent = "extractor: no state";
+      return;
+    }
+    const lines = [
+      `mode: ${debugState.mode || "-"}`,
+      `cursor: ${debugState.cursorY ?? "-"},${debugState.cursorX ?? "-"}`,
+      `source rows: ${debugState.startY ?? "-"}-${debugState.endY ?? "-"}`,
+      `selected rows: ${debugState.firstRowAbs ?? "-"}-${debugState.lastRowAbs ?? "-"}`,
+      debugState.box ? `box: t${debugState.box.top} b${debugState.box.bottom} l${debugState.box.left} r${debugState.box.right}` : "box: -",
+      "row spans:",
+      formatRowSpans(debugState.rowSpans || [], debugState.startY || 0),
+      "preview:",
+      String(debugState.valuePreview || ""),
+    ];
+    extractorDebugPanel.textContent = lines.join("\n");
   }
 
   function loadShortcuts() {
@@ -453,7 +551,7 @@
     if (!mobileComposerMode) {
       return;
     }
-    const nextValue = String(value || "").replace(/\r?\n/g, "");
+    const nextValue = String(value || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     const numericCursor = Number.isFinite(Number(cursor)) ? Number(cursor) : nextValue.length;
     const nextCursor = Math.max(0, Math.min(nextValue.length, numericCursor));
     suppressComposerSync = true;
@@ -477,6 +575,7 @@
       type: "composer-sync",
       value: composerInput.value,
       cursor: composerInput.selectionEnd ?? composerInput.value.length,
+      revision: nextComposerRevision(),
     });
   }
 
@@ -504,7 +603,7 @@
       sendMessage({ type: "input", data: "\r" });
       return;
     }
-    sendMessage({ type: "composer-enter" });
+    sendMessage({ type: "composer-enter", revision: nextComposerRevision() });
     clearComposer(false);
     openComposer(true);
   }
@@ -513,7 +612,7 @@
     if (!mobileComposerMode) {
       return;
     }
-    sendMessage({ type: "composer-reset" });
+    sendMessage({ type: "composer-reset", revision: nextComposerRevision() });
     if (clearValue) {
       clearComposer(false);
     }
@@ -525,7 +624,769 @@
       return;
     }
     openComposer(focus);
-    sendMessage({ type: "composer-history", direction });
+    sendMessage({ type: "input", data: direction === "down" ? specialMap.DOWN : specialMap.UP });
+    if (!semanticPromptState.seenMarker) {
+      queueTerminalBufferComposerSync(true);
+    }
+  }
+
+  function requestComposerRefresh() {
+    if (!mobileComposerMode) {
+      return;
+    }
+    if (semanticPromptState.seenMarker) {
+      scheduleSemanticComposerSync(true);
+      return;
+    }
+    queueTerminalBufferComposerSync(true);
+  }
+
+  function nextComposerRevision() {
+    composerRevision += 1;
+    return composerRevision;
+  }
+
+  function resetComposerRevisionState() {
+    composerRevision = 0;
+    latestAppliedComposerRevision = 0;
+  }
+
+  function semanticTrackingActive() {
+    return semanticPromptState.seenMarker && semanticPromptState.commandActive && semanticPromptState.commandStart;
+  }
+
+  function currentSemanticCursorPosition() {
+    const buffer = term.buffer.active;
+    return {
+      x: buffer.cursorX,
+      y: buffer.baseY + buffer.cursorY,
+    };
+  }
+
+  function lineTextForRange(buffer, lineIndex, startColumn, endColumn = null) {
+    const line = buffer.getLine(lineIndex);
+    if (!line) {
+      return "";
+    }
+    const nextLine = buffer.getLine(lineIndex + 1);
+    const trimRight = !(nextLine && nextLine.isWrapped) && endColumn === null;
+    return line.translateToString(trimRight, startColumn, endColumn === null ? undefined : endColumn);
+  }
+
+  function stripLeadingPromptDecor(value, cursor) {
+    let nextValue = String(value || "");
+    let nextCursor = Number.isFinite(Number(cursor)) ? Number(cursor) : nextValue.length;
+    const patterns = [/^\s*[›❯]\s?/, /^\s*[$#>]\s?/];
+    for (const pattern of patterns) {
+      const match = nextValue.match(pattern);
+      if (!match) {
+        continue;
+      }
+      const prefix = match[0];
+      nextValue = nextValue.slice(prefix.length);
+      nextCursor = Math.max(0, nextCursor - prefix.length);
+      break;
+    }
+    return {
+      value: nextValue,
+      cursor: Math.min(nextValue.length, nextCursor),
+    };
+  }
+
+  function wrappedLogicalLineBounds(buffer, absoluteY) {
+    let startY = absoluteY;
+    while (startY > 0) {
+      const line = buffer.getLine(startY);
+      if (!line || !line.isWrapped) {
+        break;
+      }
+      startY -= 1;
+    }
+    let endY = absoluteY;
+    while (true) {
+      const nextLine = buffer.getLine(endY + 1);
+      if (!nextLine || !nextLine.isWrapped) {
+        break;
+      }
+      endY += 1;
+    }
+    return { startY, endY };
+  }
+
+  function getBufferCell(line, column, cell) {
+    if (!line) {
+      return null;
+    }
+    return line.getCell(column, cell) || null;
+  }
+
+  function getCellChars(line, column, cell) {
+    const nextCell = getBufferCell(line, column, cell);
+    return nextCell ? nextCell.getChars() : "";
+  }
+
+  function isVisibleDefaultPromptCell(cell) {
+    if (!cell || cell.isInvisible() || cell.isDim() || !cell.isFgDefault()) {
+      return false;
+    }
+    const chars = cell.getChars();
+    return Boolean(chars) && /\S/.test(chars);
+  }
+
+  function isBlankPromptCell(cell) {
+    if (!cell || cell.isInvisible() || cell.isDim()) {
+      return false;
+    }
+    const chars = cell.getChars();
+    if (chars === "") {
+      return true;
+    }
+    return /^\s+$/.test(chars);
+  }
+
+  function flatIndexToBufferPosition(flatIndex, startY) {
+    return {
+      y: startY + Math.floor(flatIndex / term.cols),
+      x: flatIndex % term.cols,
+    };
+  }
+
+  function flattenRegionCells(buffer, startY, endY, startX, endX) {
+    const nullCell = buffer.getNullCell();
+    const cells = [];
+    for (let lineIndex = startY; lineIndex <= endY; lineIndex += 1) {
+      const line = buffer.getLine(lineIndex);
+      for (let column = startX; column < endX; column += 1) {
+        const cell = getBufferCell(line, column, nullCell);
+        const chars = cell ? cell.getChars() : "";
+        cells.push({
+          chars,
+          input: isVisibleDefaultPromptCell(cell),
+          blank: isBlankPromptCell(cell),
+        });
+      }
+    }
+    return cells;
+  }
+
+  function flattenWrappedPromptCells(buffer, startY, endY) {
+    return flattenRegionCells(buffer, startY, endY, 0, term.cols);
+  }
+
+  function extractPromptSpanFromCells(cells, cursorFlatIndex) {
+    const searchFrom = Math.max(0, Math.min(cells.length, cursorFlatIndex));
+    let anchorIndex = -1;
+    for (let index = searchFrom - 1; index >= 0; index -= 1) {
+      if (cells[index].input) {
+        anchorIndex = index;
+        break;
+      }
+      if (!cells[index].blank) {
+        break;
+      }
+    }
+    if (anchorIndex < 0) {
+      return null;
+    }
+
+    let startIndex = anchorIndex;
+    while (startIndex > 0 && (cells[startIndex - 1].input || cells[startIndex - 1].blank)) {
+      startIndex -= 1;
+    }
+    let endIndex = anchorIndex;
+    while (endIndex + 1 < cells.length && (cells[endIndex + 1].input || cells[endIndex + 1].blank)) {
+      endIndex += 1;
+    }
+
+    while (startIndex <= endIndex && cells[startIndex].blank) {
+      startIndex += 1;
+    }
+    while (endIndex >= startIndex && cells[endIndex].blank) {
+      endIndex -= 1;
+    }
+    if (startIndex > endIndex) {
+      return null;
+    }
+
+    return { startIndex, endIndex };
+  }
+
+  function extractPromptSpanForRow(buffer, row, startX, endX) {
+    const line = buffer.getLine(row);
+    const nullCell = buffer.getNullCell();
+    if (!line) {
+      return null;
+    }
+
+    let firstInput = -1;
+    let lastInput = -1;
+    for (let column = startX; column < endX; column += 1) {
+      const cell = getBufferCell(line, column, nullCell);
+      if (!isVisibleDefaultPromptCell(cell)) {
+        continue;
+      }
+      if (firstInput < 0) {
+        firstInput = column;
+      }
+      lastInput = column;
+    }
+    if (firstInput < 0 || lastInput < 0) {
+      return null;
+    }
+
+    while (firstInput > startX) {
+      const cell = getBufferCell(line, firstInput - 1, nullCell);
+      if (!isBlankPromptCell(cell)) {
+        break;
+      }
+      firstInput -= 1;
+    }
+    while (lastInput + 1 < endX) {
+      const cell = getBufferCell(line, lastInput + 1, nullCell);
+      if (!isBlankPromptCell(cell)) {
+        break;
+      }
+      lastInput += 1;
+    }
+
+    return {
+      start: firstInput,
+      end: lastInput + 1,
+    };
+  }
+
+  function promptSpansOverlap(left, right) {
+    if (!left || !right) {
+      return false;
+    }
+    return Math.max(left.start, right.start) <= Math.min(left.end, right.end) + 2;
+  }
+
+  function findPromptRowRange(rowSpans, anchorIndex) {
+    let effectiveAnchor = anchorIndex;
+    if (!rowSpans[effectiveAnchor]) {
+      let nearestDistance = Number.POSITIVE_INFINITY;
+      for (let index = 0; index < rowSpans.length; index += 1) {
+        if (!rowSpans[index]) {
+          continue;
+        }
+        const distance = Math.abs(index - anchorIndex);
+        if (distance >= nearestDistance) {
+          continue;
+        }
+        nearestDistance = distance;
+        effectiveAnchor = index;
+      }
+    }
+    if (!rowSpans[effectiveAnchor]) {
+      return null;
+    }
+
+    let firstRow = effectiveAnchor;
+    let lastRow = effectiveAnchor;
+    let previousSpan = rowSpans[effectiveAnchor];
+    for (let index = effectiveAnchor - 1; index >= 0; index -= 1) {
+      const span = rowSpans[index];
+      if (!span || !promptSpansOverlap(span, previousSpan)) {
+        break;
+      }
+      firstRow = index;
+      previousSpan = span;
+    }
+
+    previousSpan = rowSpans[effectiveAnchor];
+    for (let index = effectiveAnchor + 1; index < rowSpans.length; index += 1) {
+      const span = rowSpans[index];
+      if (!span || !promptSpansOverlap(span, previousSpan)) {
+        break;
+      }
+      lastRow = index;
+      previousSpan = span;
+    }
+
+    return {
+      firstRow,
+      lastRow,
+      effectiveAnchor,
+    };
+  }
+
+  function findPromptRowRangeInBox(rowSpans, anchorIndex) {
+    let firstRow = -1;
+    let lastRow = -1;
+    for (let index = 0; index < rowSpans.length; index += 1) {
+      if (!rowSpans[index]) {
+        continue;
+      }
+      if (firstRow < 0) {
+        firstRow = index;
+      }
+      lastRow = index;
+    }
+    if (firstRow < 0 || lastRow < 0) {
+      return null;
+    }
+    return {
+      firstRow,
+      lastRow,
+      effectiveAnchor: Math.max(firstRow, Math.min(lastRow, anchorIndex)),
+    };
+  }
+
+  function extractRegionPromptState(buffer, startY, endY, startX, endX, current, boxed = false) {
+    const rowSpans = [];
+    for (let row = startY; row <= endY; row += 1) {
+      rowSpans.push(extractPromptSpanForRow(buffer, row, startX, endX));
+    }
+
+    const anchorIndex = Math.max(0, Math.min(rowSpans.length - 1, current.y - startY));
+    const rowRange = boxed ? findPromptRowRangeInBox(rowSpans, anchorIndex) : findPromptRowRange(rowSpans, anchorIndex);
+    if (!rowRange) {
+      return {
+        value: "",
+        cursor: 0,
+        tracked: true,
+        debug: {
+          mode: boxed ? "boxed-empty" : "rows-empty",
+          cursorY: current.y,
+          cursorX: current.x,
+          startY,
+          endY,
+          rowSpans,
+          valuePreview: "",
+        },
+      };
+    }
+    const { firstRow, lastRow, effectiveAnchor } = rowRange;
+
+    let value = "";
+    for (let rowIndex = firstRow; rowIndex <= lastRow; rowIndex += 1) {
+      if (rowIndex > firstRow) {
+        value += "\n";
+      }
+      const span = rowSpans[rowIndex];
+      if (!span) {
+        continue;
+      }
+      value += lineTextForRange(buffer, startY + rowIndex, span.start, span.end);
+    }
+
+    let cursor = 0;
+    const relativeCursorRow = Math.max(firstRow, Math.min(lastRow, current.y - startY));
+    for (let rowIndex = firstRow; rowIndex <= relativeCursorRow; rowIndex += 1) {
+      if (rowIndex > firstRow) {
+        cursor += 1;
+      }
+      const span = rowSpans[rowIndex];
+      if (!span) {
+        continue;
+      }
+      const absoluteRow = startY + rowIndex;
+      if (absoluteRow < current.y) {
+        cursor += lineTextForRange(buffer, absoluteRow, span.start, span.end).length;
+        continue;
+      }
+      if (absoluteRow > current.y) {
+        break;
+      }
+      if (current.x <= span.start) {
+        break;
+      }
+      const endColumn = Math.min(current.x, span.end);
+      cursor += lineTextForRange(buffer, absoluteRow, span.start, endColumn).length;
+      break;
+    }
+
+    if (current.y < startY + firstRow) {
+      cursor = 0;
+    } else if (current.y > startY + lastRow) {
+      let tail = "";
+      for (let rowIndex = firstRow; rowIndex <= lastRow; rowIndex += 1) {
+        if (rowIndex > firstRow) {
+          tail += "\n";
+        }
+        const span = rowSpans[rowIndex];
+        if (!span) {
+          continue;
+        }
+        tail += lineTextForRange(buffer, startY + rowIndex, span.start, span.end);
+      }
+      cursor = tail.length;
+    } else if (current.y === startY + effectiveAnchor && !rowSpans[relativeCursorRow]) {
+      cursor = value.length;
+    }
+
+    return {
+      value,
+      cursor,
+      tracked: true,
+      debug: {
+        mode: boxed ? "boxed" : "rows",
+        cursorY: current.y,
+        cursorX: current.x,
+        startY,
+        endY,
+        firstRowAbs: startY + firstRow,
+        lastRowAbs: startY + lastRow,
+        rowSpans,
+        valuePreview: value,
+      },
+    };
+  }
+
+  function detectInputBox(buffer, cursorY, cursorX) {
+    const nullCell = buffer.getNullCell();
+    const currentLine = buffer.getLine(cursorY);
+    if (!currentLine) {
+      return null;
+    }
+
+    let leftBorder = -1;
+    for (let column = cursorX - 1; column >= 0; column -= 1) {
+      const chars = getCellChars(currentLine, column, nullCell);
+      if (BOX_VERTICAL_CHARS.has(chars)) {
+        leftBorder = column;
+        break;
+      }
+    }
+
+    let rightBorder = -1;
+    for (let column = cursorX; column < term.cols; column += 1) {
+      const chars = getCellChars(currentLine, column, nullCell);
+      if (BOX_VERTICAL_CHARS.has(chars)) {
+        rightBorder = column;
+        break;
+      }
+    }
+
+    if (leftBorder < 0 || rightBorder <= leftBorder + 1) {
+      return null;
+    }
+
+    let topBorder = -1;
+    for (let row = cursorY - 1; row >= Math.max(0, cursorY - 8); row -= 1) {
+      const line = buffer.getLine(row);
+      const leftChars = getCellChars(line, leftBorder, nullCell);
+      const rightChars = getCellChars(line, rightBorder, nullCell);
+      if (!BOX_TOP_LEFT_CHARS.has(leftChars) || !BOX_TOP_RIGHT_CHARS.has(rightChars)) {
+        continue;
+      }
+      let horizontal = true;
+      for (let column = leftBorder + 1; column < rightBorder; column += 1) {
+        const chars = getCellChars(line, column, nullCell);
+        if (chars !== "" && !BOX_HORIZONTAL_CHARS.has(chars)) {
+          horizontal = false;
+          break;
+        }
+      }
+      if (horizontal) {
+        topBorder = row;
+        break;
+      }
+    }
+
+    let bottomBorder = -1;
+    for (let row = cursorY + 1; row <= Math.min(buffer.length - 1, cursorY + 8); row += 1) {
+      const line = buffer.getLine(row);
+      const leftChars = getCellChars(line, leftBorder, nullCell);
+      const rightChars = getCellChars(line, rightBorder, nullCell);
+      if (!BOX_BOTTOM_LEFT_CHARS.has(leftChars) || !BOX_BOTTOM_RIGHT_CHARS.has(rightChars)) {
+        continue;
+      }
+      let horizontal = true;
+      for (let column = leftBorder + 1; column < rightBorder; column += 1) {
+        const chars = getCellChars(line, column, nullCell);
+        if (chars !== "" && !BOX_HORIZONTAL_CHARS.has(chars)) {
+          horizontal = false;
+          break;
+        }
+      }
+      if (horizontal) {
+        bottomBorder = row;
+        break;
+      }
+    }
+
+    if (topBorder < 0 || bottomBorder <= topBorder + 1) {
+      return null;
+    }
+
+    return {
+      top: topBorder,
+      bottom: bottomBorder,
+      left: leftBorder,
+      right: rightBorder,
+    };
+  }
+
+  function extractBoxedComposerState(buffer, current) {
+    const box = detectInputBox(buffer, current.y, current.x);
+    if (!box) {
+      return null;
+    }
+
+    const innerStartY = box.top + 1;
+    const innerEndY = box.bottom - 1;
+    const innerStartX = box.left + 1;
+    const innerEndX = box.right;
+    const innerWidth = Math.max(0, innerEndX - innerStartX);
+    if (!innerWidth || innerEndY < innerStartY) {
+      return null;
+    }
+    const regionState = extractRegionPromptState(buffer, innerStartY, innerEndY, innerStartX, innerEndX, current, true);
+    return {
+      ...regionState,
+      debug: {
+        ...(regionState.debug || {}),
+        mode: "boxed",
+        box,
+      },
+    };
+  }
+
+  function extractTerminalBufferComposerState() {
+    const buffer = term.buffer.active;
+    const current = currentSemanticCursorPosition();
+    const currentLine = buffer.getLine(current.y);
+    if (!currentLine) {
+      return null;
+    }
+
+    const boxedState = extractBoxedComposerState(buffer, current);
+    if (boxedState) {
+      const normalizedBoxed = stripLeadingPromptDecor(boxedState.value, boxedState.cursor);
+      updateExtractorDebugPanel({
+        ...(boxedState.debug || {}),
+        valuePreview: normalizedBoxed.value,
+      });
+      return {
+        value: normalizedBoxed.value,
+        cursor: normalizedBoxed.cursor,
+        tracked: true,
+      };
+    }
+
+    const { startY, endY } = wrappedLogicalLineBounds(buffer, current.y);
+    const regionState = extractRegionPromptState(buffer, startY, endY, 0, term.cols, current);
+    const normalized = stripLeadingPromptDecor(regionState.value, regionState.cursor);
+    updateExtractorDebugPanel({
+      ...(regionState.debug || {}),
+      valuePreview: normalized.value,
+    });
+    return {
+      value: normalized.value,
+      cursor: normalized.cursor,
+      tracked: true,
+    };
+  }
+
+  function extractSemanticComposerState() {
+    if (!semanticTrackingActive()) {
+      return null;
+    }
+    const buffer = term.buffer.active;
+    const start = semanticPromptState.commandStart;
+    const current = currentSemanticCursorPosition();
+    if (!start || current.y < start.y || (current.y === start.y && current.x < start.x)) {
+      return { value: "", cursor: 0, tracked: true };
+    }
+
+    let endY = current.y;
+    while (true) {
+      const nextLine = buffer.getLine(endY + 1);
+      if (!nextLine || !nextLine.isWrapped) {
+        break;
+      }
+      endY += 1;
+    }
+
+    let value = "";
+    let cursor = 0;
+    for (let lineIndex = start.y; lineIndex <= endY; lineIndex += 1) {
+      const line = buffer.getLine(lineIndex);
+      if (!line) {
+        break;
+      }
+      const startColumn = lineIndex === start.y ? start.x : 0;
+      const prefix = lineIndex === start.y ? "" : line.isWrapped ? "" : "\n";
+      value += prefix;
+      if (lineIndex < current.y) {
+        const segment = lineTextForRange(buffer, lineIndex, startColumn);
+        value += segment;
+        cursor = value.length;
+        continue;
+      }
+      if (lineIndex === current.y) {
+        const cursorSegment = lineTextForRange(buffer, lineIndex, startColumn, current.x);
+        const lineRemainder = lineTextForRange(buffer, lineIndex, startColumn);
+        value += lineRemainder;
+        cursor = value.length - Math.max(0, lineRemainder.length - cursorSegment.length);
+        continue;
+      }
+      value += lineTextForRange(buffer, lineIndex, startColumn);
+    }
+
+    return {
+      value,
+      cursor,
+      tracked: true,
+    };
+  }
+
+  function flushSemanticComposerState(force = false) {
+    if (!mobileComposerMode) {
+      return;
+    }
+
+    let nextState = extractSemanticComposerState();
+    if (!nextState) {
+      if (!force && semanticPromptState.lastSignature === "") {
+        return;
+      }
+      nextState = { value: "", cursor: 0, tracked: false };
+    }
+
+    const signature = `${nextState.tracked ? "1" : "0"}:${nextState.cursor}:${nextState.value}`;
+    if (!force && signature === semanticPromptState.lastSignature) {
+      return;
+    }
+    semanticPromptState.lastSignature = signature;
+
+    if (nextState.tracked) {
+      if (
+        composerInput.value !== nextState.value ||
+        (composerInput.selectionEnd ?? composerInput.value.length) !== nextState.cursor
+      ) {
+        setComposerValue(nextState.value, nextState.cursor);
+      }
+    } else if (composerInput.value !== "") {
+      setComposerValue("", 0);
+    }
+
+    sendMessage({
+      type: "composer-semantic-sync",
+      value: nextState.value,
+      cursor: nextState.cursor,
+      tracked: nextState.tracked,
+      revision: composerRevision,
+      source: "semantic-osc133",
+    });
+  }
+
+  function scheduleSemanticComposerSync(force = false) {
+    if (!mobileComposerMode) {
+      return;
+    }
+    semanticPromptState.forceSync = semanticPromptState.forceSync || force;
+    if (semanticPromptState.syncScheduled) {
+      return;
+    }
+    semanticPromptState.syncScheduled = true;
+    window.requestAnimationFrame(() => {
+      semanticPromptState.syncScheduled = false;
+      const nextForce = semanticPromptState.forceSync;
+      semanticPromptState.forceSync = false;
+      flushSemanticComposerState(nextForce);
+    });
+  }
+
+  function flushTerminalBufferComposerState(force = false) {
+    if (!mobileComposerMode || semanticPromptState.seenMarker) {
+      return;
+    }
+
+    const nextState = extractTerminalBufferComposerState();
+    if (!nextState) {
+      if (!force && terminalBufferSyncState.lastSignature === "") {
+        return;
+      }
+      terminalBufferSyncState.pending = false;
+      terminalBufferSyncState.lastSignature = "0:0:";
+      setComposerValue("", 0);
+      sendMessage({
+        type: "composer-semantic-sync",
+        value: "",
+        cursor: 0,
+        tracked: false,
+        revision: composerRevision,
+        source: "terminal-buffer",
+      });
+      return;
+    }
+
+    const signature = `${nextState.cursor}:${nextState.value}`;
+    if (!force && signature === terminalBufferSyncState.lastSignature) {
+      return;
+    }
+    terminalBufferSyncState.lastSignature = signature;
+    terminalBufferSyncState.pending = false;
+    if (
+      composerInput.value !== nextState.value ||
+      (composerInput.selectionEnd ?? composerInput.value.length) !== nextState.cursor
+    ) {
+      setComposerValue(nextState.value, nextState.cursor);
+    }
+    sendMessage({
+      type: "composer-semantic-sync",
+      value: nextState.value,
+      cursor: nextState.cursor,
+      tracked: true,
+      revision: composerRevision,
+      source: "terminal-buffer",
+    });
+  }
+
+  function scheduleTerminalBufferComposerSync(force = false) {
+    if (!mobileComposerMode || semanticPromptState.seenMarker) {
+      return;
+    }
+    terminalBufferSyncState.forceSync = terminalBufferSyncState.forceSync || force;
+    if (terminalBufferSyncState.syncScheduled) {
+      return;
+    }
+    terminalBufferSyncState.syncScheduled = true;
+    window.requestAnimationFrame(() => {
+      terminalBufferSyncState.syncScheduled = false;
+      const nextForce = terminalBufferSyncState.forceSync;
+      terminalBufferSyncState.forceSync = false;
+      flushTerminalBufferComposerState(nextForce);
+    });
+  }
+
+  function queueTerminalBufferComposerSync(force = false) {
+    if (!mobileComposerMode || semanticPromptState.seenMarker) {
+      return;
+    }
+    terminalBufferSyncState.pending = true;
+    terminalBufferSyncState.forceSync = terminalBufferSyncState.forceSync || force;
+    terminalBufferSyncState.timers.forEach((timer) => window.clearTimeout(timer));
+    terminalBufferSyncState.timers = TERMINAL_BUFFER_SYNC_DELAYS_MS.map((delay) =>
+      window.setTimeout(() => {
+        scheduleTerminalBufferComposerSync(force);
+      }, delay),
+    );
+  }
+
+  function installSemanticPromptHandlers() {
+    if (!term.parser || typeof term.parser.registerOscHandler !== "function") {
+      return;
+    }
+    term.parser.registerOscHandler(133, (data) => {
+      const command = String(data || "").split(";", 1)[0].trim().toUpperCase();
+      semanticPromptState.seenMarker = true;
+      if (command === "B") {
+        semanticPromptState.commandActive = true;
+        semanticPromptState.commandStart = currentSemanticCursorPosition();
+        semanticPromptState.lastSignature = "";
+        scheduleSemanticComposerSync(true);
+      } else if (command === "C" || command === "D") {
+        semanticPromptState.commandActive = false;
+        semanticPromptState.commandStart = null;
+        semanticPromptState.lastSignature = "";
+        scheduleSemanticComposerSync(true);
+      }
+      return false;
+    });
   }
 
   function shortcutHistoryDirection(sequence) {
@@ -537,6 +1398,22 @@
       return "down";
     }
     return "";
+  }
+
+  function shortcutSupportsHoldRepeat(sequence) {
+    const upper = sequence.trim().toUpperCase();
+    return [
+      "{BACKSPACE}",
+      "{TAB}",
+      "{UP}",
+      "{DOWN}",
+      "{LEFT}",
+      "{RIGHT}",
+      "{HOME}",
+      "{END}",
+      "{PGUP}",
+      "{PGDN}",
+    ].includes(upper);
   }
 
   function shortcutShouldFlushComposer(sequence) {
@@ -1084,20 +1961,21 @@
     shortcuts.filter((shortcut) => shortcut.visible !== false).forEach((shortcut) => {
       const button = document.createElement("button");
       let preserveComposerFocus = false;
+      let repeatDelayTimer = null;
+      let repeatIntervalTimer = null;
+      let suppressClickAfterRepeat = false;
       button.className = "shortcut-button";
       button.type = "button";
       button.textContent = shortcut.label;
-      button.addEventListener(
-        "pointerdown",
-        (event) => {
-          preserveComposerFocus = mobileComposerMode && document.activeElement === composerInput;
-          if (preserveComposerFocus) {
-            event.preventDefault();
-          }
-        },
-        { passive: false },
-      );
-      button.addEventListener("click", () => {
+
+      const clearRepeatTimers = () => {
+        window.clearTimeout(repeatDelayTimer);
+        window.clearInterval(repeatIntervalTimer);
+        repeatDelayTimer = null;
+        repeatIntervalTimer = null;
+      };
+
+      const activateShortcut = () => {
         if (Date.now() < suppressShortcutClickUntil) {
           return;
         }
@@ -1110,8 +1988,16 @@
           return;
         }
         if (mobileComposerMode && normalizedSequence === "{ENTER}") {
-          sendMessage({ type: "composer-enter" });
+          sendMessage({ type: "composer-enter", revision: nextComposerRevision() });
           clearComposer(false);
+          if (preserveComposerFocus) {
+            window.requestAnimationFrame(() => openComposer(true));
+          }
+          return;
+        }
+        if (mobileComposerMode && normalizedSequence === "{BACKSPACE}" && composerInput.value === "") {
+          sendMessage({ type: "input", data: specialMap.BACKSPACE });
+          requestComposerRefresh();
           if (preserveComposerFocus) {
             window.requestAnimationFrame(() => openComposer(true));
           }
@@ -1136,6 +2022,42 @@
         if (preserveComposerFocus) {
           window.requestAnimationFrame(() => openComposer(true));
         }
+      };
+
+      button.addEventListener(
+        "pointerdown",
+        (event) => {
+          if (event.pointerType === "mouse" && event.button !== 0) {
+            return;
+          }
+          preserveComposerFocus = mobileComposerMode && document.activeElement === composerInput;
+          if (preserveComposerFocus) {
+            event.preventDefault();
+          }
+          clearRepeatTimers();
+          suppressClickAfterRepeat = false;
+          if (!shortcutSupportsHoldRepeat(shortcut.sequence)) {
+            return;
+          }
+          repeatDelayTimer = window.setTimeout(() => {
+            suppressClickAfterRepeat = true;
+            activateShortcut();
+            repeatIntervalTimer = window.setInterval(() => {
+              activateShortcut();
+            }, SHORTCUT_REPEAT_INTERVAL_MS);
+          }, SHORTCUT_REPEAT_DELAY_MS);
+        },
+        { passive: false },
+      );
+      button.addEventListener("click", () => {
+        if (suppressClickAfterRepeat) {
+          suppressClickAfterRepeat = false;
+          return;
+        }
+        activateShortcut();
+      });
+      ["pointerup", "pointercancel", "pointerleave", "lostpointercapture"].forEach((eventName) => {
+        button.addEventListener(eventName, clearRepeatTimers);
       });
       shortcutBar.appendChild(button);
     });
@@ -1227,7 +2149,13 @@
       if (chunk instanceof Blob) {
         chunk = await chunk.arrayBuffer();
       }
-      term.write(decoder.decode(chunk, { stream: true }));
+      term.write(decoder.decode(chunk, { stream: true }), () => {
+        if (semanticPromptState.seenMarker) {
+          scheduleSemanticComposerSync();
+        } else if (terminalBufferSyncState.pending) {
+          scheduleTerminalBufferComposerSync();
+        }
+      });
       if (followOutput) {
         term.scrollToBottom();
       }
@@ -1255,6 +2183,9 @@
 
   function handleServerMessage(payload) {
     if (payload.type === "ready") {
+      resetComposerRevisionState();
+      resetSemanticPromptState();
+      resetTerminalBufferSyncState();
       activeSessionName = payload.session || "";
       selectedSessionName = activeSessionName;
       persistActiveSession(activeSessionName);
@@ -1265,6 +2196,9 @@
       syncOpenTabsToSessions();
       scheduleLayoutRefresh();
       focusTerminal();
+      if (!semanticPromptState.seenMarker) {
+        queueTerminalBufferComposerSync(true);
+      }
       return;
     }
     if (payload.type === "tabs") {
@@ -1280,6 +2214,19 @@
     }
     if (payload.type === "composer-state") {
       if (mobileComposerMode) {
+        if (
+          semanticTrackingActive() &&
+          payload.source !== "semantic-osc133" &&
+          payload.source !== "composer-sync" &&
+          payload.source !== "terminal-buffer"
+        ) {
+          return;
+        }
+        const revision = Number.isFinite(Number(payload.revision)) ? Number(payload.revision) : 0;
+        if (revision < composerRevision || revision < latestAppliedComposerRevision) {
+          return;
+        }
+        latestAppliedComposerRevision = revision;
         setComposerValue(payload.value || "", payload.cursor);
       }
       return;
@@ -1765,11 +2712,11 @@
   });
   composerInput.addEventListener("input", () => {
     const value = composerInput.value;
-    if (/\r|\n/.test(value)) {
+    const normalizedValue = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (normalizedValue !== value) {
       const cursor = composerInput.selectionEnd ?? value.length;
-      const nextValue = value.replace(/\r?\n/g, "");
-      const nextCursor = value.slice(0, cursor).replace(/\r?\n/g, "").length;
-      composerInput.value = nextValue;
+      const nextCursor = normalizedValue.slice(0, cursor).replace(/\r\n/g, "\n").replace(/\r/g, "\n").length;
+      composerInput.value = normalizedValue;
       try {
         composerInput.setSelectionRange(nextCursor, nextCursor);
       } catch (_error) {
@@ -1782,7 +2729,6 @@
   composerInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       if (event.shiftKey) {
-        event.preventDefault();
         return;
       }
       event.preventDefault();
@@ -1797,6 +2743,19 @@
     if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey) {
       event.preventDefault();
       navigateComposerHistory("down");
+      return;
+    }
+    if (
+      event.key === "Backspace" &&
+      !event.shiftKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      composerInput.value === ""
+    ) {
+      event.preventDefault();
+      sendMessage({ type: "input", data: specialMap.BACKSPACE });
+      requestComposerRefresh();
       return;
     }
     if (event.key === "Escape") {

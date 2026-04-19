@@ -150,6 +150,28 @@ h2 {
   color: #ff8c82;
 }
 
+.extractor-debug-panel {
+  position: fixed;
+  top: calc(env(safe-area-inset-top) + 8px);
+  right: 8px;
+  z-index: 80;
+  width: min(88vw, 420px);
+  max-height: min(42vh, 360px);
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 209, 102, 0.32);
+  background: rgba(5, 13, 19, 0.94);
+  color: #d7e3ec;
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: 12px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.42);
+  pointer-events: none;
+}
+
 .action-button,
 .ghost-button,
 .primary-button,

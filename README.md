@@ -15,7 +15,7 @@
 ## Run
 
 ```bash
-cd /home/powerhouse/mobile-terminal
+cd /path/to/mobile-terminal
 ./run.sh --host 0.0.0.0 --port 8085 --session mobile-terminal
 ```
 
@@ -25,7 +25,7 @@ The server prints an access token. Open `http://<this-computer-ip>:8085` on your
 
 ```bash
 python3 server.py --help
-python3 server.py --host 0.0.0.0 --port 8085 --session mobile-terminal --cwd /home/powerhouse --shell /usr/bin/zsh
+python3 server.py --host 0.0.0.0 --port 8085 --session mobile-terminal --cwd "$HOME" --shell "$SHELL"
 MOBILE_TERMINAL_TOKEN='choose-a-long-secret' ./run.sh --host 0.0.0.0 --port 8085
 ```
 
@@ -76,17 +76,30 @@ That setup enables tmux copy-mode on scroll and matches the scroll direction exp
 - The UI stores the access token and shortcut layout in browser local storage.
 - Traffic is plain HTTP and WebSocket. That is fine on a trusted LAN, but use a VPN, Tailscale, or HTTPS reverse proxy if you want to access it across untrusted networks.
 
-## systemd user service
+## Install
 
-The repo now includes:
-
-- [mobile-terminal.service](/home/powerhouse/.config/systemd/user/mobile-terminal.service:1)
-- [example.env](/home/powerhouse/mobile-terminal/example.env:1)
-- [systemd/mobile-terminal.service](/home/powerhouse/mobile-terminal/systemd/mobile-terminal.service:1)
-
-Default startup mode is Tailscale-only on port `8085` with no browser token. Start by copying `example.env` to `mobile-terminal.env`, then add your real settings there. To further lock it to one phone, add that phone's Tailscale IP to `MOBILE_TERMINAL_ALLOW_CLIENTS` in that local env file, then run:
+The repo includes a cross-platform installer:
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user restart mobile-terminal.service
+./install.sh
 ```
+
+What it does:
+
+- Installs `python3`, `tmux`, `node`, and `npm` if they are missing.
+- Runs `npm ci` to populate `node_modules`.
+- Creates `mobile-terminal.env` if you do not already have one.
+- Installs and starts a user service:
+  - Linux: `systemd --user`
+  - macOS: `launchd`
+
+Useful variants:
+
+```bash
+./install.sh --tailscale --no-token
+./install.sh --port 8085 --session mobile-terminal --cwd "$HOME" --shell "$SHELL"
+./install.sh --service none
+```
+
+On Linux, the generated service is written to `~/.config/systemd/user/mobile-terminal.service`.
+On macOS, the generated agent is written to `~/Library/LaunchAgents/com.mobile-terminal.server.plist`.
