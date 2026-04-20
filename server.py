@@ -1165,6 +1165,11 @@ class AppServer:
             return
 
         requested_session = parse_qs(request_url.query).get("session", [""])[0].strip()
+        skip_history = parse_qs(request_url.query).get("skip_history", [""])[0].strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         session_name = self.session_name
         create_if_missing = True
         requested_session_missing = False
@@ -1181,7 +1186,7 @@ class AppServer:
         state = {"session": session_name}
         bridge = TmuxBridge(session_name, self.shell, self.cwd, create_if_missing=create_if_missing)
         bridge.open()
-        history = capture_history(state["session"])
+        history = "" if skip_history else capture_history(state["session"])
 
         async def relay_output() -> None:
             while True:
@@ -1204,8 +1209,6 @@ class AppServer:
         tab_task = asyncio.create_task(watch_tabs())
 
         try:
-            if history:
-                await connection.send(history.encode("utf-8", "surrogateescape"))
             await self.send_json(
                 connection,
                 {
@@ -1218,6 +1221,8 @@ class AppServer:
                     "allowedClients": self.allowed_clients,
                 },
             )
+            if history:
+                await connection.send(history.encode("utf-8", "surrogateescape"))
             if requested_session_missing:
                 await self.send_json(
                     connection,

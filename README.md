@@ -73,6 +73,8 @@ That setup enables tmux copy-mode on scroll and matches the scroll direction exp
 ## Notes
 
 - The backend creates the tmux session automatically if it does not exist yet.
+- Session switches do not preload tmux history anymore. The browser reconnects to the new session first, then streams live output, which avoids large-history freezes on heavy sessions.
+- Mobile composer sync is trigger-based. It updates on explicit recall and edit actions instead of scanning terminal output continuously, which keeps full-screen apps from stalling the UI.
 - The UI stores the access token and shortcut layout in browser local storage.
 - Traffic is plain HTTP and WebSocket. That is fine on a trusted LAN, but use a VPN, Tailscale, or HTTPS reverse proxy if you want to access it across untrusted networks.
 

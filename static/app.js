@@ -133,6 +133,7 @@
   let activeSessionName = "";
   let followOutput = true;
   let reconnectForSessionSwitch = false;
+  let skipHistoryOnNextConnect = false;
   let hostSettingsReady = false;
   let sessionMenuOpen = false;
   let settingsMenuOpen = false;
@@ -519,6 +520,10 @@
     const url = new URL("/_ws", window.location.href);
     if (selectedSessionName) {
       url.searchParams.set("session", selectedSessionName);
+    }
+    if (skipHistoryOnNextConnect) {
+      url.searchParams.set("skip_history", "1");
+      skipHistoryOnNextConnect = false;
     }
     url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     return url.toString();
@@ -2152,8 +2157,6 @@
       term.write(decoder.decode(chunk, { stream: true }), () => {
         if (semanticPromptState.seenMarker) {
           scheduleSemanticComposerSync();
-        } else if (terminalBufferSyncState.pending) {
-          scheduleTerminalBufferComposerSync();
         }
       });
       if (followOutput) {
@@ -2196,9 +2199,6 @@
       syncOpenTabsToSessions();
       scheduleLayoutRefresh();
       focusTerminal();
-      if (!semanticPromptState.seenMarker) {
-        queueTerminalBufferComposerSync(true);
-      }
       return;
     }
     if (payload.type === "tabs") {
@@ -2419,6 +2419,7 @@
     resetSpeechInputState();
     resetComposerTracking(true);
     term.reset();
+    skipHistoryOnNextConnect = true;
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
       reconnectForSessionSwitch = true;
       socket.close(1000, "switch-session");
