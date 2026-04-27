@@ -278,6 +278,7 @@ def default_settings() -> dict[str, Any]:
         "shortcuts": [
             {"label": "Esc", "sequence": "{ESC}", "visible": True},
             {"label": "📋", "sequence": "{PASTE}", "visible": True},
+            {"label": "Copy", "sequence": "{COPY}", "visible": True},
             {"label": "Tab", "sequence": "{TAB}", "visible": True},
             {"label": "⬆️", "sequence": "{UP}", "visible": True},
             {"label": "⬇️", "sequence": "{DOWN}", "visible": True},
@@ -372,20 +373,46 @@ def build_composer_sync_sequence(
     current_cursor = clamp_cursor(current_value, previous_cursor)
     target_cursor = clamp_cursor(target_value, next_cursor)
 
-    move_right = max(0, len(current_value) - current_cursor)
-    move_left = max(0, len(target_value) - target_cursor)
+    common_prefix = 0
+    max_prefix = min(len(current_value), len(target_value))
+    while common_prefix < max_prefix and current_value[common_prefix] == target_value[common_prefix]:
+        common_prefix += 1
+
+    common_suffix = 0
+    max_suffix = min(len(current_value), len(target_value)) - common_prefix
+    while (
+        common_suffix < max_suffix
+        and current_value[len(current_value) - common_suffix - 1]
+        == target_value[len(target_value) - common_suffix - 1]
+    ):
+        common_suffix += 1
+
+    delete_start = common_prefix
+    delete_end = len(current_value) - common_suffix
+    insert_text = target_value[delete_start : len(target_value) - common_suffix]
+    edit_cursor = delete_start + len(insert_text)
+
     sequence = ""
-    if move_right:
-        sequence += RIGHT_ARROW * move_right
-    if current_value:
-        sequence += "\u007f" * len(current_value)
-    if target_value:
-        if "\n" in target_value:
-            sequence += BRACKETED_PASTE_START + target_value + BRACKETED_PASTE_END
+    move_to_delete_end = delete_end - current_cursor
+    if move_to_delete_end > 0:
+        sequence += RIGHT_ARROW * move_to_delete_end
+    elif move_to_delete_end < 0:
+        sequence += LEFT_ARROW * abs(move_to_delete_end)
+
+    delete_count = delete_end - delete_start
+    if delete_count > 0:
+        sequence += "\u007f" * delete_count
+    if insert_text:
+        if "\n" in insert_text:
+            sequence += BRACKETED_PASTE_START + insert_text + BRACKETED_PASTE_END
         else:
-            sequence += target_value
-    if move_left:
-        sequence += LEFT_ARROW * move_left
+            sequence += insert_text
+
+    move_to_target = target_cursor - edit_cursor
+    if move_to_target > 0:
+        sequence += RIGHT_ARROW * move_to_target
+    elif move_to_target < 0:
+        sequence += LEFT_ARROW * abs(move_to_target)
     return sequence, target_cursor
 
 
@@ -594,13 +621,19 @@ class AppServer:
         host = remote_ip(remote_address_value)
         return host in self.allowed_clients
 
+    def client_is_trusted(self, remote_address_value: Any) -> bool:
+        if not self.allowed_clients:
+            return False
+        return self.client_is_allowed(remote_address_value)
+
     async def process_request(self, connection: ServerConnection, request: Request) -> Response | None:
         path = urlsplit(request.path).path
         if not self.client_is_allowed(connection.remote_address):
             return http_response(403, b"Forbidden\n", "text/plain; charset=utf-8")
         if path == "/config":
+            trusted_client = self.client_is_trusted(connection.remote_address)
             payload = {
-                "requireToken": self.require_token,
+                "requireToken": self.require_token and not trusted_client,
                 "tailscaleMode": self.tailscale_mode,
                 "allowedClients": self.allowed_clients,
                 "host": self.host,
@@ -1136,33 +1169,35 @@ class AppServer:
             await connection.close(code=4003, reason="forbidden")
             return
 
-        try:
-            raw_auth = await asyncio.wait_for(connection.recv(), timeout=20)
-        except TimeoutError:
-            await connection.close(code=4001, reason="auth timeout")
-            return
+        trusted_client = self.client_is_trusted(connection.remote_address)
+        if not trusted_client:
+            try:
+                raw_auth = await asyncio.wait_for(connection.recv(), timeout=20)
+            except TimeoutError:
+                await connection.close(code=4001, reason="auth timeout")
+                return
 
-        if not isinstance(raw_auth, str):
-            await connection.close(code=4001, reason="auth required")
-            return
+            if not isinstance(raw_auth, str):
+                await connection.close(code=4001, reason="auth required")
+                return
 
-        try:
-            auth_payload = json.loads(raw_auth)
-        except json.JSONDecodeError:
-            await connection.close(code=4001, reason="auth required")
-            return
+            try:
+                auth_payload = json.loads(raw_auth)
+            except json.JSONDecodeError:
+                await connection.close(code=4001, reason="auth required")
+                return
 
-        token_ok = True
-        if self.require_token:
-            token_ok = self.token is not None and hmac.compare_digest(
-                str(auth_payload.get("token", "")),
-                self.token,
-            )
+            token_ok = True
+            if self.require_token:
+                token_ok = self.token is not None and hmac.compare_digest(
+                    str(auth_payload.get("token", "")),
+                    self.token,
+                )
 
-        if auth_payload.get("type") != "auth" or not token_ok:
-            await self.send_json(connection, {"type": "auth-error", "message": "Invalid access token."})
-            await connection.close(code=4001, reason="auth failed")
-            return
+            if auth_payload.get("type") != "auth" or not token_ok:
+                await self.send_json(connection, {"type": "auth-error", "message": "Invalid access token."})
+                await connection.close(code=4001, reason="auth failed")
+                return
 
         requested_session = parse_qs(request_url.query).get("session", [""])[0].strip()
         skip_history = parse_qs(request_url.query).get("skip_history", [""])[0].strip().lower() in (
@@ -1216,7 +1251,7 @@ class AppServer:
                     "session": state["session"],
                     "shell": self.shell,
                     "cwd": self.cwd,
-                    "requireToken": self.require_token,
+                    "requireToken": self.require_token and not trusted_client,
                     "tailscaleMode": self.tailscale_mode,
                     "allowedClients": self.allowed_clients,
                 },

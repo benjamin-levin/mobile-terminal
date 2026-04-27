@@ -14,6 +14,7 @@
   const defaultShortcuts = [
     { label: "Esc", sequence: "{ESC}", visible: true },
     { label: "📋", sequence: "{PASTE}", visible: true },
+    { label: "Copy", sequence: "{COPY}", visible: true },
     { label: "Tab", sequence: "{TAB}", visible: true },
     { label: "⬆️", sequence: "{UP}", visible: true },
     { label: "⬇️", sequence: "{DOWN}", visible: true },
@@ -69,6 +70,7 @@
   const displayPreview = document.getElementById("displayPreview");
   const displayUiPreview = document.getElementById("displayUiPreview");
   const displayTerminalPreview = document.getElementById("displayTerminalPreview");
+  const terminalElement = document.getElementById("terminal");
 
   let serverConfig = {
     requireToken: true,
@@ -115,12 +117,19 @@
   });
   const fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
-  term.open(document.getElementById("terminal"));
+  term.open(terminalElement);
   installSemanticPromptHandlers();
 
   let socket = null;
   let reconnectTimer = null;
   let fitTimer = null;
+  let terminalFitScheduled = false;
+  let pendingFitPreserveCols = false;
+  let lastTerminalCols = 0;
+  let lastTerminalRows = 0;
+  let lastTerminalLayoutWidth = 0;
+  let lastComposerHeight = 0;
+  let lastLayoutViewportWidth = 0;
   let viewportSettleTimers = [];
   let lastStableViewportWidth = 0;
   let lastStableViewportHeight = 0;
@@ -134,6 +143,7 @@
   let followOutput = true;
   let reconnectForSessionSwitch = false;
   let skipHistoryOnNextConnect = false;
+  let authConfigPollTimer = 0;
   let hostSettingsReady = false;
   let sessionMenuOpen = false;
   let settingsMenuOpen = false;
@@ -178,6 +188,7 @@
   const SHORTCUT_REPEAT_DELAY_MS = 320;
   const SHORTCUT_REPEAT_INTERVAL_MS = 70;
   const TERMINAL_BUFFER_SYNC_DELAYS_MS = [20, 60, 120, 220];
+  const TERMINAL_COL_GUARD = 1;
   const EXTRACTOR_DEBUG_ENABLED = false;
   const BOX_VERTICAL_CHARS = new Set(["│", "┃", "║", "|"]);
   const BOX_HORIZONTAL_CHARS = new Set(["─", "━", "═", "-"]);
@@ -345,6 +356,115 @@
     }, 2800);
   }
 
+  function isEditableTarget(target) {
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+    return Boolean(target.closest("input, textarea, select, [contenteditable=''], [contenteditable='true']"));
+  }
+
+  function insertComposerText(text, focus = true) {
+    if (!mobileComposerMode || !text) {
+      return;
+    }
+    openComposer(focus);
+    composerInput.setRangeText(text, composerInput.selectionStart, composerInput.selectionEnd, "end");
+    autoSizeComposer();
+    syncComposerState();
+  }
+
+  function composerHasKeyboardFocus() {
+    return mobileComposerMode && document.activeElement === composerInput;
+  }
+
+  let lastComposerInputAt = 0;
+  let userRefreshExpected = false;
+  const COMPOSER_INPUT_QUIET_MS = 350;
+
+  function userIsActivelyTyping() {
+    if (!mobileComposerMode) return false;
+    return Date.now() - lastComposerInputAt < COMPOSER_INPUT_QUIET_MS;
+  }
+
+  function consumeUserRefreshExpectation() {
+    const value = userRefreshExpected;
+    userRefreshExpected = false;
+    return value;
+  }
+
+  function shouldYieldToLocalComposer(extracted) {
+    if (!extracted) {
+      return false;
+    }
+    if (!composerHasKeyboardFocus() && !userIsActivelyTyping()) {
+      return false;
+    }
+    const localValue = composerInput.value;
+    const localCursor = composerInput.selectionEnd ?? localValue.length;
+    return localValue !== extracted.value || localCursor !== extracted.cursor;
+  }
+
+  function restoreShortcutKeyboardState(wasFocused) {
+    if (!mobileComposerMode) {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      if (wasFocused) {
+        openComposer(true);
+      } else if (document.activeElement === composerInput) {
+        composerInput.blur();
+        setComposerActive(false);
+      }
+    });
+  }
+
+  function terminalSelectionText() {
+    if (typeof term.getSelection !== "function") {
+      return "";
+    }
+    return term.getSelection();
+  }
+
+  function copyTextWithFallback(text) {
+    if (!text) {
+      return false;
+    }
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.left = "-9999px";
+    textarea.style.top = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch (_error) {
+      copied = false;
+    }
+    textarea.remove();
+    return copied;
+  }
+
+  async function copyTerminalSelection() {
+    const text = terminalSelectionText();
+    if (!text) {
+      showToast("Select terminal text first.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast("Copied terminal selection.");
+    } catch (_error) {
+      if (copyTextWithFallback(text)) {
+        showToast("Copied terminal selection.");
+        return;
+      }
+      showToast("Clipboard copy is blocked by this browser.");
+    }
+  }
+
   function persistActiveSession(sessionName) {
     if (!sessionName) {
       localStorage.removeItem(STORAGE_ACTIVE_SESSION_KEY);
@@ -500,9 +620,17 @@
     if (!mobileComposerMode) {
       return;
     }
+    const previousHeight = lastComposerHeight || Math.ceil(composerInput.getBoundingClientRect().height);
     composerInput.style.height = "auto";
-    composerInput.style.height = `${Math.min(composerInput.scrollHeight, window.innerHeight * 0.34)}px`;
-    scheduleLayoutRefresh();
+    const style = window.getComputedStyle(composerInput);
+    const borderHeight =
+      Number.parseFloat(style.borderTopWidth || "0") + Number.parseFloat(style.borderBottomWidth || "0");
+    const nextHeight = Math.ceil(Math.min(composerInput.scrollHeight + borderHeight, window.innerHeight * 0.34));
+    composerInput.style.height = `${nextHeight}px`;
+    if (Math.abs(nextHeight - previousHeight) > 1) {
+      lastComposerHeight = nextHeight;
+      scheduleLayoutRefresh({ preserveTerminalCols: true });
+    }
   }
 
   function setComposerActive(active) {
@@ -510,9 +638,9 @@
       return;
     }
     document.body.dataset.composerActive = active ? "true" : "false";
-    scheduleLayoutRefresh();
+    scheduleLayoutRefresh({ preserveTerminalCols: true });
     window.requestAnimationFrame(() => {
-      scheduleLayoutRefresh();
+      scheduleLayoutRefresh({ preserveTerminalCols: true });
     });
   }
 
@@ -527,6 +655,34 @@
     }
     url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     return url.toString();
+  }
+
+  function stopAuthConfigPolling() {
+    if (authConfigPollTimer) {
+      window.clearTimeout(authConfigPollTimer);
+      authConfigPollTimer = 0;
+    }
+  }
+
+  function scheduleAuthConfigPolling() {
+    if (authConfigPollTimer) {
+      return;
+    }
+    authConfigPollTimer = window.setTimeout(async () => {
+      authConfigPollTimer = 0;
+      const savedToken = localStorage.getItem(STORAGE_TOKEN_KEY);
+      if (!loginOverlay || loginOverlay.classList.contains("hidden") || savedToken) {
+        return;
+      }
+      await loadServerConfig();
+      if (!serverConfig.requireToken) {
+        loginOverlay.classList.add("hidden");
+        loginMessage.textContent = "";
+        connect();
+        return;
+      }
+      scheduleAuthConfigPolling();
+    }, 1500);
   }
 
   function openComposer(focus = true) {
@@ -639,6 +795,7 @@
     if (!mobileComposerMode) {
       return;
     }
+    userRefreshExpected = true;
     if (semanticPromptState.seenMarker) {
       scheduleSemanticComposerSync(true);
       return;
@@ -1255,6 +1412,14 @@
     if (!force && signature === semanticPromptState.lastSignature) {
       return;
     }
+
+    // While the user is actively typing, the xterm buffer is one round-trip
+    // behind the textarea. Yield to the local composer unless this was a
+    // user-initiated refresh (history navigation, explicit refresh).
+    const userInitiated = consumeUserRefreshExpectation();
+    if (!userInitiated && shouldYieldToLocalComposer(nextState)) {
+      return;
+    }
     semanticPromptState.lastSignature = signature;
 
     if (nextState.tracked) {
@@ -1305,6 +1470,9 @@
       if (!force && terminalBufferSyncState.lastSignature === "") {
         return;
       }
+      if (composerHasKeyboardFocus() && composerInput.value !== "" && !consumeUserRefreshExpectation()) {
+        return;
+      }
       terminalBufferSyncState.pending = false;
       terminalBufferSyncState.lastSignature = "0:0:";
       setComposerValue("", 0);
@@ -1321,6 +1489,10 @@
 
     const signature = `${nextState.cursor}:${nextState.value}`;
     if (!force && signature === terminalBufferSyncState.lastSignature) {
+      return;
+    }
+    const userInitiated = consumeUserRefreshExpectation();
+    if (!userInitiated && shouldYieldToLocalComposer(nextState)) {
       return;
     }
     terminalBufferSyncState.lastSignature = signature;
@@ -1476,11 +1648,11 @@
     socket.send(JSON.stringify(payload));
   }
 
-  function scheduleLayoutRefresh() {
+  function scheduleLayoutRefresh({ preserveTerminalCols = false } = {}) {
     window.clearTimeout(fitTimer);
     fitTimer = window.setTimeout(() => {
       measureShortcutHeight();
-      fitTerminal();
+      fitTerminal({ preserveCols: preserveTerminalCols });
       positionTabMenu();
       positionSessionMenu();
       positionSettingsMenu();
@@ -1492,12 +1664,83 @@
     followOutput = buffer.viewportY >= buffer.baseY;
   }
 
-  function fitTerminal() {
+  function terminalVisibleWidth() {
+    const viewport = terminalElement.querySelector(".xterm-viewport");
+    return Math.floor((viewport || terminalElement).getBoundingClientRect().width);
+  }
+
+  function terminalRenderedWidth() {
+    const screen = terminalElement.querySelector(".xterm-screen");
+    const canvases = terminalElement.querySelectorAll(".xterm-screen canvas");
+    let width = screen ? Math.ceil(screen.getBoundingClientRect().width) : 0;
+    canvases.forEach((canvas) => {
+      width = Math.max(width, Math.ceil(canvas.getBoundingClientRect().width));
+    });
+    return width;
+  }
+
+  function terminalHorizontallyOverflows() {
+    const visibleWidth = terminalVisibleWidth();
+    const renderedWidth = terminalRenderedWidth();
+    return visibleWidth > 0 && renderedWidth > visibleWidth + 1;
+  }
+
+  function clampTerminalColumnsToVisibleWidth() {
+    let attempts = 0;
+    while (terminalHorizontallyOverflows() && term.cols > 20 && attempts < 4) {
+      term.resize(term.cols - 1, term.rows);
+      attempts += 1;
+    }
+  }
+
+  function fitTerminal({ preserveCols = false } = {}) {
+    if (terminalFitScheduled) {
+      pendingFitPreserveCols = pendingFitPreserveCols && preserveCols;
+      return;
+    }
+    terminalFitScheduled = true;
+    pendingFitPreserveCols = preserveCols;
     window.requestAnimationFrame(() => {
-      fitAddon.fit();
-      sendMessage({ type: "resize", cols: term.cols, rows: term.rows });
+      terminalFitScheduled = false;
+      // xterm caches cell dimensions inside its render service. After a tab
+      // switch / viewport change those cached values can be stale (font may
+      // have loaded after the initial measure, devicePixelRatio shifts, etc.),
+      // making proposeDimensions return too few rows and leaving a gap below
+      // the rendered content. Force a fresh measurement before fitting.
+      try {
+        term._core?._charSizeService?.measure?.();
+      } catch (_error) {
+        // Internal API — ignore if shape changes.
+      }
+      const terminalWidth = Math.ceil(terminalElement.getBoundingClientRect().width);
+      const widthChanged = lastTerminalLayoutWidth > 0 && Math.abs(terminalWidth - lastTerminalLayoutWidth) > 1;
+      const shouldPreserveCols = pendingFitPreserveCols && !widthChanged && !terminalHorizontallyOverflows();
+      pendingFitPreserveCols = false;
+      if (typeof fitAddon.proposeDimensions === "function") {
+        const proposed = fitAddon.proposeDimensions();
+        if (proposed && Number.isFinite(proposed.rows) && proposed.rows > 0) {
+          const proposedCols = Number.isFinite(proposed.cols) ? Math.floor(proposed.cols) : term.cols;
+          const guardedCols = Math.max(20, proposedCols - TERMINAL_COL_GUARD);
+          const nextCols = shouldPreserveCols && lastTerminalCols > 0 ? lastTerminalCols : guardedCols;
+          term.resize(nextCols, proposed.rows);
+        } else {
+          fitAddon.fit();
+        }
+      } else {
+        fitAddon.fit();
+      }
+      clampTerminalColumnsToVisibleWidth();
+      lastTerminalLayoutWidth = terminalWidth;
+      if (term.cols !== lastTerminalCols || term.rows !== lastTerminalRows) {
+        lastTerminalCols = term.cols;
+        lastTerminalRows = term.rows;
+        sendMessage({ type: "resize", cols: term.cols, rows: term.rows });
+      }
       if (followOutput) {
         term.scrollToBottom();
+      }
+      if (term.rows > 0) {
+        term.refresh(0, term.rows - 1);
       }
     });
   }
@@ -1543,6 +1786,43 @@
     touchInertiaFrameId = window.requestAnimationFrame(stepTouchInertia);
   }
 
+  let pendingScrollLines = 0;
+  let pendingScrollFrameId = null;
+  let scrollRepaintTimer = null;
+
+  function scheduleScrollRepaint() {
+    if (scrollRepaintTimer !== null) {
+      window.clearTimeout(scrollRepaintTimer);
+    }
+    scrollRepaintTimer = window.setTimeout(() => {
+      scrollRepaintTimer = null;
+      if (term.rows > 0) {
+        term.refresh(0, term.rows - 1);
+      }
+    }, 80);
+  }
+
+  function flushPendingScrollLines() {
+    pendingScrollFrameId = null;
+    if (pendingScrollLines === 0) {
+      return;
+    }
+    const clamped = Math.max(-48, Math.min(48, pendingScrollLines));
+    pendingScrollLines = 0;
+    sendMessage({ type: "scroll-history", lines: clamped });
+    if (clamped > 0) {
+      followOutput = false;
+    }
+    scheduleScrollRepaint();
+  }
+
+  function queueScrollHistory(lines) {
+    pendingScrollLines += lines;
+    if (pendingScrollFrameId === null) {
+      pendingScrollFrameId = window.requestAnimationFrame(flushPendingScrollLines);
+    }
+  }
+
   function scrollTerminalByPixels(pixelDelta) {
     if (!term.rows || !Number.isFinite(pixelDelta) || pixelDelta === 0) {
       return;
@@ -1563,10 +1843,7 @@
       return;
     }
     scrollLineRemainder = lineDelta - lines;
-    sendMessage({ type: "scroll-history", lines });
-    if (lines > 0) {
-      followOutput = false;
-    }
+    queueScrollHistory(lines);
   }
 
   function installTerminalScrollHandlers() {
@@ -1831,14 +2108,6 @@
     return Math.min(1, Math.max(0.5, Math.min(widthScale, heightScale)));
   }
 
-  function forceMinimumUiScale(persist = true) {
-    uiScale = 0.5;
-    draftUiScale = Math.min(draftUiScale, uiScale);
-    if (persist) {
-      localStorage.setItem(STORAGE_UI_SCALE_KEY, String(uiScale));
-    }
-  }
-
   function detectViewportShock(viewportWidth, viewportHeight, keyboardInset = 0) {
     if (keyboardInset > 0) {
       return false;
@@ -1867,8 +2136,11 @@
   }
 
   function applyEffectiveUiScale(viewportWidth, viewportHeight, keyboardInset = 0, layoutHeight = window.innerHeight) {
-    const nextSafeScale = computeViewportSafeUiScale(viewportWidth, viewportHeight, keyboardInset, layoutHeight);
-    effectiveUiScale = Math.min(uiScale, nextSafeScale);
+    void viewportWidth;
+    void viewportHeight;
+    void keyboardInset;
+    void layoutHeight;
+    effectiveUiScale = uiScale;
     document.documentElement.style.setProperty("--ui-scale", String(effectiveUiScale));
     return effectiveUiScale;
   }
@@ -1882,34 +2154,75 @@
       document.body.dataset.composerActive === "true"
         ? composerPanel.getBoundingClientRect()
         : null;
-    const viewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+    const viewport = window.visualViewport;
+    const viewportClaimsKeyboard =
+      viewport && window.innerHeight - (viewport.height + viewport.offsetTop) > KEYBOARD_THRESHOLD;
+    const layoutSaysKeyboardClosed = document.body.dataset.keyboardOpen !== "true";
+    // Trust the layout-viewport bottom whenever we don't believe the keyboard
+    // is genuinely up: stale visualViewport, no focused input, or we just
+    // hard-reset --keyboard-inset to 0 (e.g. after a tab switch).
+    const trustViewportBottom =
+      viewport &&
+      viewportClaimsKeyboard &&
+      focusedElementAcceptsKeyboard() &&
+      !layoutSaysKeyboardClosed;
+    const viewportBottom = trustViewportBottom
+      ? viewport.offsetTop + viewport.height
+      : window.innerHeight;
     const top = composerRect ? Math.min(panelRect.top, composerRect.top) : panelRect.top;
     const shortcutHeight = Math.ceil(shortcutRect.height);
     if (shortcutHeight > 0) {
       document.documentElement.style.setProperty("--shortcut-height", `${shortcutHeight}px`);
     }
-    const reserve = Math.max(0, Math.ceil(viewportHeight - top));
+    const reserve = Math.max(0, Math.ceil(viewportBottom - top));
     if (reserve > 0) {
       document.documentElement.style.setProperty("--shortcut-reserve", `${reserve}px`);
     }
   }
 
+  function focusedElementAcceptsKeyboard() {
+    const el = document.activeElement;
+    if (!el || el === document.body || el === document.documentElement) {
+      return false;
+    }
+    const tag = el.tagName ? el.tagName.toLowerCase() : "";
+    if (tag === "textarea") return true;
+    if (tag === "input") {
+      const type = (el.type || "text").toLowerCase();
+      const nonTextTypes = new Set([
+        "button", "submit", "reset", "checkbox", "radio", "file", "image", "range", "color", "hidden",
+      ]);
+      return !nonTextTypes.has(type);
+    }
+    if (el.isContentEditable) return true;
+    return false;
+  }
+
   function updateViewportMetrics() {
     const viewport = window.visualViewport;
     const viewportWidth = viewport ? viewport.width : window.innerWidth;
-    const viewportHeight = viewport ? viewport.height : window.innerHeight;
+    let viewportHeight = viewport ? viewport.height : window.innerHeight;
     const offsetTop = viewport ? viewport.offsetTop : 0;
     const layoutHeight = window.innerHeight;
-    const rawKeyboardInset = Math.max(0, layoutHeight - (viewportHeight + offsetTop));
-    const keyboardInset = rawKeyboardInset > KEYBOARD_THRESHOLD ? rawKeyboardInset : 0;
-    if (detectViewportShock(viewportWidth, viewportHeight, keyboardInset)) {
-      forceMinimumUiScale();
+    let rawKeyboardInset = Math.max(0, layoutHeight - (viewportHeight + offsetTop));
+    // visualViewport sometimes stays "shrunk" after a tab switch even though
+    // the keyboard isn't actually open and no event will fire to refresh it.
+    // If nothing focusable currently has focus, the keyboard cannot be open —
+    // override the stale viewport value with the layout viewport height.
+    if (rawKeyboardInset > KEYBOARD_THRESHOLD && !focusedElementAcceptsKeyboard()) {
+      viewportHeight = layoutHeight;
+      rawKeyboardInset = 0;
     }
+    const keyboardInset = rawKeyboardInset > KEYBOARD_THRESHOLD ? rawKeyboardInset : 0;
+    detectViewportShock(viewportWidth, viewportHeight, keyboardInset);
+    document.documentElement.style.setProperty("--app-top", `${Math.round(offsetTop)}px`);
     document.documentElement.style.setProperty("--app-height", `${Math.round(viewportHeight)}px`);
     document.documentElement.style.setProperty("--keyboard-inset", `${Math.round(keyboardInset)}px`);
     document.body.dataset.keyboardOpen = keyboardInset > 0 ? "true" : "false";
     applyEffectiveUiScale(viewportWidth, viewportHeight, keyboardInset, layoutHeight);
-    scheduleLayoutRefresh();
+    const preserveTerminalCols = lastLayoutViewportWidth > 0 && Math.abs(viewportWidth - lastLayoutViewportWidth) < 1;
+    lastLayoutViewportWidth = viewportWidth;
+    scheduleLayoutRefresh({ preserveTerminalCols });
   }
 
   function renderTabs() {
@@ -1969,8 +2282,10 @@
       let repeatDelayTimer = null;
       let repeatIntervalTimer = null;
       let suppressClickAfterRepeat = false;
+      let shortcutKeyboardWasFocused = false;
       button.className = "shortcut-button";
       button.type = "button";
+      button.tabIndex = -1;
       button.textContent = shortcut.label;
 
       const clearRepeatTimers = () => {
@@ -1986,31 +2301,33 @@
         }
         const normalizedSequence = shortcut.sequence.trim().toUpperCase();
         if (normalizedSequence === "{PASTE}") {
-          pasteFromClipboard();
-          if (preserveComposerFocus) {
-            window.requestAnimationFrame(() => openComposer(true));
-          }
+          pasteFromClipboard({
+            preserveKeyboardState: true,
+            wasKeyboardFocused: shortcutKeyboardWasFocused,
+          });
+          return;
+        }
+        if (normalizedSequence === "{COPY}") {
+          copyTerminalSelection();
+          restoreShortcutKeyboardState(shortcutKeyboardWasFocused);
           return;
         }
         if (mobileComposerMode && normalizedSequence === "{ENTER}") {
           sendMessage({ type: "composer-enter", revision: nextComposerRevision() });
           clearComposer(false);
-          if (preserveComposerFocus) {
-            window.requestAnimationFrame(() => openComposer(true));
-          }
+          restoreShortcutKeyboardState(shortcutKeyboardWasFocused);
           return;
         }
         if (mobileComposerMode && normalizedSequence === "{BACKSPACE}" && composerInput.value === "") {
           sendMessage({ type: "input", data: specialMap.BACKSPACE });
           requestComposerRefresh();
-          if (preserveComposerFocus) {
-            window.requestAnimationFrame(() => openComposer(true));
-          }
+          restoreShortcutKeyboardState(shortcutKeyboardWasFocused);
           return;
         }
         const historyDirection = mobileComposerMode ? shortcutHistoryDirection(shortcut.sequence) : "";
         if (historyDirection) {
-          navigateComposerHistory(historyDirection, preserveComposerFocus);
+          navigateComposerHistory(historyDirection, shortcutKeyboardWasFocused);
+          restoreShortcutKeyboardState(shortcutKeyboardWasFocused);
           return;
         }
         if (mobileComposerMode && shortcutShouldFlushComposer(shortcut.sequence)) {
@@ -2018,15 +2335,11 @@
         }
         const sequence = expandShortcutSequence(shortcut.sequence);
         if (!sequence) {
-          if (preserveComposerFocus) {
-            window.requestAnimationFrame(() => openComposer(true));
-          }
+          restoreShortcutKeyboardState(shortcutKeyboardWasFocused);
           return;
         }
         sendMessage({ type: "input", data: sequence });
-        if (preserveComposerFocus) {
-          window.requestAnimationFrame(() => openComposer(true));
-        }
+        restoreShortcutKeyboardState(shortcutKeyboardWasFocused);
       };
 
       button.addEventListener(
@@ -2035,7 +2348,8 @@
           if (event.pointerType === "mouse" && event.button !== 0) {
             return;
           }
-          preserveComposerFocus = mobileComposerMode && document.activeElement === composerInput;
+          shortcutKeyboardWasFocused = composerHasKeyboardFocus();
+          preserveComposerFocus = shortcutKeyboardWasFocused;
           if (preserveComposerFocus) {
             event.preventDefault();
           }
@@ -2093,6 +2407,9 @@
     if (upper === "PASTE") {
       return "";
     }
+    if (upper === "COPY") {
+      return "";
+    }
     if (upper.startsWith("TEXT:")) {
       return clean.slice(5);
     }
@@ -2115,8 +2432,8 @@
 
   function focusTerminal() {
     if (mobileComposerMode) {
-      openComposer(true);
-      scheduleLayoutRefresh();
+      openComposer(false);
+      scheduleLayoutRefresh({ preserveTerminalCols: true });
       return;
     }
     term.focus();
@@ -2132,10 +2449,12 @@
     if (serverConfig.requireToken && !token) {
       loginOverlay.classList.remove("hidden");
       tokenInput.focus();
+      scheduleAuthConfigPolling();
       return;
     }
 
     window.clearTimeout(reconnectTimer);
+    stopAuthConfigPolling();
     loginOverlay.classList.add("hidden");
     socket = new WebSocket(wsUrl());
     socket.binaryType = "arraybuffer";
@@ -2155,13 +2474,16 @@
         chunk = await chunk.arrayBuffer();
       }
       term.write(decoder.decode(chunk, { stream: true }), () => {
+        if (followOutput) {
+          term.scrollToBottom();
+        }
         if (semanticPromptState.seenMarker) {
           scheduleSemanticComposerSync();
         }
+        if (terminalHorizontallyOverflows()) {
+          scheduleLayoutRefresh();
+        }
       });
-      if (followOutput) {
-        term.scrollToBottom();
-      }
     });
 
     socket.addEventListener("close", (event) => {
@@ -2174,6 +2496,7 @@
         loginOverlay.classList.remove("hidden");
         loginMessage.textContent = "Authentication failed. Check the token and try again.";
         localStorage.removeItem(STORAGE_TOKEN_KEY);
+        scheduleAuthConfigPolling();
         return;
       }
       if (event.code === 4003) {
@@ -2196,8 +2519,34 @@
       followOutput = true;
       loginOverlay.classList.add("hidden");
       loginMessage.textContent = "";
+      stopAuthConfigPolling();
       syncOpenTabsToSessions();
+      // The visualViewport often lags through a tab switch — the keyboard may
+      // still be settling when the first fit runs, leaving xterm's row count
+      // stuck at the keyboard-open size. Force a fresh viewport measurement
+      // and refit a few more times so the terminal grows to fill the panel.
+      // Also re-assert keyboard-closed layout to defeat a stale visualViewport
+      // — the keyboard isn't actually open right after a tab switch (tab pills
+      // aren't keyboard inputs), and visualViewport sometimes won't fire a
+      // resize to correct itself.
+      if (mobileComposerMode) {
+        document.documentElement.style.setProperty("--app-top", "0px");
+        document.documentElement.style.setProperty("--app-height", `${window.innerHeight}px`);
+        document.documentElement.style.setProperty("--keyboard-inset", "0px");
+        document.body.dataset.keyboardOpen = "false";
+      }
+      // Skip updateViewportMetrics on the immediate path so it doesn't
+      // overwrite the keyboard-closed values with a stale visualViewport.
+      // Re-measure on a delay; if visualViewport stayed stuck and no input
+      // is focused, the override inside updateViewportMetrics keeps the
+      // keyboard-closed state.
       scheduleLayoutRefresh();
+      window.setTimeout(() => {
+        updateViewportMetrics();
+        scheduleLayoutRefresh();
+      }, 180);
+      window.setTimeout(scheduleLayoutRefresh, 480);
+      window.setTimeout(scheduleLayoutRefresh, 900);
       focusTerminal();
       return;
     }
@@ -2417,6 +2766,25 @@
     syncOpenTabsToSessions();
     followOutput = true;
     resetSpeechInputState();
+    // Explicitly drop composer focus so iOS actually closes the keyboard and
+    // fires a real visualViewport resize event before the new session loads.
+    // iOS sometimes ignores programmatic blur or doesn't dispatch the resize,
+    // so also force the layout variables to keyboard-closed state. The next
+    // real visualViewport event will overwrite this if the user reopens it.
+    if (mobileComposerMode) {
+      if (document.activeElement === composerInput) {
+        composerInput.blur();
+      }
+      setComposerActive(false);
+      // Hiding the panel removes the textarea from layout, forcing iOS to
+      // drop the keyboard even if blur() alone was ignored. The next
+      // openComposer() during focusTerminal() will re-show it.
+      composerPanel.classList.add("hidden");
+      document.documentElement.style.setProperty("--app-top", "0px");
+      document.documentElement.style.setProperty("--app-height", `${window.innerHeight}px`);
+      document.documentElement.style.setProperty("--keyboard-inset", "0px");
+      document.body.dataset.keyboardOpen = "false";
+    }
     resetComposerTracking(true);
     term.reset();
     skipHistoryOnNextConnect = true;
@@ -2602,13 +2970,20 @@
     displayOverlay.classList.add("hidden");
   }
 
-  async function pasteFromClipboard() {
+  async function pasteFromClipboard({ preserveKeyboardState = false, wasKeyboardFocused = composerHasKeyboardFocus() } = {}) {
     try {
       const text = await navigator.clipboard.readText();
       if (text) {
         if (mobileComposerMode) {
-          openComposer(true);
-          composerInput.setRangeText(text, composerInput.selectionStart, composerInput.selectionEnd, "end");
+          if (wasKeyboardFocused) {
+            insertComposerText(text, true);
+          } else {
+            resetComposerTracking(true);
+            sendMessage({ type: "input", data: text });
+          }
+          if (preserveKeyboardState) {
+            restoreShortcutKeyboardState(wasKeyboardFocused);
+          }
           return;
         }
         resetSpeechInputState();
@@ -2619,6 +2994,43 @@
       showToast("Clipboard paste needs browser permission.");
     }
   }
+
+  document.addEventListener("copy", (event) => {
+    if (isEditableTarget(event.target)) {
+      return;
+    }
+    const text = terminalSelectionText();
+    if (!text || !event.clipboardData) {
+      return;
+    }
+    event.clipboardData.setData("text/plain", text);
+    event.preventDefault();
+  });
+
+  document.addEventListener("paste", (event) => {
+    const text = event.clipboardData?.getData("text/plain") || "";
+    if (!text) {
+      return;
+    }
+    if (event.target === composerInput) {
+      window.setTimeout(() => {
+        autoSizeComposer();
+        syncComposerState();
+      }, 0);
+      return;
+    }
+    if (isEditableTarget(event.target)) {
+      return;
+    }
+    event.preventDefault();
+    if (mobileComposerMode) {
+      insertComposerText(text);
+      return;
+    }
+    resetSpeechInputState();
+    sendMessage({ type: "input", data: text });
+    focusTerminal();
+  });
 
   loginForm.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -2705,13 +3117,22 @@
     composerPanel.classList.remove("hidden");
     setComposerActive(true);
     autoSizeComposer();
-    scheduleLayoutRefresh();
+    scheduleLayoutRefresh({ preserveTerminalCols: true });
   });
   composerInput.addEventListener("blur", () => {
     setComposerActive(false);
-    window.setTimeout(scheduleLayoutRefresh, 60);
+    // After blur, iOS sometimes neglects to fire a visualViewport resize even
+    // though the keyboard actually closed. Re-measure on a couple of delays
+    // so --app-height and --shortcut-reserve recover.
+    [60, 220, 520].forEach((delay) =>
+      window.setTimeout(() => {
+        updateViewportMetrics();
+        scheduleLayoutRefresh({ preserveTerminalCols: true });
+      }, delay),
+    );
   });
   composerInput.addEventListener("input", () => {
+    lastComposerInputAt = Date.now();
     const value = composerInput.value;
     const normalizedValue = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     if (normalizedValue !== value) {
@@ -2850,10 +3271,11 @@
 
   const layoutObserver = new ResizeObserver(() => {
     measureShortcutHeight();
-    fitTerminal();
+    fitTerminal({ preserveCols: true });
   });
   layoutObserver.observe(shortcutsPanel);
   layoutObserver.observe(composerPanel);
+  layoutObserver.observe(terminalElement);
 
   window.visualViewport?.addEventListener("resize", () => {
     updateViewportMetrics();
@@ -2865,7 +3287,6 @@
     scheduleViewportSettlePasses();
   });
   window.addEventListener("orientationchange", () => {
-    forceMinimumUiScale();
     updateViewportMetrics();
     scheduleViewportSettlePasses();
   });
@@ -2915,6 +3336,9 @@
     openComposer(false);
   }
   updateViewportMetrics();
+  document.fonts?.ready?.then(() => {
+    scheduleLayoutRefresh();
+  });
   loadServerConfig().finally(() => {
     if (!serverConfig.requireToken) {
       loginOverlay.classList.add("hidden");
