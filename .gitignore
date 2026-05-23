@@ -4,3 +4,4 @@ node_modules/
 *.env
 !example.env
 mobile-terminal-settings.json
+mobile-terminal-usage.json

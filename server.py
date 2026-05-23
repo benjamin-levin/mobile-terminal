@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import base64
+import datetime
 import fcntl
 import hmac
 import ipaddress
@@ -10,9 +12,11 @@ import os
 import re
 import secrets
 import signal
+import shlex
 import struct
 import subprocess
 import termios
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -28,17 +32,135 @@ STATIC_ROOT = ROOT / "static"
 NODE_MODULES_ROOT = ROOT / "node_modules"
 WS_PATH = "/_ws"
 SETTINGS_PATH = ROOT / "mobile-terminal-settings.json"
+USAGE_PATH = ROOT / "mobile-terminal-usage.json"
+USAGE_RETENTION_DAYS = 365
+USAGE_VERSION = 2
+USAGE_DAY_FIELDS = (
+    "sessions",
+    "durationSeconds",
+    "inputEvents",
+    "commandsRun",
+    "bytesIn",
+    "bytesOut",
+)
+USAGE_HOUR_KEY_FORMAT = "%Y-%m-%dT%H"
 MOBILE_COMPOSER_HISTORY_LIMIT = 200
 COMPOSER_CAPTURE_CONTEXT_ROWS = 12
 COMPOSER_CAPTURE_LOGICAL_LINES = 48
 COMPOSER_CAPTURE_MAX_CHARS = 12000
 COMPOSER_REFRESH_DELAYS = (0.02, 0.05, 0.09, 0.14, 0.2, 0.28, 0.38, 0.5)
+MOBILE_COMPOSER_FORCE_CLEAR_BACKSPACES = 1024
+FILE_TREE_MAX_ENTRIES = 600
+FILE_READ_MAX_BYTES = 2_000_000
+FILE_WRITE_MAX_BYTES = 2_000_000
+FILE_BOOKMARK_MAX_ITEMS = 40
+FILE_BOOKMARK_MAX_PATH_CHARS = 512
+FILE_BOOKMARK_MAX_NAME_CHARS = 80
+SSH_FS_TIMEOUT_SECONDS = 7
+SSH_FS_OPTIONS = (
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "NumberOfPasswordPrompts=0",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+)
 LEFT_ARROW = "\u001b[D"
 RIGHT_ARROW = "\u001b[C"
 UP_ARROW = "\u001b[A"
 DOWN_ARROW = "\u001b[B"
+CTRL_E = "\u0005"
+CTRL_U = "\u0015"
 BRACKETED_PASTE_START = "\u001b[200~"
 BRACKETED_PASTE_END = "\u001b[201~"
+SSH_PATH_PATTERN = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.@%+-]*):(.*)$")
+SSH_FS_SCRIPT = r'''
+import base64
+import json
+import os
+import sys
+
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload))
+
+
+try:
+    operation = sys.argv[1]
+    raw_path = base64.b64decode(sys.argv[2].encode("ascii")).decode("utf-8", "surrogateescape")
+    max_entries = int(sys.argv[3])
+    max_read = int(sys.argv[4])
+    max_write = int(sys.argv[5])
+
+    path = os.path.expandvars(os.path.expanduser(raw_path or "~"))
+    path = os.path.abspath(path)
+
+    if operation == "list":
+        if not os.path.isdir(path):
+            raise ValueError("Selected path is not a directory.")
+        entries = []
+        truncated = False
+        with os.scandir(path) as iterator:
+            for index, child in enumerate(iterator):
+                if index >= max_entries:
+                    truncated = True
+                    break
+                try:
+                    is_dir = child.is_dir(follow_symlinks=True)
+                    is_file = child.is_file(follow_symlinks=True)
+                    stat_result = child.stat(follow_symlinks=True) if is_file else None
+                except OSError:
+                    is_dir = False
+                    is_file = False
+                    stat_result = None
+                entries.append(
+                    {
+                        "name": child.name,
+                        "path": os.path.abspath(child.path),
+                        "type": "directory" if is_dir else "file" if is_file else "other",
+                        "size": stat_result.st_size if stat_result and is_file else None,
+                    }
+                )
+        entries.sort(key=lambda entry: (entry["type"] != "directory", entry["name"].lower()))
+        emit({"path": path, "entries": entries, "truncated": truncated})
+    elif operation == "read":
+        if not os.path.isfile(path):
+            raise ValueError("Selected path is not a file.")
+        size = os.path.getsize(path)
+        if size > max_read:
+            raise ValueError(f"File is larger than {max_read // 1_000_000} MB.")
+        with open(path, "rb") as handle:
+            data = handle.read()
+        if b"\x00" in data[:4096]:
+            raise ValueError("Binary files are not editable here.")
+        try:
+            content = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Only UTF-8 text files are editable here.") from exc
+        emit({"path": path, "name": os.path.basename(path) or path, "content": content})
+    elif operation == "write":
+        data = sys.stdin.buffer.read(max_write + 1)
+        if len(data) > max_write:
+            raise ValueError(f"File is larger than {max_write // 1_000_000} MB.")
+        if os.path.exists(path) and not os.path.isfile(path):
+            raise ValueError("Selected path is not a file.")
+        parent = os.path.dirname(path) or "."
+        if not os.path.isdir(parent):
+            raise ValueError("Parent directory does not exist.")
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Only UTF-8 text files are editable here.") from exc
+        with open(path, "wb") as handle:
+            handle.write(data)
+        emit({"path": path, "name": os.path.basename(path) or path})
+    else:
+        raise ValueError("Unsupported file operation.")
+except Exception as exc:
+    emit({"error": str(exc)})
+'''
 
 
 def tmux_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -293,6 +415,7 @@ def default_settings() -> dict[str, Any]:
         ],
         "uiScale": 0.85,
         "terminalFontSize": 10,
+        "fileBookmarks": [],
     }
 
 
@@ -317,6 +440,38 @@ def normalize_shortcuts(raw_shortcuts: Any) -> list[dict[str, Any]]:
     return normalized or default_settings()["shortcuts"]
 
 
+def normalize_file_bookmarks(raw_bookmarks: Any) -> list[dict[str, str]]:
+    if not isinstance(raw_bookmarks, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_bookmarks:
+        if isinstance(item, str):
+            path = item.strip()
+            name = ""
+        elif isinstance(item, dict):
+            path = str(item.get("path", "")).strip()
+            name = str(item.get("name", "")).strip()
+        else:
+            continue
+        if not path:
+            continue
+        path = path[:FILE_BOOKMARK_MAX_PATH_CHARS]
+        key = path.replace("\\", "/").rstrip("/")
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(
+            {
+                "path": path,
+                "name": name[:FILE_BOOKMARK_MAX_NAME_CHARS],
+            }
+        )
+        if len(normalized) >= FILE_BOOKMARK_MAX_ITEMS:
+            break
+    return normalized
+
+
 def normalize_settings(raw_settings: Any) -> dict[str, Any]:
     defaults = default_settings()
     if not isinstance(raw_settings, dict):
@@ -338,6 +493,7 @@ def normalize_settings(raw_settings: Any) -> dict[str, Any]:
         "shortcuts": normalize_shortcuts(raw_settings.get("shortcuts")),
         "uiScale": ui_scale,
         "terminalFontSize": terminal_font_size,
+        "fileBookmarks": normalize_file_bookmarks(raw_settings.get("fileBookmarks")),
     }
 
 
@@ -454,6 +610,317 @@ def save_settings(settings: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_settings(settings)
     SETTINGS_PATH.write_text(json.dumps(normalized, indent=2) + "\n")
     return normalized
+
+
+def empty_usage_bucket() -> dict[str, int]:
+    return {field: 0 for field in USAGE_DAY_FIELDS}
+
+
+def default_usage() -> dict[str, Any]:
+    return {
+        "version": USAGE_VERSION,
+        "createdAt": datetime.datetime.now().isoformat(timespec="seconds"),
+        "totals": empty_usage_bucket(),
+        "days": {},
+        "hours": {},
+    }
+
+
+def _read_bucket(raw: dict[str, Any]) -> dict[str, int]:
+    bucket = empty_usage_bucket()
+    for field in USAGE_DAY_FIELDS:
+        try:
+            bucket[field] = max(0, int(raw.get(field, 0)))
+        except (TypeError, ValueError):
+            pass
+    return bucket
+
+
+def normalize_usage(raw: Any) -> dict[str, Any]:
+    base = default_usage()
+    if not isinstance(raw, dict):
+        return base
+    created_at = raw.get("createdAt")
+    if isinstance(created_at, str) and created_at:
+        base["createdAt"] = created_at
+    totals = raw.get("totals")
+    if isinstance(totals, dict):
+        base["totals"] = _read_bucket(totals)
+    days = raw.get("days")
+    if isinstance(days, dict):
+        for key, value in days.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                base["days"][key] = _read_bucket(value)
+    hours = raw.get("hours")
+    if isinstance(hours, dict):
+        for key, value in hours.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                base["hours"][key] = _read_bucket(value)
+    return base
+
+
+def load_usage() -> dict[str, Any]:
+    if not USAGE_PATH.is_file():
+        return default_usage()
+    try:
+        return normalize_usage(json.loads(USAGE_PATH.read_text()))
+    except (OSError, json.JSONDecodeError):
+        return default_usage()
+
+
+def save_usage(usage: dict[str, Any]) -> None:
+    try:
+        USAGE_PATH.write_text(json.dumps(usage, indent=2, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def trim_usage_history(
+    usage: dict[str, Any],
+    today: datetime.date,
+    retention_days: int = USAGE_RETENTION_DAYS,
+) -> None:
+    cutoff_date = today - datetime.timedelta(days=retention_days)
+    cutoff_day = cutoff_date.isoformat()
+    days = usage.get("days", {})
+    for key in list(days.keys()):
+        if key < cutoff_day:
+            days.pop(key, None)
+    hours = usage.get("hours", {})
+    for key in list(hours.keys()):
+        if key[:10] < cutoff_day:
+            hours.pop(key, None)
+
+
+def _hour_bucket(usage: dict[str, Any], moment: datetime.datetime) -> dict[str, int]:
+    key = moment.strftime(USAGE_HOUR_KEY_FORMAT)
+    bucket = usage["hours"].get(key)
+    if bucket is None:
+        bucket = empty_usage_bucket()
+        usage["hours"][key] = bucket
+    return bucket
+
+
+def record_session_usage(
+    usage: dict[str, Any],
+    summary: dict[str, int],
+    start_at: datetime.datetime,
+    end_at: datetime.datetime | None = None,
+) -> None:
+    if end_at is None:
+        end_at = start_at + datetime.timedelta(seconds=int(summary.get("durationSeconds", 0)))
+
+    day_key = start_at.date().isoformat()
+    day_bucket = usage["days"].get(day_key)
+    if day_bucket is None:
+        day_bucket = empty_usage_bucket()
+        usage["days"][day_key] = day_bucket
+    for field in USAGE_DAY_FIELDS:
+        try:
+            value = max(0, int(summary.get(field, 0)))
+        except (TypeError, ValueError):
+            value = 0
+        day_bucket[field] += value
+        usage["totals"][field] += value
+
+    start_hour_bucket = _hour_bucket(usage, start_at)
+    for field in ("sessions", "inputEvents", "commandsRun", "bytesIn", "bytesOut"):
+        try:
+            value = max(0, int(summary.get(field, 0)))
+        except (TypeError, ValueError):
+            value = 0
+        start_hour_bucket[field] += value
+
+    remaining = max(0, int(summary.get("durationSeconds", 0)))
+    cursor = start_at
+    while remaining > 0:
+        hour_floor = cursor.replace(minute=0, second=0, microsecond=0)
+        next_hour = hour_floor + datetime.timedelta(hours=1)
+        seconds_until_next = int((next_hour - cursor).total_seconds())
+        seconds_in_hour = min(remaining, max(1, seconds_until_next))
+        bucket = _hour_bucket(usage, hour_floor)
+        bucket["durationSeconds"] += seconds_in_hour
+        remaining -= seconds_in_hour
+        cursor = next_hour
+
+    trim_usage_history(usage, start_at.date())
+
+
+def resolve_user_path(raw_path: Any, base_path: str) -> Path:
+    value = str(raw_path or "").strip()
+    if not value:
+        value = base_path
+    expanded = os.path.expandvars(os.path.expanduser(value))
+    candidate = Path(expanded)
+    if not candidate.is_absolute():
+        candidate = Path(base_path) / candidate
+    return candidate.resolve()
+
+
+def split_ssh_path(raw_path: Any) -> tuple[str, str] | None:
+    value = str(raw_path or "").strip()
+    if not value:
+        return None
+    match = SSH_PATH_PATTERN.match(value)
+    if not match:
+        return None
+    host = match.group(1)
+    remote_path = match.group(2).strip() or "~"
+    return host, remote_path
+
+
+def ssh_display_path(host: str, remote_path: str) -> str:
+    return f"{host}:{remote_path}"
+
+
+def file_entry(path: Path) -> dict[str, Any]:
+    is_dir = path.is_dir()
+    is_file = path.is_file()
+    try:
+        stat_result = path.stat()
+    except OSError:
+        stat_result = None
+    return {
+        "name": path.name or str(path),
+        "path": str(path),
+        "type": "directory" if is_dir else "file" if is_file else "other",
+        "size": stat_result.st_size if stat_result and is_file else None,
+    }
+
+
+def list_file_entries(path: Path) -> tuple[list[dict[str, Any]], bool]:
+    entries: list[dict[str, Any]] = []
+    truncated = False
+    for index, child in enumerate(path.iterdir()):
+        if index >= FILE_TREE_MAX_ENTRIES:
+            truncated = True
+            break
+        entries.append(file_entry(child))
+    entries.sort(key=lambda entry: (entry["type"] != "directory", entry["name"].lower()))
+    return entries, truncated
+
+
+def read_text_file(path: Path) -> str:
+    if not path.is_file():
+        raise ValueError("Selected path is not a file.")
+    size = path.stat().st_size
+    if size > FILE_READ_MAX_BYTES:
+        raise ValueError(f"File is larger than {FILE_READ_MAX_BYTES // 1_000_000} MB.")
+    data = path.read_bytes()
+    if b"\x00" in data[:4096]:
+        raise ValueError("Binary files are not editable here.")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Only UTF-8 text files are editable here.") from exc
+
+
+def write_text_file(path: Path, content: Any) -> None:
+    if path.exists() and not path.is_file():
+        raise ValueError("Selected path is not a file.")
+    text = str(content)
+    if len(text.encode("utf-8")) > FILE_WRITE_MAX_BYTES:
+        raise ValueError(f"File is larger than {FILE_WRITE_MAX_BYTES // 1_000_000} MB.")
+    if not path.parent.is_dir():
+        raise ValueError("Parent directory does not exist.")
+    path.write_text(text, encoding="utf-8")
+
+
+def ssh_file_payload(host: str, operation: str, remote_path: str, content: Any = None) -> dict[str, Any]:
+    encoded_script = base64.b64encode(SSH_FS_SCRIPT.encode("utf-8")).decode("ascii")
+    encoded_path = base64.b64encode(remote_path.encode("utf-8", "surrogateescape")).decode("ascii")
+    runner = f'import base64;exec(base64.b64decode("{encoded_script}"))'
+    command = " ".join(
+        (
+            "python3",
+            "-c",
+            shlex.quote(runner),
+            shlex.quote(operation),
+            shlex.quote(encoded_path),
+            str(FILE_TREE_MAX_ENTRIES),
+            str(FILE_READ_MAX_BYTES),
+            str(FILE_WRITE_MAX_BYTES),
+        )
+    )
+    input_bytes = None
+    if operation == "write":
+        input_bytes = str(content).encode("utf-8")
+        if len(input_bytes) > FILE_WRITE_MAX_BYTES:
+            raise ValueError(f"File is larger than {FILE_WRITE_MAX_BYTES // 1_000_000} MB.")
+
+    def run_ssh(options: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["ssh", *options, host, command],
+            cwd=ROOT,
+            input=input_bytes,
+            capture_output=True,
+            check=False,
+            timeout=SSH_FS_TIMEOUT_SECONDS,
+        )
+
+    try:
+        result = run_ssh(SSH_FS_OPTIONS)
+    except FileNotFoundError as exc:
+        raise ValueError("ssh is not installed on the server.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"SSH operation timed out for {host}.") from exc
+
+    stdout = result.stdout.decode("utf-8", "replace")
+    stderr = result.stderr.decode("utf-8", "replace").strip()
+    if result.returncode != 0 and "Bad owner or permissions" in stderr and "ssh_config" in stderr:
+        try:
+            result = run_ssh(("-F", "none", *SSH_FS_OPTIONS))
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError(f"SSH operation timed out for {host}.") from exc
+        stdout = result.stdout.decode("utf-8", "replace")
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+    output_lines = [line for line in stdout.splitlines() if line.strip()]
+    output = output_lines[-1] if output_lines else ""
+    if result.returncode != 0:
+        message = stderr or output or f"ssh exited with status {result.returncode}"
+        raise ValueError(f"{host}: {message}")
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        message = stderr or "SSH returned an invalid file response."
+        raise ValueError(f"{host}: {message}") from exc
+    if payload.get("error"):
+        raise ValueError(str(payload["error"]))
+    return payload
+
+
+def list_ssh_file_entries(host: str, remote_path: str) -> tuple[str, list[dict[str, Any]], bool]:
+    payload = ssh_file_payload(host, "list", remote_path)
+    resolved_path = str(payload.get("path") or remote_path)
+    entries = []
+    for entry in payload.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
+        child_path = str(entry.get("path") or "")
+        entries.append(
+            {
+                "name": str(entry.get("name") or child_path or "item"),
+                "path": ssh_display_path(host, child_path),
+                "type": entry.get("type") if entry.get("type") in {"directory", "file", "other"} else "other",
+                "size": entry.get("size") if isinstance(entry.get("size"), int) else None,
+            }
+        )
+    return ssh_display_path(host, resolved_path), entries, payload.get("truncated") is True
+
+
+def read_ssh_text_file(host: str, remote_path: str) -> tuple[str, str, str]:
+    payload = ssh_file_payload(host, "read", remote_path)
+    resolved_path = str(payload.get("path") or remote_path)
+    name = str(payload.get("name") or Path(resolved_path).name or resolved_path)
+    content = str(payload.get("content") or "")
+    return ssh_display_path(host, resolved_path), name, content
+
+
+def write_ssh_text_file(host: str, remote_path: str, content: Any) -> tuple[str, str]:
+    payload = ssh_file_payload(host, "write", remote_path, content)
+    resolved_path = str(payload.get("path") or remote_path)
+    name = str(payload.get("name") or Path(resolved_path).name or resolved_path)
+    return ssh_display_path(host, resolved_path), name
 
 
 def safe_join(path: str) -> tuple[Path | None, str | None]:
@@ -611,6 +1078,8 @@ class AppServer:
         self.tailscale_mode = tailscale_mode
         self.settings = load_settings()
         self.mobile_composer_states: dict[str, dict[str, Any]] = {}
+        self.usage = load_usage()
+        self.active_sessions = 0
 
     async def send_json(self, connection: ServerConnection, payload: dict[str, Any]) -> None:
         await connection.send(json.dumps(payload))
@@ -641,7 +1110,31 @@ class AppServer:
             }
             body = json.dumps(payload).encode("utf-8")
             return http_response(200, body, "application/json; charset=utf-8")
+        if path == "/stats":
+            body = json.dumps(self.usage_payload()).encode("utf-8")
+            return http_response(200, body, "application/json; charset=utf-8")
         return await process_request(connection, request)
+
+    def usage_payload(self) -> dict[str, Any]:
+        return {
+            "usage": self.usage,
+            "today": datetime.date.today().isoformat(),
+            "retentionDays": USAGE_RETENTION_DAYS,
+            "activeSessions": self.active_sessions,
+            "serverStartedAt": getattr(self, "started_at", None),
+        }
+
+    def record_session(
+        self,
+        summary: dict[str, int],
+        start_at: datetime.datetime,
+        end_at: datetime.datetime,
+    ) -> None:
+        record_session_usage(self.usage, summary, start_at, end_at)
+        save_usage(self.usage)
+
+    async def send_stats(self, connection: ServerConnection) -> None:
+        await self.send_json(connection, {"type": "stats", **self.usage_payload()})
 
     async def send_tabs(self, connection: ServerConnection, session_name: str) -> list[dict[str, Any]]:
         tabs = session_tabs(session_name)
@@ -696,6 +1189,17 @@ class AppServer:
         state["pendingDraft"] = ""
         state["tracked"] = False
         state["source"] = "reset"
+
+    def force_clear_mobile_composer(self, bridge: TmuxBridge, session_name: str, revision: int | None = None) -> None:
+        if pane_in_mode(session_name):
+            tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
+        sequence = CTRL_E + ("\u007f" * MOBILE_COMPOSER_FORCE_CLEAR_BACKSPACES) + CTRL_U
+        bridge.write(sequence)
+        self.reset_mobile_composer_tracking(session_name)
+        state = self.mobile_composer_state(session_name)
+        if revision is not None:
+            state["revision"] = max(state["revision"], revision)
+        state["source"] = "force-clear"
 
     def sync_mobile_composer(
         self,
@@ -1014,6 +1518,11 @@ class AppServer:
             await self.send_composer_state(connection, session_name)
             return
 
+        if message_type == "composer-force-clear":
+            self.force_clear_mobile_composer(bridge, session_name, revision=revision)
+            await self.send_composer_state(connection, session_name)
+            return
+
         if message_type == "input":
             if pane_in_mode(session_name):
                 tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
@@ -1045,9 +1554,137 @@ class AppServer:
             await self.send_settings(connection)
             return
 
+        if message_type == "request-stats":
+            await self.send_stats(connection)
+            return
+
         if message_type == "save-settings":
             self.settings = save_settings(payload.get("settings", {}))
             await self.send_settings(connection)
+            return
+
+        if message_type == "fs-default-root":
+            await self.send_json(
+                connection,
+                {
+                    "type": "fs-default-root",
+                    "requestId": str(payload.get("requestId", "")),
+                    "path": current_path(session_name, self.cwd),
+                    "home": str(Path.home()),
+                },
+            )
+            return
+
+        if message_type == "fs-list":
+            request_id = str(payload.get("requestId", ""))
+            try:
+                ssh_target = split_ssh_path(payload.get("path"))
+                if ssh_target:
+                    host, remote_path = ssh_target
+                    display_path, entries, truncated = await asyncio.to_thread(
+                        list_ssh_file_entries,
+                        host,
+                        remote_path,
+                    )
+                    path_value = display_path
+                else:
+                    path = resolve_user_path(payload.get("path"), current_path(session_name, self.cwd))
+                    if not path.is_dir():
+                        raise ValueError("Selected path is not a directory.")
+                    entries, truncated = list_file_entries(path)
+                    path_value = str(path)
+                await self.send_json(
+                    connection,
+                    {
+                        "type": "fs-list",
+                        "requestId": request_id,
+                        "path": path_value,
+                        "entries": entries,
+                        "truncated": truncated,
+                    },
+                )
+            except (OSError, ValueError) as exc:
+                await self.send_json(
+                    connection,
+                    {
+                        "type": "fs-error",
+                        "requestId": request_id,
+                        "operation": "list",
+                        "message": str(exc),
+                    },
+                )
+            return
+
+        if message_type == "fs-read":
+            request_id = str(payload.get("requestId", ""))
+            try:
+                ssh_target = split_ssh_path(payload.get("path"))
+                if ssh_target:
+                    host, remote_path = ssh_target
+                    path_value, name, content = await asyncio.to_thread(read_ssh_text_file, host, remote_path)
+                else:
+                    path = resolve_user_path(payload.get("path"), current_path(session_name, self.cwd))
+                    content = read_text_file(path)
+                    path_value = str(path)
+                    name = path.name
+                await self.send_json(
+                    connection,
+                    {
+                        "type": "fs-read",
+                        "requestId": request_id,
+                        "path": path_value,
+                        "name": name,
+                        "content": content,
+                    },
+                )
+            except (OSError, ValueError) as exc:
+                await self.send_json(
+                    connection,
+                    {
+                        "type": "fs-error",
+                        "requestId": request_id,
+                        "operation": "read",
+                        "message": str(exc),
+                    },
+                )
+            return
+
+        if message_type == "fs-write":
+            request_id = str(payload.get("requestId", ""))
+            try:
+                ssh_target = split_ssh_path(payload.get("path"))
+                if ssh_target:
+                    host, remote_path = ssh_target
+                    path_value, name = await asyncio.to_thread(
+                        write_ssh_text_file,
+                        host,
+                        remote_path,
+                        payload.get("content", ""),
+                    )
+                else:
+                    path = resolve_user_path(payload.get("path"), current_path(session_name, self.cwd))
+                    write_text_file(path, payload.get("content", ""))
+                    path_value = str(path)
+                    name = path.name
+                await self.send_json(
+                    connection,
+                    {
+                        "type": "fs-write",
+                        "requestId": request_id,
+                        "path": path_value,
+                        "name": name,
+                    },
+                )
+            except (OSError, ValueError) as exc:
+                await self.send_json(
+                    connection,
+                    {
+                        "type": "fs-error",
+                        "requestId": request_id,
+                        "operation": "write",
+                        "message": str(exc),
+                    },
+                )
             return
 
         if message_type == "new-tab":
@@ -1223,11 +1860,24 @@ class AppServer:
         bridge.open()
         history = "" if skip_history else capture_history(state["session"])
 
+        session_summary: dict[str, int] = {
+            "sessions": 1,
+            "durationSeconds": 0,
+            "inputEvents": 0,
+            "commandsRun": 0,
+            "bytesIn": 0,
+            "bytesOut": 0,
+        }
+        session_start = time.monotonic()
+        session_start_at = datetime.datetime.now()
+        self.active_sessions += 1
+
         async def relay_output() -> None:
             while True:
                 chunk = await bridge.read()
                 if not chunk:
                     break
+                session_summary["bytesOut"] += len(chunk)
                 await connection.send(chunk)
 
         async def watch_tabs() -> None:
@@ -1274,10 +1924,20 @@ class AppServer:
             async for raw_message in connection:
                 if not isinstance(raw_message, str):
                     continue
+                session_summary["bytesIn"] += len(raw_message)
                 try:
                     payload = json.loads(raw_message)
                 except json.JSONDecodeError:
                     continue
+                msg_type = payload.get("type")
+                if msg_type and msg_type != "request-stats":
+                    session_summary["inputEvents"] += 1
+                if msg_type == "composer-enter":
+                    session_summary["commandsRun"] += 1
+                elif msg_type == "input":
+                    data = payload.get("data", "")
+                    if isinstance(data, str) and ("\r" in data or "\n" in data):
+                        session_summary["commandsRun"] += data.count("\r") + data.count("\n")
                 await self.handle_command(connection, bridge, state, payload)
         except ConnectionClosed:
             pass
@@ -1285,8 +1945,20 @@ class AppServer:
             output_task.cancel()
             tab_task.cancel()
             bridge.close()
+            session_summary["durationSeconds"] = int(time.monotonic() - session_start)
+            self.active_sessions = max(0, self.active_sessions - 1)
+            self.record_session(session_summary, session_start_at, datetime.datetime.now())
 
     async def run(self) -> None:
+        self.started_at = datetime.datetime.now().isoformat(timespec="seconds")
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for signal_name in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(signal_name, stop_event.set)
+            except (NotImplementedError, RuntimeError):
+                pass
+
         async with serve(
             self.websocket_handler,
             self.host,
@@ -1309,7 +1981,7 @@ class AppServer:
             else:
                 print("access token: disabled")
             print("")
-            await asyncio.Future()
+            await stop_event.wait()
 
 
 def parse_args() -> argparse.Namespace:
