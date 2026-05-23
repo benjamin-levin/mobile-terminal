@@ -10,6 +10,7 @@ EnvironmentFile=-@ENV_FILE@
 ExecStart=@PYTHON@ @WORKDIR@/server.py
 Restart=always
 RestartSec=3
+KillMode=process
 StandardOutput=journal
 StandardError=journal
 
