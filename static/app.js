@@ -641,7 +641,10 @@
       codeLines = [];
     };
 
-    lines.forEach((line) => {
+    const parseListItem = (value) => String(value || "").match(/^\s{0,3}([-+*]|(\d+)\.)\s+(.+)$/);
+    const listItemType = (match) => (match?.[2] ? "ol" : match ? "ul" : "");
+
+    lines.forEach((line, index) => {
       if (/^\s*```/.test(line)) {
         if (inCodeBlock) {
           closeCodeBlock();
@@ -661,6 +664,13 @@
 
       if (!line.trim()) {
         closeParagraph();
+        if (listType) {
+          const nextContentLine = lines.slice(index + 1).find((candidate) => candidate.trim());
+          const nextListItem = parseListItem(nextContentLine);
+          if (listItemType(nextListItem) === listType) {
+            return;
+          }
+        }
         closeList();
         return;
       }
@@ -681,18 +691,20 @@
         return;
       }
 
-      const listItem = line.match(/^\s{0,3}(([-+*])|(\d+\.))\s+(.+)$/);
+      const listItem = parseListItem(line);
       if (listItem) {
         closeParagraph();
-        const nextListType = /\d+\./.test(listItem[1]) ? "ol" : "ul";
+        const nextListType = listItemType(listItem);
         if (listType && listType !== nextListType) {
           closeList();
         }
         if (!listType) {
           listType = nextListType;
-          output.push(`<${listType}>`);
+          const start = Number(listItem[2]);
+          const startAttribute = listType === "ol" && Number.isFinite(start) && start !== 1 ? ` start="${start}"` : "";
+          output.push(`<${listType}${startAttribute}>`);
         }
-        output.push(`<li>${renderMarkdownInline(listItem[4].trim())}</li>`);
+        output.push(`<li>${renderMarkdownInline(listItem[3].trim())}</li>`);
         return;
       }
 
