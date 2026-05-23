@@ -5,11 +5,15 @@
   const STORAGE_TERMINAL_FONT_KEY = "mobile-terminal.terminal-font";
   const STORAGE_ACTIVE_SESSION_KEY = "mobile-terminal.active-session";
   const STORAGE_OPEN_TABS_KEY = "mobile-terminal.open-tabs";
+  const STORAGE_EDITOR_TABS_KEY = "mobile-terminal.editor-tabs";
   const DEFAULT_UI_SCALE = 0.85;
   const DEFAULT_TERMINAL_FONT = 10;
   const KEYBOARD_THRESHOLD = 80;
   const UI_SCALE_FIT_WIDTH = 430;
   const UI_SCALE_FIT_HEIGHT = 700;
+  const EDITOR_TAB_PREFIX = "editor:";
+  const FILE_REQUEST_TIMEOUT_MS = 8000;
+  const FILE_BOOKMARK_LIMIT = 40;
   const decoder = new TextDecoder();
   const defaultShortcuts = [
     { label: "Esc", sequence: "{ESC}", visible: true },
@@ -50,6 +54,7 @@
   const shortcutsPanel = document.getElementById("shortcutsPanel");
   const composerPanel = document.getElementById("composerPanel");
   const composerInput = document.getElementById("composerInput");
+  const clearComposerButton = document.getElementById("clearComposerButton");
   const loginOverlay = document.getElementById("loginOverlay");
   const loginForm = document.getElementById("loginForm");
   const tokenInput = document.getElementById("tokenInput");
@@ -63,6 +68,23 @@
   const editorOverlay = document.getElementById("editorOverlay");
   const shortcutEditorList = document.getElementById("shortcutEditorList");
   const displayOverlay = document.getElementById("displayOverlay");
+  const usageOverlay = document.getElementById("usageOverlay");
+  const usageMetaLabel = document.getElementById("usageMeta");
+  const usageStats = document.getElementById("usageStats");
+  const usageRangeGroup = document.getElementById("usageRangeGroup");
+  const usageDailyChart = document.getElementById("usageDailyChart");
+  const usageDailyChartTitle = document.getElementById("usageDailyChartTitle");
+  const usageDailyEmpty = document.getElementById("usageDailyEmpty");
+  const usageHourChart = document.getElementById("usageHourChart");
+  const usageHourNote = document.getElementById("usageHourNote");
+  const usageBreakdown = document.getElementById("usageBreakdown");
+  const usageBreakdownTitle = document.getElementById("usageBreakdownTitle");
+  const usageViewToggle = document.getElementById("usageViewToggle");
+  const usageEmpty = document.getElementById("usageEmpty");
+  let usageView = "daily";
+  let usageRange = "30d";
+  let lastUsagePayload = null;
+  let usageRequestTimer = null;
   const uiScaleInput = document.getElementById("uiScaleInput");
   const terminalFontInput = document.getElementById("terminalFontInput");
   const uiScaleValue = document.getElementById("uiScaleValue");
@@ -70,7 +92,32 @@
   const displayPreview = document.getElementById("displayPreview");
   const displayUiPreview = document.getElementById("displayUiPreview");
   const displayTerminalPreview = document.getElementById("displayTerminalPreview");
+  const terminalPanel = document.getElementById("terminalPanel");
   const terminalElement = document.getElementById("terminal");
+  const newEditorTabButton = document.getElementById("newEditorTabButton");
+  const fileWorkspace = document.getElementById("fileWorkspace");
+  const fileWorkspaceRoot = document.getElementById("fileWorkspaceRoot");
+  const fileWorkspaceTitle = document.getElementById("fileWorkspaceTitle");
+  const fileTreePanel = document.getElementById("fileTreePanel");
+  const fileTreeScrim = document.getElementById("fileTreeScrim");
+  const fileTree = document.getElementById("fileTree");
+  const fileTreeToggleButton = document.getElementById("fileTreeToggleButton");
+  const fileChangeRootButton = document.getElementById("fileChangeRootButton");
+  const fileRefreshButton = document.getElementById("fileRefreshButton");
+  const fileSaveButton = document.getElementById("fileSaveButton");
+  const filePathLabel = document.getElementById("filePathLabel");
+  const fileStatus = document.getElementById("fileStatus");
+  const fileEditorTabs = document.getElementById("fileEditorTabs");
+  const fileEditorInput = document.getElementById("fileEditorInput");
+  const fileMarkdownToggleButton = document.getElementById("fileMarkdownToggleButton");
+  const fileMarkdownPreview = document.getElementById("fileMarkdownPreview");
+  const fileRootOverlay = document.getElementById("fileRootOverlay");
+  const fileRootForm = document.getElementById("fileRootForm");
+  const fileRootInput = document.getElementById("fileRootInput");
+  const fileRootMessage = document.getElementById("fileRootMessage");
+  const fileBookmarkList = document.getElementById("fileBookmarkList");
+  const fileBookmarkButton = document.getElementById("fileBookmarkButton");
+  const useHomeRootButton = document.getElementById("useHomeRootButton");
 
   let serverConfig = {
     requireToken: true,
@@ -135,11 +182,17 @@
   let lastStableViewportHeight = 0;
   let currentTabs = [];
   let shortcuts = loadShortcuts();
-  let openTabMenuName = null;
+  let openTabMenuKey = null;
   let currentSessions = [];
   let openTabNames = loadOpenTabs();
+  let editorTabs = loadEditorTabs();
+  let fileBookmarks = [];
   let selectedSessionName = localStorage.getItem(STORAGE_ACTIVE_SESSION_KEY) || "";
+  let activeTabKey = selectedSessionName ? terminalTabKey(selectedSessionName) : "";
   let activeSessionName = "";
+  let fileRequestCounter = 0;
+  let pendingFileRequests = new Map();
+  let lastDefaultFileRoot = "";
   let followOutput = true;
   let reconnectForSessionSwitch = false;
   let skipHistoryOnNextConnect = false;
@@ -318,6 +371,350 @@
     return [];
   }
 
+  function terminalTabKey(sessionName) {
+    return `terminal:${sessionName}`;
+  }
+
+  function editorTabKey(tabId) {
+    return `${EDITOR_TAB_PREFIX}${tabId}`;
+  }
+
+  function isEditorTabKey(tabKey) {
+    return String(tabKey || "").startsWith(EDITOR_TAB_PREFIX);
+  }
+
+  function pathBaseName(path) {
+    const value = String(path || "").replace(/[\\/]+$/, "");
+    const pieces = value.split(/[\\/]/).filter(Boolean);
+    return pieces[pieces.length - 1] || value || "Files";
+  }
+
+  function normalizeEditorTab(tab) {
+    if (!tab || !tab.root) {
+      return null;
+    }
+    const root = String(tab.root || "").trim();
+    if (!root) {
+      return null;
+    }
+    const id = String(tab.id || `files-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`);
+    const openFiles = Array.isArray(tab.openFiles)
+      ? tab.openFiles.map(normalizeOpenFile).filter(Boolean)
+      : [];
+    if (!openFiles.length && tab.selectedPath) {
+      const migratedFile = normalizeOpenFile({
+        path: tab.selectedPath,
+        name: tab.selectedName || pathBaseName(tab.selectedPath),
+        content: tab.content || "",
+        originalContent: tab.originalContent || "",
+        dirty: tab.dirty === true,
+      });
+      if (migratedFile) {
+        openFiles.push(migratedFile);
+      }
+    }
+    const activeFilePath =
+      String(tab.activeFilePath || tab.selectedPath || "").trim() ||
+      openFiles[0]?.path ||
+      "";
+    return {
+      id,
+      root,
+      name: String(tab.name || pathBaseName(root)).trim() || "Files",
+      tree: tab.tree && typeof tab.tree === "object" ? tab.tree : {},
+      openFiles,
+      activeFilePath,
+      loadingPath: "",
+      error: "",
+      treeHidden: tab.treeHidden === true,
+    };
+  }
+
+  function normalizeOpenFile(file) {
+    if (!file || !file.path) {
+      return null;
+    }
+    const path = String(file.path || "").trim();
+    if (!path) {
+      return null;
+    }
+    const content = String(file.content || "");
+    return {
+      path,
+      name: String(file.name || pathBaseName(path)).trim() || pathBaseName(path),
+      content,
+      originalContent: String(file.originalContent ?? content),
+      dirty: file.dirty === true,
+      loaded: file.loaded === true || Object.prototype.hasOwnProperty.call(file, "content"),
+      previewMode: file.previewMode === true,
+    };
+  }
+
+  function loadEditorTabs() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(STORAGE_EDITOR_TABS_KEY) || "null");
+      if (Array.isArray(parsed)) {
+        return parsed.map(normalizeEditorTab).filter(Boolean);
+      }
+    } catch (_error) {
+      // Ignore bad local storage payloads.
+    }
+    return [];
+  }
+
+  function persistEditorTabs() {
+    if (!editorTabs.length) {
+      localStorage.removeItem(STORAGE_EDITOR_TABS_KEY);
+      return;
+    }
+    localStorage.setItem(
+      STORAGE_EDITOR_TABS_KEY,
+      JSON.stringify(
+        editorTabs.map((tab) => ({
+          id: tab.id,
+          root: tab.root,
+          name: tab.name,
+          treeHidden: tab.treeHidden === true,
+          activeFilePath: tab.activeFilePath || "",
+          openFiles: tab.openFiles.map((file) => ({
+            path: file.path,
+            name: file.name,
+          })),
+        })),
+      ),
+    );
+  }
+
+  function activeEditorTab() {
+    if (!isEditorTabKey(activeTabKey)) {
+      return null;
+    }
+    const tabId = activeTabKey.slice(EDITOR_TAB_PREFIX.length);
+    return editorTabs.find((tab) => tab.id === tabId) || null;
+  }
+
+  function editorTabById(tabId) {
+    return editorTabs.find((tab) => tab.id === tabId) || null;
+  }
+
+  function activeOpenFile(tab) {
+    if (!tab) {
+      return null;
+    }
+    return tab.openFiles.find((file) => sameFilePath(file.path, tab.activeFilePath)) || tab.openFiles[0] || null;
+  }
+
+  function editorHasDirtyFiles(tab) {
+    return Boolean(tab?.openFiles?.some((file) => file.dirty));
+  }
+
+  function normalizeFilePathForCompare(path) {
+    return String(path || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  }
+
+  function sameFilePath(left, right) {
+    return normalizeFilePathForCompare(left) === normalizeFilePathForCompare(right);
+  }
+
+  function fileBookmarkName(path) {
+    const value = String(path || "").trim();
+    const remoteMatch = value.match(/^([^:]+):(.+)$/);
+    if (remoteMatch) {
+      const remoteName = pathBaseName(remoteMatch[2]);
+      return `${remoteMatch[1]}:${remoteName ? ` ${remoteName}` : ""}`.trim();
+    }
+    return pathBaseName(value);
+  }
+
+  function normalizeFileBookmark(bookmark) {
+    const rawPath = typeof bookmark === "string" ? bookmark : bookmark?.path;
+    const path = String(rawPath || "").trim();
+    if (!path) {
+      return null;
+    }
+    const name = String(typeof bookmark === "object" && bookmark ? bookmark.name || "" : "").trim();
+    return {
+      path,
+      name: name || fileBookmarkName(path),
+    };
+  }
+
+  function normalizeFileBookmarks(bookmarks) {
+    if (!Array.isArray(bookmarks)) {
+      return [];
+    }
+    const normalized = [];
+    bookmarks.forEach((bookmark) => {
+      const nextBookmark = normalizeFileBookmark(bookmark);
+      if (!nextBookmark || normalized.some((item) => sameFilePath(item.path, nextBookmark.path))) {
+        return;
+      }
+      normalized.push(nextBookmark);
+    });
+    return normalized.slice(0, FILE_BOOKMARK_LIMIT);
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    }[character]));
+  }
+
+  function isMarkdownFile(file) {
+    const name = String(file?.path || file?.name || "");
+    return /\.(md|markdown|mdown|mkdn)$/i.test(name);
+  }
+
+  function safeMarkdownHref(rawHref) {
+    const href = String(rawHref || "").trim();
+    if (!href) {
+      return "";
+    }
+    const lowerHref = href.toLowerCase();
+    if (
+      lowerHref.startsWith("http://") ||
+      lowerHref.startsWith("https://") ||
+      lowerHref.startsWith("mailto:") ||
+      href.startsWith("#") ||
+      href.startsWith("/") ||
+      href.startsWith("./") ||
+      href.startsWith("../")
+    ) {
+      return escapeHtml(href);
+    }
+    return "";
+  }
+
+  function renderMarkdownInline(text) {
+    return String(text || "")
+      .split(/(`[^`]*`)/g)
+      .map((chunk) => {
+        if (chunk.startsWith("`") && chunk.endsWith("`")) {
+          return `<code>${escapeHtml(chunk.slice(1, -1))}</code>`;
+        }
+        let html = escapeHtml(chunk);
+        html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_match, label, href) => {
+          const safeHref = safeMarkdownHref(href);
+          if (!safeHref) {
+            return label;
+          }
+          return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+        });
+        html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+        html = html.replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+        return html;
+      })
+      .join("");
+  }
+
+  function markdownToHtml(markdown) {
+    const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
+    const output = [];
+    let paragraph = [];
+    let listType = "";
+    let inCodeBlock = false;
+    let codeLines = [];
+
+    const closeParagraph = () => {
+      if (!paragraph.length) {
+        return;
+      }
+      output.push(`<p>${renderMarkdownInline(paragraph.join(" "))}</p>`);
+      paragraph = [];
+    };
+
+    const closeList = () => {
+      if (!listType) {
+        return;
+      }
+      output.push(`</${listType}>`);
+      listType = "";
+    };
+
+    const closeCodeBlock = () => {
+      output.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+      inCodeBlock = false;
+      codeLines = [];
+    };
+
+    lines.forEach((line) => {
+      if (/^\s*```/.test(line)) {
+        if (inCodeBlock) {
+          closeCodeBlock();
+        } else {
+          closeParagraph();
+          closeList();
+          inCodeBlock = true;
+          codeLines = [];
+        }
+        return;
+      }
+
+      if (inCodeBlock) {
+        codeLines.push(line);
+        return;
+      }
+
+      if (!line.trim()) {
+        closeParagraph();
+        closeList();
+        return;
+      }
+
+      const heading = line.match(/^(#{1,6})\s+(.+)$/);
+      if (heading) {
+        closeParagraph();
+        closeList();
+        const level = heading[1].length;
+        output.push(`<h${level}>${renderMarkdownInline(heading[2].trim())}</h${level}>`);
+        return;
+      }
+
+      if (/^\s{0,3}([-*_])\s*(\1\s*){2,}$/.test(line)) {
+        closeParagraph();
+        closeList();
+        output.push("<hr>");
+        return;
+      }
+
+      const listItem = line.match(/^\s{0,3}(([-+*])|(\d+\.))\s+(.+)$/);
+      if (listItem) {
+        closeParagraph();
+        const nextListType = /\d+\./.test(listItem[1]) ? "ol" : "ul";
+        if (listType && listType !== nextListType) {
+          closeList();
+        }
+        if (!listType) {
+          listType = nextListType;
+          output.push(`<${listType}>`);
+        }
+        output.push(`<li>${renderMarkdownInline(listItem[4].trim())}</li>`);
+        return;
+      }
+
+      const quote = line.match(/^\s{0,3}>\s?(.*)$/);
+      if (quote) {
+        closeParagraph();
+        closeList();
+        output.push(`<blockquote>${renderMarkdownInline(quote[1])}</blockquote>`);
+        return;
+      }
+
+      paragraph.push(line.trim());
+    });
+
+    if (inCodeBlock) {
+      closeCodeBlock();
+    }
+    closeParagraph();
+    closeList();
+    return output.join("\n");
+  }
+
   function saveShortcuts(nextShortcuts) {
     shortcuts = nextShortcuts
       .map(normalizeShortcut)
@@ -335,6 +732,7 @@
         shortcuts,
         uiScale,
         terminalFontSize,
+        fileBookmarks,
       },
     });
   }
@@ -520,19 +918,38 @@
   }
 
   function syncOpenTabsToSessions() {
+    const editorTabViews = editorTabs.map((tab) => ({
+      type: "editor",
+      key: editorTabKey(tab.id),
+      id: tab.id,
+      name: tab.name || pathBaseName(tab.root),
+      root: tab.root,
+      active: false,
+    }));
+
     if (!currentSessions.length) {
       const fallbackTabs = openTabNames.length
         ? openTabNames
         : activeSessionName
           ? [activeSessionName]
           : [];
-      currentTabs = fallbackTabs.map((name) => ({
+      const terminalTabs = fallbackTabs.map((name) => ({
+        type: "terminal",
+        key: terminalTabKey(name),
         name,
-        active: name === activeSessionName,
+        active: false,
         attached: 0,
         windows: 0,
       }));
+      currentTabs = [...terminalTabs, ...editorTabViews];
+      if (!currentTabs.some((tab) => tab.key === activeTabKey)) {
+        activeTabKey = terminalTabs[0]?.key || editorTabViews[0]?.key || "";
+      }
+      currentTabs.forEach((tab) => {
+        tab.active = tab.key === activeTabKey;
+      });
       renderTabs();
+      renderActiveSurface();
       return;
     }
 
@@ -556,22 +973,70 @@
     }
 
     const sessionByName = new Map(currentSessions.map((session) => [session.name, session]));
-    currentTabs = openTabNames
+    const terminalTabs = openTabNames
       .map((name) => {
         const session = sessionByName.get(name);
         if (!session) {
           return null;
         }
         return {
+          type: "terminal",
+          key: terminalTabKey(name),
           name,
-          active: name === activeSessionName,
+          active: false,
           attached: session.attached,
           windows: session.windows,
         };
       })
       .filter(Boolean);
 
+    currentTabs = [...terminalTabs, ...editorTabViews];
+    if (!currentTabs.some((tab) => tab.key === activeTabKey)) {
+      activeTabKey =
+        terminalTabs.find((tab) => tab.name === activeSessionName)?.key ||
+        terminalTabs[0]?.key ||
+        editorTabViews[0]?.key ||
+        "";
+    }
+    currentTabs.forEach((tab) => {
+      tab.active = tab.key === activeTabKey;
+    });
     renderTabs();
+    renderActiveSurface();
+  }
+
+  function renderActiveSurface() {
+    const active = activeTab();
+    const editorActive = active?.type === "editor";
+    document.body.dataset.activeSurface = editorActive ? "editor" : "terminal";
+    terminalPanel.classList.toggle("hidden", editorActive);
+    fileWorkspace.classList.toggle("hidden", !editorActive);
+    shortcutsPanel.classList.toggle("hidden", editorActive);
+    if (editorActive) {
+      if (mobileComposerMode) {
+        if (document.activeElement === composerInput) {
+          composerInput.blur();
+        }
+        setComposerActive(false);
+        composerPanel.classList.add("hidden");
+      }
+      document.documentElement.style.setProperty("--shortcut-height", "0px");
+      document.documentElement.style.setProperty("--shortcut-reserve", "0px");
+      renderFileWorkspace();
+      const tab = activeEditorTab();
+      const rootNode = tab ? tab.tree[tab.root] : null;
+      if (tab && !rootNode?.loaded && !rootNode?.error && !tab.loadingPath) {
+        requestFileList(tab, tab.root);
+      }
+      const file = activeOpenFile(tab);
+      if (tab && file && !file.loaded && tab.loadingPath !== file.path) {
+        requestFileRead(tab, file.path);
+      }
+      return;
+    }
+    shortcutsPanel.classList.remove("hidden");
+    renderFileWorkspace();
+    scheduleLayoutRefresh();
   }
 
   function longestCommonPrefixLength(left, right) {
@@ -750,6 +1215,16 @@
     if (sync) {
       syncComposerState();
     }
+  }
+
+  function forceClearComposer() {
+    if (!mobileComposerMode) {
+      return;
+    }
+    const wasFocused = composerHasKeyboardFocus();
+    clearComposer(false);
+    sendMessage({ type: "composer-force-clear", revision: nextComposerRevision() });
+    restoreShortcutKeyboardState(wasFocused);
   }
 
   function flushComposerText() {
@@ -1633,6 +2108,9 @@
     currentSessions = Array.isArray(sessions) ? sessions : [];
     if (nextActiveSession) {
       activeSessionName = nextActiveSession;
+      if (!isEditorTabKey(activeTabKey)) {
+        activeTabKey = terminalTabKey(activeSessionName);
+      }
     }
     syncOpenTabsToSessions();
     renderSessionMenu();
@@ -1657,6 +2135,16 @@
       positionSessionMenu();
       positionSettingsMenu();
     }, 40);
+  }
+
+  function performLayoutNow({ preserveTerminalCols = false } = {}) {
+    window.clearTimeout(fitTimer);
+    fitTimer = 0;
+    measureShortcutHeight();
+    fitTerminal({ preserveCols: preserveTerminalCols });
+    positionTabMenu();
+    positionSessionMenu();
+    positionSettingsMenu();
   }
 
   function refreshFollowOutput() {
@@ -1694,6 +2182,9 @@
   }
 
   function fitTerminal({ preserveCols = false } = {}) {
+    if (terminalPanel.classList.contains("hidden")) {
+      return;
+    }
     if (terminalFitScheduled) {
       pendingFitPreserveCols = pendingFitPreserveCols && preserveCols;
       return;
@@ -2146,6 +2637,11 @@
   }
 
   function measureShortcutHeight() {
+    if (shortcutsPanel.classList.contains("hidden")) {
+      document.documentElement.style.setProperty("--shortcut-height", "0px");
+      document.documentElement.style.setProperty("--shortcut-reserve", "0px");
+      return;
+    }
     const panelRect = shortcutsPanel.getBoundingClientRect();
     const shortcutRect = shortcutBar.getBoundingClientRect();
     const composerRect =
@@ -2229,23 +2725,27 @@
     tabsStrip.innerHTML = "";
     currentTabs.forEach((tab) => {
       const button = document.createElement("button");
-      button.className = `tab-pill${tab.active ? " is-active" : ""}`;
+      button.className = `tab-pill tab-pill-${tab.type || "terminal"}${tab.active ? " is-active" : ""}`;
       button.type = "button";
-      button.textContent = tab.name || "session";
+      button.textContent = tab.type === "editor" ? `Files: ${tab.name || "root"}` : tab.name || "session";
       button.addEventListener("click", () => {
         if (Date.now() < suppressTabClickUntil) {
           return;
         }
         if (tab.active) {
-          toggleTabMenu(tab.name);
+          toggleTabMenu(tab.key);
+          return;
+        }
+        if (tab.type === "editor") {
+          switchEditorTab(tab.id);
           return;
         }
         switchSession(tab.name);
       });
-      button.dataset.tabName = tab.name;
+      button.dataset.tabKey = tab.key;
       tabsStrip.appendChild(button);
     });
-    if (!currentTabs.some((tab) => tab.name === openTabMenuName && tab.active)) {
+    if (!currentTabs.some((tab) => tab.key === openTabMenuKey && tab.active)) {
       closeTabMenu();
     } else {
       positionTabMenu();
@@ -2444,6 +2944,732 @@
     scheduleLayoutRefresh();
   }
 
+  function nextFileRequestId() {
+    fileRequestCounter += 1;
+    return `fs-${Date.now().toString(36)}-${fileRequestCounter}`;
+  }
+
+  function sendFileCommand(type, payload = {}, context = {}) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      showToast("Connect before opening files.");
+      return "";
+    }
+    const requestId = nextFileRequestId();
+    const timeoutId = window.setTimeout(() => {
+      const pending = pendingFileRequests.get(requestId);
+      if (!pending) {
+        return;
+      }
+      pendingFileRequests.delete(requestId);
+      handleFileRequestTimeout(pending);
+    }, FILE_REQUEST_TIMEOUT_MS);
+    pendingFileRequests.set(requestId, { ...context, timeoutId });
+    sendMessage({ type, requestId, ...payload });
+    return requestId;
+  }
+
+  function requestDefaultFileRoot() {
+    sendFileCommand("fs-default-root", {}, { kind: "default-root" });
+  }
+
+  function openFileRootPicker(mode = "new") {
+    closeTabMenu();
+    closeSessionMenu();
+    closeSettingsMenu();
+    const currentEditor = activeEditorTab();
+    fileRootForm.dataset.mode = mode;
+    fileRootMessage.textContent = "";
+    fileRootInput.value = mode === "change" && currentEditor ? currentEditor.root : lastDefaultFileRoot || currentEditor?.root || "";
+    renderFileBookmarks();
+    fileRootOverlay.classList.remove("hidden");
+    requestDefaultFileRoot();
+    window.requestAnimationFrame(() => {
+      fileRootInput.focus({ preventScroll: true });
+      fileRootInput.select();
+    });
+  }
+
+  function closeFileRootPicker() {
+    fileRootOverlay.classList.add("hidden");
+    fileRootMessage.textContent = "";
+  }
+
+  function openBookmarkedRoot(path) {
+    fileRootInput.value = path;
+    fileRootMessage.textContent = "";
+    if (fileRootForm.dataset.mode === "change") {
+      changeActiveEditorRoot(path);
+      return;
+    }
+    createEditorTab(path);
+  }
+
+  function renderFileBookmarks() {
+    fileBookmarkList.innerHTML = "";
+    if (!fileBookmarks.length) {
+      const empty = document.createElement("div");
+      empty.className = "file-bookmark-empty";
+      empty.textContent = "No bookmarks saved";
+      fileBookmarkList.appendChild(empty);
+      return;
+    }
+    fileBookmarks.forEach((bookmark) => {
+      const row = document.createElement("div");
+      row.className = "file-bookmark-row";
+
+      const openButton = document.createElement("button");
+      openButton.type = "button";
+      openButton.className = "file-bookmark-open";
+      openButton.addEventListener("click", () => openBookmarkedRoot(bookmark.path));
+
+      const name = document.createElement("span");
+      name.className = "file-bookmark-name";
+      name.textContent = bookmark.name || fileBookmarkName(bookmark.path);
+      openButton.appendChild(name);
+
+      const path = document.createElement("span");
+      path.className = "file-bookmark-path";
+      path.textContent = bookmark.path;
+      openButton.appendChild(path);
+      row.appendChild(openButton);
+
+      const removeButton = document.createElement("button");
+      removeButton.type = "button";
+      removeButton.className = "file-bookmark-remove";
+      removeButton.textContent = "Remove";
+      removeButton.setAttribute("aria-label", `Remove ${bookmark.name || bookmark.path}`);
+      removeButton.addEventListener("click", () => removeFileBookmark(bookmark.path));
+      row.appendChild(removeButton);
+
+      fileBookmarkList.appendChild(row);
+    });
+  }
+
+  function addFileBookmark(path) {
+    const nextPath = String(path || "").trim();
+    if (!nextPath) {
+      fileRootMessage.textContent = "Enter a path to bookmark.";
+      return;
+    }
+    const nextBookmark = normalizeFileBookmark(nextPath);
+    fileBookmarks = [
+      nextBookmark,
+      ...fileBookmarks.filter((bookmark) => !sameFilePath(bookmark.path, nextPath)),
+    ].slice(0, FILE_BOOKMARK_LIMIT);
+    fileRootMessage.textContent = "";
+    saveHostSettings();
+    renderFileBookmarks();
+    showToast("Bookmark saved.");
+  }
+
+  function removeFileBookmark(path) {
+    fileBookmarks = fileBookmarks.filter((bookmark) => !sameFilePath(bookmark.path, path));
+    saveHostSettings();
+    renderFileBookmarks();
+    showToast("Bookmark removed.");
+  }
+
+  function createEditorTab(rootPath) {
+    const root = String(rootPath || "").trim();
+    if (!root) {
+      fileRootMessage.textContent = "Enter a path first.";
+      return;
+    }
+    const tab = normalizeEditorTab({
+      id: `files-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+      root,
+      name: pathBaseName(root),
+    });
+    if (!tab) {
+      fileRootMessage.textContent = "Enter a valid path.";
+      return;
+    }
+    editorTabs.push(tab);
+    persistEditorTabs();
+    activeTabKey = editorTabKey(tab.id);
+    closeFileRootPicker();
+    syncOpenTabsToSessions();
+    requestFileList(tab, tab.root);
+  }
+
+  function changeActiveEditorRoot(rootPath) {
+    const tab = activeEditorTab();
+    const root = String(rootPath || "").trim();
+    if (!tab || !root) {
+      fileRootMessage.textContent = "Enter a path first.";
+      return;
+    }
+    if (editorHasDirtyFiles(tab) && !window.confirm(`Discard unsaved changes in "${tab.name}"?`)) {
+      return;
+    }
+    tab.root = root;
+    tab.name = pathBaseName(root);
+    tab.tree = {};
+    tab.openFiles = [];
+    tab.activeFilePath = "";
+    tab.error = "";
+    persistEditorTabs();
+    closeFileRootPicker();
+    syncOpenTabsToSessions();
+    requestFileList(tab, tab.root);
+  }
+
+  function switchEditorTab(tabId) {
+    const tab = editorTabById(tabId);
+    if (!tab) {
+      return;
+    }
+    activeTabKey = editorTabKey(tab.id);
+    closeSessionMenu();
+    closeTabMenu();
+    syncOpenTabsToSessions();
+  }
+
+  function closeEditorTab(tabId) {
+    const tab = editorTabById(tabId);
+    if (!tab) {
+      return;
+    }
+    if (editorHasDirtyFiles(tab) && !window.confirm(`Discard unsaved changes in "${tab.name}"?`)) {
+      return;
+    }
+    const wasActive = activeTabKey === editorTabKey(tabId);
+    editorTabs = editorTabs.filter((item) => item.id !== tabId);
+    persistEditorTabs();
+    if (wasActive) {
+      activeTabKey = activeSessionName ? terminalTabKey(activeSessionName) : "";
+    }
+    syncOpenTabsToSessions();
+    if (wasActive && activeSessionName) {
+      focusTerminal();
+    }
+  }
+
+  function ensureTreeNode(tab, path) {
+    if (!tab.tree[path]) {
+      tab.tree[path] = {
+        loaded: false,
+        expanded: false,
+        entries: [],
+        error: "",
+        truncated: false,
+      };
+    }
+    return tab.tree[path];
+  }
+
+  function requestFileList(tab, path) {
+    if (!tab || !path) {
+      return;
+    }
+    const node = ensureTreeNode(tab, path);
+    node.expanded = true;
+    node.error = "";
+    tab.loadingPath = path;
+    tab.error = "";
+    renderFileWorkspace();
+    const requestId = sendFileCommand("fs-list", { path }, { kind: "list", tabId: tab.id, path });
+    if (!requestId) {
+      tab.loadingPath = "";
+      renderFileWorkspace();
+    }
+  }
+
+  function requestFileRead(tab, path) {
+    if (!tab || !path) {
+      return;
+    }
+    const existingFile = tab.openFiles.find((file) => sameFilePath(file.path, path));
+    if (existingFile && existingFile.loaded) {
+      tab.activeFilePath = existingFile.path;
+      tab.error = "";
+      if (fileTreeUsesDrawer()) {
+        tab.treeHidden = true;
+      }
+      persistEditorTabs();
+      renderFileWorkspace();
+      return;
+    }
+    if (existingFile) {
+      tab.activeFilePath = existingFile.path;
+    }
+    tab.loadingPath = path;
+    tab.error = "";
+    renderFileWorkspace();
+    const requestId = sendFileCommand("fs-read", { path }, { kind: "read", tabId: tab.id, path });
+    if (!requestId) {
+      tab.loadingPath = "";
+      renderFileWorkspace();
+    }
+  }
+
+  function saveActiveFile() {
+    const tab = activeEditorTab();
+    const file = activeOpenFile(tab);
+    if (!tab || !file || !file.dirty) {
+      return;
+    }
+    tab.loadingPath = file.path;
+    tab.error = "";
+    updateFileControls(tab);
+    const requestId = sendFileCommand(
+      "fs-write",
+      { path: file.path, content: file.content },
+      { kind: "write", tabId: tab.id, path: file.path },
+    );
+    if (!requestId) {
+      tab.loadingPath = "";
+      updateFileControls(tab);
+    }
+  }
+
+  function toggleDirectory(tab, path) {
+    const node = ensureTreeNode(tab, path);
+    if (node.expanded) {
+      node.expanded = false;
+      renderFileWorkspace();
+      return;
+    }
+    node.expanded = true;
+    if (!node.loaded) {
+      requestFileList(tab, path);
+      return;
+    }
+    renderFileWorkspace();
+  }
+
+  function renderFileTreeRow(tab, entry, depth, parent) {
+    const isDirectory = entry.type === "directory";
+    const node = isDirectory ? ensureTreeNode(tab, entry.path) : null;
+    const activePath = activeOpenFile(tab)?.path || tab.activeFilePath;
+    const isActiveFile = !isDirectory && sameFilePath(entry.path, activePath);
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = [
+      "file-tree-row",
+      isDirectory ? "is-directory" : "is-file",
+      isActiveFile ? "is-selected is-active-file" : "",
+    ].filter(Boolean).join(" ");
+    row.style.setProperty("--tree-depth", String(depth));
+    row.dataset.path = entry.path;
+    if (isActiveFile) {
+      row.dataset.currentFile = "true";
+      row.setAttribute("aria-current", "true");
+    }
+
+    const marker = document.createElement("span");
+    marker.className = "file-tree-marker";
+    marker.textContent = isDirectory ? (node.expanded ? "v" : ">") : "";
+    row.appendChild(marker);
+
+    const label = document.createElement("span");
+    label.className = "file-tree-label";
+    label.textContent = entry.name || entry.path;
+    row.appendChild(label);
+
+    row.addEventListener("click", () => {
+      if (isDirectory) {
+        toggleDirectory(tab, entry.path);
+        return;
+      }
+      requestFileRead(tab, entry.path);
+    });
+    parent.appendChild(row);
+
+    if (isDirectory && node.expanded) {
+      if (node.error) {
+        renderFileTreeMessage(node.error, depth + 1, parent);
+      } else if (!node.loaded) {
+        renderFileTreeMessage("Loading...", depth + 1, parent);
+      } else if (!node.entries.length) {
+        renderFileTreeMessage("Empty", depth + 1, parent);
+      } else {
+        node.entries.forEach((child) => renderFileTreeRow(tab, child, depth + 1, parent));
+        if (node.truncated) {
+          renderFileTreeMessage("Directory truncated", depth + 1, parent);
+        }
+      }
+    }
+  }
+
+  function renderFileTreeMessage(message, depth, parent) {
+    const item = document.createElement("div");
+    item.className = "file-tree-message";
+    item.style.setProperty("--tree-depth", String(depth));
+    item.textContent = message;
+    parent.appendChild(item);
+  }
+
+  function renderFileTree(tab) {
+    fileTree.innerHTML = "";
+    if (!tab) {
+      renderFileTreeMessage("Open a file tab", 0, fileTree);
+      return;
+    }
+    const rootNode = ensureTreeNode(tab, tab.root);
+    if (rootNode.error) {
+      renderFileTreeMessage(rootNode.error, 0, fileTree);
+      return;
+    }
+    if (!rootNode.loaded) {
+      renderFileTreeMessage(tab.loadingPath === tab.root ? "Loading..." : "Open root", 0, fileTree);
+      return;
+    }
+    if (!rootNode.entries.length) {
+      renderFileTreeMessage("Empty", 0, fileTree);
+      return;
+    }
+    revealActiveFileInTree(tab);
+    rootNode.entries.forEach((entry) => renderFileTreeRow(tab, entry, 0, fileTree));
+    if (rootNode.truncated) {
+      renderFileTreeMessage("Directory truncated", 0, fileTree);
+    }
+    scheduleActiveFileTreeScroll();
+  }
+
+  function revealActiveFileInTree(tab) {
+    const activePath = activeOpenFile(tab)?.path || tab?.activeFilePath || "";
+    const rootNode = tab ? tab.tree[tab.root] : null;
+    if (!tab || !activePath || !rootNode?.loaded) {
+      return;
+    }
+    const ancestors = activeFileAncestorPaths(tab, activePath);
+    let parentNode = rootNode;
+    for (const ancestorPath of ancestors.slice(1)) {
+      const entry = (parentNode.entries || []).find((item) => (
+        item.type === "directory" && sameFilePath(item.path, ancestorPath)
+      ));
+      if (!entry) {
+        break;
+      }
+      const node = ensureTreeNode(tab, entry.path);
+      node.expanded = true;
+      if (!node.loaded) {
+        queueRevealDirectoryLoad(tab, entry.path);
+        return;
+      }
+      parentNode = node;
+    }
+
+    const revealInEntries = (entries) => {
+      for (const entry of entries) {
+        if (sameFilePath(entry.path, activePath)) {
+          return true;
+        }
+        if (entry.type !== "directory") {
+          continue;
+        }
+        const node = tab.tree[entry.path];
+        if (!node?.loaded || !revealInEntries(node.entries || [])) {
+          continue;
+        }
+        node.expanded = true;
+        return true;
+      }
+      return false;
+    };
+
+    revealInEntries(rootNode.entries || []);
+  }
+
+  function activeFileAncestorPaths(tab, activePath) {
+    const root = normalizeFilePathForCompare(tab?.root || "");
+    const active = normalizeFilePathForCompare(activePath);
+    if (!root || !active || active === root || !active.startsWith(`${root}/`)) {
+      return tab?.root ? [tab.root] : [];
+    }
+    const relative = active.slice(root.length).replace(/^[\\/]+/, "");
+    const pieces = relative.split(/[\\/]/).filter(Boolean);
+    const ancestors = [tab.root];
+    let current = root;
+    pieces.slice(0, -1).forEach((piece) => {
+      current = `${current}/${piece}`;
+      ancestors.push(current);
+    });
+    return ancestors;
+  }
+
+  function queueRevealDirectoryLoad(tab, path) {
+    if (!tab || !path || tab.loadingPath || tab.pendingRevealPath === path) {
+      return;
+    }
+    tab.pendingRevealPath = path;
+    window.requestAnimationFrame(() => {
+      if (tab.pendingRevealPath !== path) {
+        return;
+      }
+      tab.pendingRevealPath = "";
+      const node = ensureTreeNode(tab, path);
+      if (node.loaded || tab.loadingPath) {
+        renderFileWorkspace();
+        return;
+      }
+      requestFileList(tab, path);
+    });
+  }
+
+  function scheduleActiveFileTreeScroll() {
+    window.requestAnimationFrame(() => {
+      const activeRow = fileTree.querySelector('[data-current-file="true"]');
+      if (!activeRow || fileTreePanel.offsetParent === null) {
+        return;
+      }
+      activeRow.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+  }
+
+  function switchOpenFile(path) {
+    const tab = activeEditorTab();
+    const file = tab?.openFiles.find((item) => sameFilePath(item.path, path));
+    if (!tab || !path || !file) {
+      return;
+    }
+    tab.activeFilePath = file.path;
+    tab.error = "";
+    persistEditorTabs();
+    renderFileWorkspace();
+    if (!file.loaded) {
+      requestFileRead(tab, path);
+      return;
+    }
+    if (!file.previewMode) {
+      fileEditorInput.focus({ preventScroll: true });
+    }
+  }
+
+  function closeOpenFile(path) {
+    const tab = activeEditorTab();
+    if (!tab || !path) {
+      return;
+    }
+    const file = tab.openFiles.find((item) => sameFilePath(item.path, path));
+    if (!file) {
+      return;
+    }
+    if (file.dirty && !window.confirm(`Discard unsaved changes in "${file.name}"?`)) {
+      return;
+    }
+    const index = tab.openFiles.findIndex((item) => sameFilePath(item.path, path));
+    tab.openFiles = tab.openFiles.filter((item) => !sameFilePath(item.path, path));
+    if (sameFilePath(tab.activeFilePath, path)) {
+      tab.activeFilePath =
+        tab.openFiles[Math.max(0, Math.min(index, tab.openFiles.length - 1))]?.path || "";
+    }
+    persistEditorTabs();
+    renderFileWorkspace();
+  }
+
+  function renderOpenFileTabs(tab) {
+    fileEditorTabs.innerHTML = "";
+    if (!tab || !tab.openFiles.length) {
+      fileEditorTabs.classList.add("hidden");
+      return;
+    }
+    fileEditorTabs.classList.remove("hidden");
+    tab.openFiles.forEach((file) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = `file-editor-tab${sameFilePath(file.path, tab.activeFilePath) ? " is-active" : ""}${file.dirty ? " is-dirty" : ""}`;
+      item.addEventListener("click", () => switchOpenFile(file.path));
+
+      const label = document.createElement("span");
+      label.className = "file-editor-tab-label";
+      label.textContent = file.dirty ? `${file.name} *` : file.name;
+      item.appendChild(label);
+
+      const closeButton = document.createElement("span");
+      closeButton.className = "file-editor-tab-close";
+      closeButton.textContent = "x";
+      closeButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        closeOpenFile(file.path);
+      });
+      item.appendChild(closeButton);
+      fileEditorTabs.appendChild(item);
+    });
+  }
+
+  function updateFileControls(tab) {
+    const file = activeOpenFile(tab);
+    const hasFile = Boolean(file);
+    const markdownFile = hasFile && isMarkdownFile(file);
+    const previewMode = markdownFile && file.loaded && file.previewMode === true;
+    filePathLabel.textContent = file ? file.path : "No file selected";
+    fileStatus.textContent = tab?.error || (file?.dirty ? "Unsaved" : tab?.loadingPath || (file && !file.loaded) ? "Loading..." : "");
+    fileSaveButton.disabled = !tab || !hasFile || !file.dirty || Boolean(tab.loadingPath);
+    fileEditorInput.disabled = !hasFile || !file.loaded;
+    fileEditorInput.classList.toggle("hidden", previewMode);
+    fileMarkdownToggleButton.classList.toggle("hidden", !markdownFile);
+    fileMarkdownToggleButton.classList.toggle("is-active", previewMode);
+    fileMarkdownToggleButton.disabled = !markdownFile || !file.loaded;
+    fileMarkdownToggleButton.textContent = previewMode ? "Editor" : "Preview";
+    fileMarkdownPreview.classList.toggle("hidden", !previewMode);
+    fileMarkdownPreview.innerHTML = previewMode ? markdownToHtml(file.content) : "";
+  }
+
+  function renderFileWorkspace() {
+    const tab = activeEditorTab();
+    if (tab && tab.openFiles.length && !tab.openFiles.some((file) => sameFilePath(file.path, tab.activeFilePath))) {
+      tab.activeFilePath = tab.openFiles[0].path;
+    }
+    const treeOpen = Boolean(tab && tab.treeHidden !== true);
+    fileWorkspace.classList.toggle("is-tree-hidden", !treeOpen);
+    fileWorkspace.classList.toggle("is-tree-open", treeOpen);
+    fileWorkspaceRoot.textContent = tab?.root || "";
+    fileWorkspaceTitle.textContent = tab?.name || "Files";
+    fileTreeToggleButton.classList.toggle("is-active", treeOpen);
+    renderFileTree(tab);
+    renderOpenFileTabs(tab);
+    updateFileControls(tab);
+    const file = activeOpenFile(tab);
+    const nextValue = file?.content || "";
+    if (document.activeElement !== fileEditorInput && fileEditorInput.value !== nextValue) {
+      fileEditorInput.value = nextValue;
+    }
+    if (!tab) {
+      fileEditorInput.value = "";
+      fileEditorInput.disabled = true;
+    }
+  }
+
+  function handleFileServerMessage(payload) {
+    const requestId = String(payload.requestId || "");
+    const context = pendingFileRequests.get(requestId) || {};
+    if (requestId) {
+      pendingFileRequests.delete(requestId);
+    }
+    if (context.timeoutId) {
+      window.clearTimeout(context.timeoutId);
+    }
+
+    if (payload.type === "fs-default-root") {
+      lastDefaultFileRoot = payload.path || lastDefaultFileRoot;
+      if (payload.home) {
+        useHomeRootButton.dataset.path = payload.home;
+      }
+      if (!fileRootOverlay.classList.contains("hidden") && !fileRootInput.value.trim()) {
+        fileRootInput.value = lastDefaultFileRoot;
+      }
+      return;
+    }
+
+    const tab = editorTabById(context.tabId);
+    if (!tab) {
+      return;
+    }
+
+    if (payload.type === "fs-error") {
+      tab.loadingPath = "";
+      tab.error = payload.message || "File operation failed.";
+      if (context.kind === "list" && context.path) {
+        const node = ensureTreeNode(tab, context.path);
+        node.loaded = false;
+        node.error = tab.error;
+      }
+      showToast(tab.error);
+      renderFileWorkspace();
+      return;
+    }
+
+    if (payload.type === "fs-list") {
+      tab.loadingPath = "";
+      const resolvedPath = payload.path || context.path || tab.root;
+      if (sameFilePath(context.path, tab.root) && !sameFilePath(resolvedPath, tab.root)) {
+        const shouldRename = tab.name === pathBaseName(tab.root);
+        delete tab.tree[tab.root];
+        tab.root = resolvedPath;
+        if (shouldRename || !tab.name) {
+          tab.name = pathBaseName(resolvedPath);
+        }
+        persistEditorTabs();
+      }
+      tab.tree[resolvedPath] = {
+        loaded: true,
+        expanded: true,
+        entries: Array.isArray(payload.entries) ? payload.entries : [],
+        error: "",
+        truncated: payload.truncated === true,
+      };
+      tab.error = "";
+      syncOpenTabsToSessions();
+      return;
+    }
+
+    if (payload.type === "fs-read") {
+      tab.loadingPath = "";
+      const path = payload.path || context.path || "";
+      const name = payload.name || pathBaseName(path);
+      const content = String(payload.content || "");
+      const existingIndex = tab.openFiles.findIndex((file) => sameFilePath(file.path, path));
+      const existingFile = existingIndex >= 0 ? tab.openFiles[existingIndex] : null;
+      const nextFile = {
+        path,
+        name,
+        content,
+        originalContent: content,
+        dirty: false,
+        loaded: true,
+        previewMode: existingFile?.previewMode === true,
+      };
+      if (existingIndex >= 0) {
+        tab.openFiles[existingIndex] = nextFile;
+      } else {
+        tab.openFiles.push(nextFile);
+      }
+      tab.activeFilePath = nextFile.path;
+      if (fileTreeUsesDrawer()) {
+        tab.treeHidden = true;
+      }
+      tab.error = "";
+      persistEditorTabs();
+      renderFileWorkspace();
+      if (!nextFile.previewMode) {
+        fileEditorInput.focus({ preventScroll: true });
+      }
+      return;
+    }
+
+    if (payload.type === "fs-write") {
+      tab.loadingPath = "";
+      const path = payload.path || context.path || tab.activeFilePath;
+      const file = tab.openFiles.find((item) => sameFilePath(item.path, path));
+      if (file) {
+        file.originalContent = file.content;
+        file.dirty = false;
+        file.loaded = true;
+      }
+      tab.error = "";
+      persistEditorTabs();
+      renderOpenFileTabs(tab);
+      updateFileControls(tab);
+      showToast(`Saved ${payload.name || pathBaseName(path)}.`);
+    }
+  }
+
+  function handleFileRequestTimeout(context) {
+    if (context.kind === "default-root") {
+      fileRootMessage.textContent = "No file response from the server. Restart the server to enable file tabs.";
+      return;
+    }
+    const tab = editorTabById(context.tabId);
+    if (!tab) {
+      return;
+    }
+    tab.loadingPath = "";
+    tab.error = "No file response from the server. Restart the server to enable file tabs.";
+    if (context.kind === "list" && context.path) {
+      const node = ensureTreeNode(tab, context.path);
+      node.loaded = false;
+      node.error = tab.error;
+    }
+    renderFileWorkspace();
+    showToast(tab.error);
+  }
+
+  function fileTreeUsesDrawer() {
+    return window.matchMedia("(max-aspect-ratio: 4 / 5), (max-width: 720px)").matches;
+  }
+
   function connect() {
     const token = localStorage.getItem(STORAGE_TOKEN_KEY);
     if (serverConfig.requireToken && !token) {
@@ -2508,12 +3734,20 @@
   }
 
   function handleServerMessage(payload) {
+    if (String(payload.type || "").startsWith("fs-")) {
+      handleFileServerMessage(payload);
+      return;
+    }
     if (payload.type === "ready") {
       resetComposerRevisionState();
       resetSemanticPromptState();
       resetTerminalBufferSyncState();
       activeSessionName = payload.session || "";
       selectedSessionName = activeSessionName;
+      const keepEditorActive = activeEditorTab() !== null;
+      if (!keepEditorActive) {
+        activeTabKey = terminalTabKey(activeSessionName);
+      }
       persistActiveSession(activeSessionName);
       addOpenTab(activeSessionName);
       followOutput = true;
@@ -2521,33 +3755,21 @@
       loginMessage.textContent = "";
       stopAuthConfigPolling();
       syncOpenTabsToSessions();
-      // The visualViewport often lags through a tab switch — the keyboard may
-      // still be settling when the first fit runs, leaving xterm's row count
-      // stuck at the keyboard-open size. Force a fresh viewport measurement
-      // and refit a few more times so the terminal grows to fill the panel.
-      // Also re-assert keyboard-closed layout to defeat a stale visualViewport
-      // — the keyboard isn't actually open right after a tab switch (tab pills
-      // aren't keyboard inputs), and visualViewport sometimes won't fire a
-      // resize to correct itself.
+      // Re-assert keyboard-closed layout. The keyboard cannot be open at
+      // this point (tab pills aren't keyboard inputs), but visualViewport
+      // sometimes stays stale on iOS without firing a resize event.
       if (mobileComposerMode) {
         document.documentElement.style.setProperty("--app-top", "0px");
         document.documentElement.style.setProperty("--app-height", `${window.innerHeight}px`);
         document.documentElement.style.setProperty("--keyboard-inset", "0px");
         document.body.dataset.keyboardOpen = "false";
       }
-      // Skip updateViewportMetrics on the immediate path so it doesn't
-      // overwrite the keyboard-closed values with a stale visualViewport.
-      // Re-measure on a delay; if visualViewport stayed stuck and no input
-      // is focused, the override inside updateViewportMetrics keeps the
-      // keyboard-closed state.
-      scheduleLayoutRefresh();
-      window.setTimeout(() => {
-        updateViewportMetrics();
-        scheduleLayoutRefresh();
-      }, 180);
-      window.setTimeout(scheduleLayoutRefresh, 480);
-      window.setTimeout(scheduleLayoutRefresh, 900);
-      focusTerminal();
+      // focusTerminal re-shows the composer panel, so layout must be measured
+      // *after* it to account for the composer's height in --shortcut-reserve.
+      if (!keepEditorActive) {
+        focusTerminal();
+        performLayoutNow();
+      }
       return;
     }
     if (payload.type === "tabs") {
@@ -2587,6 +3809,10 @@
       }
       return;
     }
+    if (payload.type === "stats") {
+      renderUsage(payload);
+      return;
+    }
     if (payload.type === "settings") {
       const nextSettings = payload.settings || {};
       const hostPersisted = payload.persisted === true;
@@ -2611,6 +3837,10 @@
         applyTerminalFontSize(Number(nextSettings.terminalFontSize), false);
         localStorage.setItem(STORAGE_TERMINAL_FONT_KEY, String(terminalFontSize));
       }
+      fileBookmarks = normalizeFileBookmarks(nextSettings.fileBookmarks);
+      if (!fileRootOverlay.classList.contains("hidden")) {
+        renderFileBookmarks();
+      }
       hostSettingsReady = true;
       updateDisplayDraft(uiScale, terminalFontSize);
       scheduleLayoutRefresh();
@@ -2631,6 +3861,9 @@
       if (activeSessionName === previousName) {
         activeSessionName = nextName;
       }
+      if (activeTabKey === terminalTabKey(previousName)) {
+        activeTabKey = terminalTabKey(nextName);
+      }
       if (selectedSessionName === previousName || activeSessionName === nextName) {
         selectedSessionName = nextName;
         persistActiveSession(nextName);
@@ -2644,6 +3877,9 @@
       const nextSession = payload.nextSession || "";
       if (nextSession) {
         selectedSessionName = nextSession;
+        if (activeTabKey === terminalTabKey(payload.closedSession || "")) {
+          activeTabKey = terminalTabKey(nextSession);
+        }
         persistActiveSession(nextSession);
         reconnectForSessionSwitch = true;
       }
@@ -2654,23 +3890,28 @@
     }
   }
 
-  function toggleTabMenu(sessionName) {
+  function toggleTabMenu(tabKey) {
     closeSessionMenu();
     closeSettingsMenu();
-    if (openTabMenuName === sessionName) {
+    if (openTabMenuKey === tabKey) {
       closeTabMenu();
       return;
     }
-    openTabMenuName = sessionName;
+    openTabMenuKey = tabKey;
+    const tab = currentTabs.find((item) => item.key === openTabMenuKey);
+    const terminalTab = !tab || tab.type !== "editor";
+    document.getElementById("renameTabButton").textContent = terminalTab ? "Rename Tab" : "Rename Tab";
+    document.getElementById("detachOthersButton").classList.toggle("hidden", !terminalTab);
+    document.getElementById("killSessionButton").classList.toggle("hidden", !terminalTab);
     tabMenu.classList.remove("hidden");
     positionTabMenu();
   }
 
   function positionTabMenu() {
-    if (!openTabMenuName) {
+    if (!openTabMenuKey) {
       return;
     }
-    const button = tabsStrip.querySelector(`[data-tab-name="${CSS.escape(openTabMenuName)}"]`);
+    const button = tabsStrip.querySelector(`[data-tab-key="${CSS.escape(openTabMenuKey)}"]`);
     if (!button) {
       closeTabMenu();
       return;
@@ -2686,7 +3927,7 @@
   }
 
   function closeTabMenu() {
-    openTabMenuName = null;
+    openTabMenuKey = null;
     tabMenu.classList.add("hidden");
   }
 
@@ -2754,11 +3995,20 @@
   }
 
   function switchSession(sessionName) {
-    if (!sessionName || sessionName === activeSessionName) {
+    if (!sessionName) {
       closeSessionMenu();
       return;
     }
+    if (sessionName === activeSessionName) {
+      activeTabKey = terminalTabKey(sessionName);
+      closeSessionMenu();
+      closeTabMenu();
+      syncOpenTabsToSessions();
+      focusTerminal();
+      return;
+    }
     addOpenTab(sessionName);
+    activeTabKey = terminalTabKey(sessionName);
     selectedSessionName = sessionName;
     persistActiveSession(sessionName);
     closeSessionMenu();
@@ -2784,6 +4034,10 @@
       document.documentElement.style.setProperty("--app-height", `${window.innerHeight}px`);
       document.documentElement.style.setProperty("--keyboard-inset", "0px");
       document.body.dataset.keyboardOpen = "false";
+      // Run measure + fit synchronously so the very first paint after the
+      // tap renders the new layout. The default scheduleLayoutRefresh path
+      // is debounced 40 ms, which is long enough to flash the gap.
+      performLayoutNow({ preserveTerminalCols: false });
     }
     resetComposerTracking(true);
     term.reset();
@@ -2970,6 +4224,457 @@
     displayOverlay.classList.add("hidden");
   }
 
+
+  function openUsage() {
+    closeSettingsMenu();
+    usageOverlay.classList.remove("hidden");
+    renderUsageLoading();
+    requestUsage();
+  }
+
+  function closeUsage() {
+    usageOverlay.classList.add("hidden");
+    if (usageRequestTimer) {
+      clearTimeout(usageRequestTimer);
+      usageRequestTimer = null;
+    }
+  }
+
+  function requestUsage() {
+    if (usageRequestTimer) clearTimeout(usageRequestTimer);
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      showUsageError("Not connected to the server. Reconnect and try again.");
+      return;
+    }
+    sendMessage({ type: "request-stats" });
+    usageRequestTimer = window.setTimeout(() => {
+      usageRequestTimer = null;
+      if (!lastUsagePayload) {
+        showUsageError(
+          "No response from the server. The mobile-terminal service may be running an older version — restart it with: systemctl --user restart mobile-terminal",
+        );
+      }
+    }, 4000);
+  }
+
+  function showUsageError(message) {
+    usageMetaLabel.textContent = message;
+    usageMetaLabel.classList.add("usage-error");
+    usageStats.innerHTML = "";
+    usageDailyChart.innerHTML = "";
+    usageHourChart.innerHTML = "";
+    usageHourNote.textContent = "";
+    usageBreakdown.innerHTML = "";
+    usageEmpty.classList.add("hidden");
+    usageDailyEmpty.classList.add("hidden");
+  }
+
+  function renderUsageLoading() {
+    usageMetaLabel.textContent = "Loading…";
+    usageMetaLabel.classList.remove("usage-error");
+    usageStats.innerHTML = "";
+    usageDailyChart.innerHTML = "";
+    usageHourChart.innerHTML = "";
+    usageHourNote.textContent = "";
+    usageBreakdown.innerHTML = "";
+    usageEmpty.classList.add("hidden");
+    usageDailyEmpty.classList.add("hidden");
+  }
+
+  function formatBytes(bytes) {
+    const value = Number(bytes) || 0;
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+    if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function formatDuration(seconds) {
+    const value = Math.max(0, Math.floor(Number(seconds) || 0));
+    if (value < 60) return `${value}s`;
+    const minutes = Math.floor(value / 60);
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    const remMinutes = minutes % 60;
+    if (hours < 24) return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`;
+    const days = Math.floor(hours / 24);
+    const remHours = hours % 24;
+    return remHours ? `${days}d ${remHours}h` : `${days}d`;
+  }
+
+  function formatNumber(value) {
+    return Number(value || 0).toLocaleString();
+  }
+
+  function emptyUsageBucket() {
+    return {
+      sessions: 0,
+      durationSeconds: 0,
+      inputEvents: 0,
+      commandsRun: 0,
+      bytesIn: 0,
+      bytesOut: 0,
+    };
+  }
+
+  function sumBuckets(buckets) {
+    const total = emptyUsageBucket();
+    for (const bucket of buckets) {
+      if (!bucket) continue;
+      for (const key of Object.keys(total)) {
+        total[key] += Number(bucket[key]) || 0;
+      }
+    }
+    return total;
+  }
+
+  function rangeWindowDays(range) {
+    if (range === "7d") return 7;
+    if (range === "30d") return 30;
+    if (range === "90d") return 90;
+    return null;
+  }
+
+  function rangeLabel(range) {
+    if (range === "7d") return "last 7 days";
+    if (range === "30d") return "last 30 days";
+    if (range === "90d") return "last 90 days";
+    return "all time";
+  }
+
+  function toIsoDate(date) {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, "0");
+    const d = String(date.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  function startOfIsoWeek(dateStr) {
+    const d = new Date(`${dateStr}T00:00:00`);
+    const day = d.getDay();
+    const diff = (day + 6) % 7;
+    d.setDate(d.getDate() - diff);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  function formatWeekLabel(monday) {
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    const fmt = (d) => `${d.toLocaleString(undefined, { month: "short" })} ${d.getDate()}`;
+    return `${fmt(monday)} – ${fmt(sunday)}`;
+  }
+
+  function rangeBoundariesIso(payload) {
+    const todayIso = payload.today || new Date().toISOString().slice(0, 10);
+    const window = rangeWindowDays(usageRange);
+    if (window == null) return { startIso: "0000-00-00", endIso: todayIso, windowDays: null, todayIso };
+    const start = new Date(`${todayIso}T00:00:00`);
+    start.setDate(start.getDate() - (window - 1));
+    return { startIso: toIsoDate(start), endIso: todayIso, windowDays: window, todayIso };
+  }
+
+  function dayKeysInRange(days, payload) {
+    const { startIso, endIso } = rangeBoundariesIso(payload);
+    const keys = Object.keys(days).filter((k) => k >= startIso && k <= endIso);
+    keys.sort();
+    return keys;
+  }
+
+  function enumerateDaysAsc(payload) {
+    const { startIso, endIso, windowDays, todayIso } = rangeBoundariesIso(payload);
+    const result = [];
+    if (windowDays == null) {
+      const days = lastUsagePayload && lastUsagePayload.usage ? lastUsagePayload.usage.days || {} : {};
+      const presentKeys = Object.keys(days).sort();
+      if (presentKeys.length === 0) return [todayIso];
+      const start = new Date(`${presentKeys[0]}T00:00:00`);
+      const end = new Date(`${endIso}T00:00:00`);
+      const cap = 400;
+      const cursor = new Date(start);
+      for (let i = 0; i < cap && cursor <= end; i += 1) {
+        result.push(toIsoDate(cursor));
+        cursor.setDate(cursor.getDate() + 1);
+      }
+      return result;
+    }
+    const cursor = new Date(`${startIso}T00:00:00`);
+    for (let i = 0; i < windowDays; i += 1) {
+      result.push(toIsoDate(cursor));
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    return result;
+  }
+
+  function aggregateForRange(payload) {
+    const days = payload.usage.days || {};
+    const keys = dayKeysInRange(days, payload);
+    return sumBuckets(keys.map((k) => days[k]));
+  }
+
+  function renderUsage(payload) {
+    if (usageRequestTimer) {
+      clearTimeout(usageRequestTimer);
+      usageRequestTimer = null;
+    }
+    lastUsagePayload = payload;
+    usageMetaLabel.classList.remove("usage-error");
+    const usage = payload && payload.usage ? payload.usage : null;
+    if (!usage) {
+      usageMetaLabel.textContent = "No usage data available.";
+      usageStats.innerHTML = "";
+      usageDailyChart.innerHTML = "";
+      usageHourChart.innerHTML = "";
+      usageHourNote.textContent = "";
+      usageBreakdown.innerHTML = "";
+      usageEmpty.classList.remove("hidden");
+      return;
+    }
+
+    const activeSessions = Number(payload.activeSessions) || 0;
+    const startedAt = payload.serverStartedAt ? new Date(payload.serverStartedAt) : null;
+    const retention = Number(payload.retentionDays) || 0;
+    const updated = new Date();
+    const metaParts = [];
+    metaParts.push(`Updated ${updated.toLocaleTimeString()}`);
+    metaParts.push(`Active sessions: ${activeSessions}`);
+    if (startedAt && !Number.isNaN(startedAt.getTime())) {
+      metaParts.push(`Server up since ${startedAt.toLocaleString()}`);
+    }
+    if (retention) {
+      metaParts.push(`${retention}-day retention`);
+    }
+    usageMetaLabel.textContent = metaParts.join(" · ");
+
+    renderUsageStats(payload);
+    renderDailyChart(payload);
+    renderHourlyChart(payload);
+    renderUsageBreakdown(payload);
+  }
+
+  function renderUsageStats(payload) {
+    const bucket = aggregateForRange(payload);
+    const label = rangeLabel(usageRange);
+    const stats = [
+      { label: "Sessions", value: formatNumber(bucket.sessions) },
+      { label: "Active Time", value: formatDuration(bucket.durationSeconds) },
+      { label: "Commands", value: formatNumber(bucket.commandsRun) },
+      { label: "Input Events", value: formatNumber(bucket.inputEvents) },
+      { label: "Bytes In", value: formatBytes(bucket.bytesIn) },
+      { label: "Bytes Out", value: formatBytes(bucket.bytesOut) },
+    ];
+    usageStats.innerHTML = stats
+      .map(
+        (s) => `
+          <div class="usage-stat-card">
+            <div class="label">${s.label}</div>
+            <div class="value">${s.value}</div>
+            <div class="sub">${label}</div>
+          </div>
+        `,
+      )
+      .join("");
+  }
+
+  function renderDailyChart(payload) {
+    const days = payload.usage.days || {};
+    const keys = enumerateDaysAsc(payload);
+    usageDailyChartTitle.textContent = `Daily Activity — ${rangeLabel(usageRange)}`;
+    usageDailyChart.innerHTML = "";
+    if (keys.length === 0) {
+      usageDailyEmpty.classList.remove("hidden");
+      return;
+    }
+    const maxDuration = Math.max(
+      1,
+      ...keys.map((k) => Number((days[k] || {}).durationSeconds) || 0),
+    );
+    const anyActivity = keys.some((k) => (Number((days[k] || {}).durationSeconds) || 0) > 0);
+    if (!anyActivity) {
+      usageDailyEmpty.classList.remove("hidden");
+      return;
+    }
+    usageDailyEmpty.classList.add("hidden");
+
+    const step = Math.max(1, Math.ceil(keys.length / 12));
+    for (let i = 0; i < keys.length; i += 1) {
+      const dayKey = keys[i];
+      const bucket = days[dayKey] || emptyUsageBucket();
+      const ratio = Math.min(1, (Number(bucket.durationSeconds) || 0) / maxDuration);
+      const col = document.createElement("div");
+      col.className = "usage-daily-col";
+      col.title = `${dayKey} · ${formatDuration(bucket.durationSeconds)} · ${formatNumber(bucket.sessions)} sessions · ${formatNumber(bucket.commandsRun)} commands`;
+      const bar = document.createElement("span");
+      bar.className = "usage-daily-bar";
+      bar.style.height = `${(ratio * 100).toFixed(1)}%`;
+      col.appendChild(bar);
+      if (i % step === 0 || i === keys.length - 1) {
+        const tick = document.createElement("div");
+        tick.className = "usage-daily-tick";
+        tick.textContent = dayKey.slice(5);
+        col.appendChild(tick);
+      }
+      usageDailyChart.appendChild(col);
+    }
+  }
+
+  function renderHourlyChart(payload) {
+    const hours = payload.usage.hours || {};
+    const { startIso, endIso } = rangeBoundariesIso(payload);
+    const buckets = Array.from({ length: 24 }, () => emptyUsageBucket());
+    for (const [key, bucket] of Object.entries(hours)) {
+      if (!key || key.length < 13) continue;
+      const dayPart = key.slice(0, 10);
+      if (dayPart < startIso || dayPart > endIso) continue;
+      const hour = Number(key.slice(11, 13));
+      if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
+      for (const field of Object.keys(buckets[hour])) {
+        buckets[hour][field] += Number(bucket[field]) || 0;
+      }
+    }
+    usageHourChart.innerHTML = "";
+    const totalDuration = buckets.reduce((sum, b) => sum + b.durationSeconds, 0);
+    if (totalDuration === 0 && buckets.every((b) => b.sessions === 0)) {
+      usageHourNote.textContent = "Not enough data for an hourly breakdown yet.";
+      return;
+    }
+    const maxDuration = Math.max(1, ...buckets.map((b) => b.durationSeconds));
+    for (let hour = 0; hour < 24; hour += 1) {
+      const bucket = buckets[hour];
+      const ratio = bucket.durationSeconds / maxDuration;
+      const col = document.createElement("div");
+      col.className = "usage-hour-col";
+      const label = String(hour).padStart(2, "0");
+      col.title = `${label}:00 · ${formatDuration(bucket.durationSeconds)} · ${formatNumber(bucket.sessions)} sessions · ${formatNumber(bucket.commandsRun)} commands`;
+      col.innerHTML = `
+        <div class="usage-hour-bar-wrap"><span class="usage-hour-bar" style="height:${(ratio * 100).toFixed(1)}%"></span></div>
+        <div class="usage-hour-label">${label}</div>
+      `;
+      usageHourChart.appendChild(col);
+    }
+    const peak = buckets.reduce(
+      (acc, b, idx) => (b.durationSeconds > acc.durationSeconds ? { hour: idx, durationSeconds: b.durationSeconds } : acc),
+      { hour: 0, durationSeconds: 0 },
+    );
+    const peakBucket = buckets[peak.hour];
+    if (peak.durationSeconds > 0) {
+      usageHourNote.textContent = `Peak hour: ${String(peak.hour).padStart(2, "0")}:00 — ${formatDuration(peakBucket.durationSeconds)} active, ${formatNumber(peakBucket.sessions)} sessions, ${formatNumber(peakBucket.commandsRun)} commands (${rangeLabel(usageRange)}).`;
+    } else {
+      usageHourNote.textContent = "Not enough data to identify a peak hour yet.";
+    }
+  }
+
+  function renderUsageBreakdown(payload) {
+    if (!payload || !payload.usage) return;
+    if (usageView === "weekly") {
+      renderWeeklyBreakdown(payload);
+    } else {
+      renderDailyBreakdown(payload);
+    }
+  }
+
+  function renderDailyBreakdown(payload) {
+    const days = payload.usage.days || {};
+    const keys = dayKeysInRange(days, payload).reverse();
+    usageBreakdownTitle.textContent = "Recent Days";
+    usageBreakdown.innerHTML = "";
+    if (keys.length === 0) {
+      usageEmpty.classList.remove("hidden");
+      return;
+    }
+    usageEmpty.classList.add("hidden");
+    const maxDuration = Math.max(1, ...keys.map((k) => Number(days[k].durationSeconds) || 0));
+    for (const dayKey of keys) {
+      const bucket = days[dayKey];
+      const ratio = Math.min(1, (Number(bucket.durationSeconds) || 0) / maxDuration);
+      const row = document.createElement("div");
+      row.className = "usage-day-row";
+      row.innerHTML = `
+        <div class="usage-day-key">${dayKey}</div>
+        <div class="usage-day-bar"><span style="width:${(ratio * 100).toFixed(1)}%"></span></div>
+        <div class="usage-day-stats">
+          <span>${formatDuration(bucket.durationSeconds)}</span>
+          <span>${formatNumber(bucket.sessions)} sess</span>
+          <span>${formatNumber(bucket.commandsRun)} cmds</span>
+        </div>
+      `;
+      usageBreakdown.appendChild(row);
+    }
+  }
+
+  function renderWeeklyBreakdown(payload) {
+    const days = payload.usage.days || {};
+    const keys = dayKeysInRange(days, payload);
+    const weeks = new Map();
+    for (const dayKey of keys) {
+      const bucket = days[dayKey];
+      if (!bucket) continue;
+      const monday = startOfIsoWeek(dayKey);
+      const weekKey = toIsoDate(monday);
+      let entry = weeks.get(weekKey);
+      if (!entry) {
+        entry = { monday, bucket: emptyUsageBucket() };
+        weeks.set(weekKey, entry);
+      }
+      for (const field of Object.keys(entry.bucket)) {
+        entry.bucket[field] += Number(bucket[field]) || 0;
+      }
+    }
+    const sortedWeeks = [...weeks.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1));
+    usageBreakdownTitle.textContent = "Recent Weeks";
+    usageBreakdown.innerHTML = "";
+    if (sortedWeeks.length === 0) {
+      usageEmpty.classList.remove("hidden");
+      return;
+    }
+    usageEmpty.classList.add("hidden");
+    const maxDuration = Math.max(1, ...sortedWeeks.map(([, w]) => Number(w.bucket.durationSeconds) || 0));
+    for (const [, week] of sortedWeeks) {
+      const ratio = Math.min(1, (Number(week.bucket.durationSeconds) || 0) / maxDuration);
+      const row = document.createElement("div");
+      row.className = "usage-day-row";
+      row.innerHTML = `
+        <div class="usage-day-key">${formatWeekLabel(week.monday)}</div>
+        <div class="usage-day-bar"><span style="width:${(ratio * 100).toFixed(1)}%"></span></div>
+        <div class="usage-day-stats">
+          <span>${formatDuration(week.bucket.durationSeconds)}</span>
+          <span>${formatNumber(week.bucket.sessions)} sess</span>
+          <span>${formatNumber(week.bucket.commandsRun)} cmds</span>
+        </div>
+      `;
+      usageBreakdown.appendChild(row);
+    }
+  }
+
+  function setUsageView(view) {
+    if (view !== "daily" && view !== "weekly") return;
+    usageView = view;
+    for (const btn of usageViewToggle.querySelectorAll("[data-view]")) {
+      const isActive = btn.dataset.view === view;
+      btn.classList.toggle("is-active", isActive);
+      btn.setAttribute("aria-selected", isActive ? "true" : "false");
+    }
+    if (lastUsagePayload) {
+      renderUsageBreakdown(lastUsagePayload);
+    }
+  }
+
+  function setUsageRange(range) {
+    if (!["7d", "30d", "90d", "all"].includes(range)) return;
+    usageRange = range;
+    for (const btn of usageRangeGroup.querySelectorAll("[data-range]")) {
+      const isActive = btn.dataset.range === range;
+      btn.classList.toggle("is-active", isActive);
+      btn.setAttribute("aria-selected", isActive ? "true" : "false");
+    }
+    if (lastUsagePayload) {
+      renderUsageStats(lastUsagePayload);
+      renderDailyChart(lastUsagePayload);
+      renderHourlyChart(lastUsagePayload);
+      renderUsageBreakdown(lastUsagePayload);
+    }
+  }
+
   async function pasteFromClipboard({ preserveKeyboardState = false, wasKeyboardFocused = composerHasKeyboardFocus() } = {}) {
     try {
       const text = await navigator.clipboard.readText();
@@ -3052,23 +4757,114 @@
     sendMessage({ type: "new-tab" });
   });
 
+  clearComposerButton.addEventListener("click", forceClearComposer);
+
+  newEditorTabButton.addEventListener("click", () => openFileRootPicker("new"));
+  fileRootForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (fileRootForm.dataset.mode === "change") {
+      changeActiveEditorRoot(fileRootInput.value);
+      return;
+    }
+    createEditorTab(fileRootInput.value);
+  });
+  document.getElementById("cancelFileRootButton").addEventListener("click", closeFileRootPicker);
+  useHomeRootButton.addEventListener("click", () => {
+    if (useHomeRootButton.dataset.path) {
+      fileRootInput.value = useHomeRootButton.dataset.path;
+    }
+  });
+  fileBookmarkButton.addEventListener("click", () => addFileBookmark(fileRootInput.value));
+  fileRootOverlay.addEventListener("click", (event) => {
+    if (event.target === fileRootOverlay) {
+      closeFileRootPicker();
+    }
+  });
+  fileChangeRootButton.addEventListener("click", () => openFileRootPicker("change"));
+  fileRefreshButton.addEventListener("click", () => {
+    const tab = activeEditorTab();
+    if (tab) {
+      tab.tree = {};
+      requestFileList(tab, tab.root);
+    }
+  });
+  fileTreeToggleButton.addEventListener("click", () => {
+    const tab = activeEditorTab();
+    if (!tab) {
+      return;
+    }
+    tab.treeHidden = !tab.treeHidden;
+    persistEditorTabs();
+    renderFileWorkspace();
+  });
+  fileTreeScrim.addEventListener("click", () => {
+    const tab = activeEditorTab();
+    if (!tab) {
+      return;
+    }
+    tab.treeHidden = true;
+    persistEditorTabs();
+    renderFileWorkspace();
+  });
+  fileSaveButton.addEventListener("click", saveActiveFile);
+  fileMarkdownToggleButton.addEventListener("click", () => {
+    const tab = activeEditorTab();
+    const file = activeOpenFile(tab);
+    if (!file || !isMarkdownFile(file) || !file.loaded) {
+      return;
+    }
+    file.previewMode = !file.previewMode;
+    renderFileWorkspace();
+    if (!file.previewMode) {
+      fileEditorInput.focus({ preventScroll: true });
+    }
+  });
+  fileEditorInput.addEventListener("input", () => {
+    const tab = activeEditorTab();
+    const file = activeOpenFile(tab);
+    if (!tab || !file) {
+      return;
+    }
+    file.content = fileEditorInput.value;
+    file.dirty = file.content !== file.originalContent;
+    file.loaded = true;
+    persistEditorTabs();
+    renderOpenFileTabs(tab);
+    updateFileControls(tab);
+  });
+  fileEditorInput.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      saveActiveFile();
+    }
+  });
+
   openSessionButton.addEventListener("click", toggleSessionMenu);
 
   document.getElementById("renameTabButton").addEventListener("click", () => {
-    const current = currentTabs.find((tab) => tab.name === openTabMenuName) || activeTab();
+    const current = currentTabs.find((tab) => tab.key === openTabMenuKey) || activeTab();
     if (!current) {
       return;
     }
     const nextName = window.prompt("Rename current tab", current.name || "");
     if (nextName) {
-      sendMessage({ type: "rename-tab", session: current.name, name: nextName });
+      if (current.type === "editor") {
+        const tab = editorTabById(current.id);
+        if (tab) {
+          tab.name = nextName.trim().slice(0, 40) || tab.name;
+          persistEditorTabs();
+          syncOpenTabsToSessions();
+        }
+      } else {
+        sendMessage({ type: "rename-tab", session: current.name, name: nextName });
+      }
     }
     closeTabMenu();
   });
 
   document.getElementById("detachOthersButton").addEventListener("click", () => {
-    const current = currentTabs.find((tab) => tab.name === openTabMenuName) || activeTab();
-    if (!current) {
+    const current = currentTabs.find((tab) => tab.key === openTabMenuKey) || activeTab();
+    if (!current || current.type === "editor") {
       return;
     }
     sendMessage({ type: "detach-other-clients", session: current.name });
@@ -3076,19 +4872,25 @@
   });
 
   document.getElementById("closeTabButton").addEventListener("click", () => {
-    const current = currentTabs.find((tab) => tab.name === openTabMenuName) || activeTab();
+    const current = currentTabs.find((tab) => tab.key === openTabMenuKey) || activeTab();
     if (!current) {
       return;
     }
-    if (currentTabs.length <= 1) {
-      showToast("The last visible tab stays open.");
+    if (current.type === "editor") {
+      closeEditorTab(current.id);
+      closeTabMenu();
+      return;
+    }
+    const terminalTabs = currentTabs.filter((tab) => tab.type !== "editor");
+    if (terminalTabs.length <= 1) {
+      showToast("The last terminal tab stays open.");
       closeTabMenu();
       return;
     }
     if (current.name === activeSessionName) {
-      const fallback = currentTabs.find((tab) => tab.name !== current.name);
+      const fallback = terminalTabs.find((tab) => tab.name !== current.name);
       if (!fallback) {
-        showToast("The last visible tab stays open.");
+        showToast("The last terminal tab stays open.");
         closeTabMenu();
         return;
       }
@@ -3103,8 +4905,8 @@
   });
 
   document.getElementById("killSessionButton").addEventListener("click", () => {
-    const current = currentTabs.find((tab) => tab.name === openTabMenuName) || activeTab();
-    if (!current) {
+    const current = currentTabs.find((tab) => tab.key === openTabMenuKey) || activeTab();
+    if (!current || current.type === "editor") {
       return;
     }
     if (!window.confirm(`Kill tmux session "${current.name}"?`)) {
@@ -3197,6 +4999,29 @@
     closeEditor();
   });
   document.getElementById("displayButton").addEventListener("click", openDisplay);
+  document.getElementById("usageButton").addEventListener("click", openUsage);
+  document.getElementById("closeUsageButton").addEventListener("click", closeUsage);
+  document.getElementById("refreshUsageButton").addEventListener("click", () => {
+    renderUsageLoading();
+    requestUsage();
+  });
+  usageOverlay.addEventListener("click", (event) => {
+    if (event.target === usageOverlay) {
+      closeUsage();
+    }
+  });
+  usageViewToggle.addEventListener("click", (event) => {
+    const target = event.target.closest("button[data-view]");
+    if (target && target.dataset.view) {
+      setUsageView(target.dataset.view);
+    }
+  });
+  usageRangeGroup.addEventListener("click", (event) => {
+    const target = event.target.closest("button[data-range]");
+    if (target && target.dataset.range) {
+      setUsageRange(target.dataset.range);
+    }
+  });
   settingsButton.addEventListener("click", toggleSettingsMenu);
   document.getElementById("closeDisplayButton").addEventListener("click", () => closeDisplay(true));
   document.getElementById("saveDisplayButton").addEventListener("click", () => closeDisplay(true));
@@ -3256,6 +5081,9 @@
   });
 
   term.onData((data) => {
+    if (activeTab()?.type === "editor") {
+      return;
+    }
     if (mobileComposerMode) {
       return;
     }
@@ -3298,7 +5126,7 @@
   });
   document.addEventListener("click", (event) => {
     if (
-      openTabMenuName &&
+      openTabMenuKey &&
       !tabMenu.contains(event.target) &&
       !tabsStrip.contains(event.target)
     ) {
