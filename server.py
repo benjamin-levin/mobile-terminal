@@ -332,10 +332,25 @@ def scroll_session_history(session_name: str, lines: int) -> None:
     count = abs(int(lines))
     if count == 0:
         return
-    if not pane_in_mode(session_name):
-        tmux_capture("copy-mode", "-e", "-t", session_name, check=False)
     command = "scroll-up" if lines > 0 else "scroll-down"
-    tmux_capture("send-keys", "-t", session_name, "-X", "-N", str(count), command, check=False)
+    # Chained into one tmux invocation: copy-mode is a no-op when the pane is
+    # already in a mode, and the ";" separator makes enter+scroll atomic so the
+    # mode can't exit between a separate check and the scroll keys.
+    tmux_capture(
+        "copy-mode",
+        "-e",
+        "-t",
+        session_name,
+        ";",
+        "send-keys",
+        "-t",
+        session_name,
+        "-X",
+        "-N",
+        str(count),
+        command,
+        check=False,
+    )
 
 
 def list_session_clients(session_name: str) -> list[dict[str, str]]:
@@ -1081,6 +1096,42 @@ class AppServer:
         self.mobile_composer_states: dict[str, dict[str, Any]] = {}
         self.usage = load_usage()
         self.active_sessions = 0
+        self.scroll_states: dict[str, dict[str, Any]] = {}
+
+    def queue_scroll_history(self, session_name: str, lines: int) -> None:
+        if lines == 0:
+            return
+        state = self.scroll_states.setdefault(session_name, {"pending": 0, "task": None})
+        state["pending"] += lines
+        task = state["task"]
+        if task is None or task.done():
+            state["task"] = asyncio.create_task(self.drain_scroll_history(session_name, state))
+
+    async def drain_scroll_history(self, session_name: str, state: dict[str, Any]) -> None:
+        # Deltas that arrive while a tmux call is in flight accumulate in
+        # "pending" and get merged into one call on the next iteration, so the
+        # event loop is never blocked and tmux sees at most one process at a
+        # time per session.
+        while state["pending"] != 0:
+            lines = state["pending"]
+            state["pending"] = 0
+            await asyncio.to_thread(scroll_session_history, session_name, lines)
+
+    async def settle_scroll_history(self, session_name: str) -> None:
+        # Scroll commands execute out-of-band; before any handler cancels
+        # copy-mode and writes keys to the pane, drop queued deltas and wait
+        # out the in-flight tmux call so a stale scroll can't re-enter
+        # copy-mode and swallow the keystrokes.
+        state = self.scroll_states.get(session_name)
+        if state is None:
+            return
+        state["pending"] = 0
+        task = state["task"]
+        if task is not None and not task.done():
+            try:
+                await task
+            except Exception:
+                pass
 
     async def send_json(self, connection: ServerConnection, payload: dict[str, Any]) -> None:
         await connection.send(json.dumps(payload))
@@ -1454,6 +1505,14 @@ class AppServer:
             revision = int(payload.get("revision", 0))
         except (TypeError, ValueError):
             revision = 0
+        if message_type in (
+            "input",
+            "composer-sync",
+            "composer-enter",
+            "composer-history",
+            "composer-force-clear",
+        ):
+            await self.settle_scroll_history(session_name)
         if message_type == "composer-sync":
             self.sync_mobile_composer(
                 bridge,
@@ -1540,7 +1599,7 @@ class AppServer:
 
         if message_type == "scroll-history":
             lines = int(payload.get("lines", 0))
-            scroll_session_history(session_name, lines)
+            self.queue_scroll_history(session_name, lines)
             return
 
         if message_type == "request-tabs":

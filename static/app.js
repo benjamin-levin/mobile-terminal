@@ -2318,7 +2318,10 @@
       return;
     }
     const clamped = Math.max(-48, Math.min(48, pendingScrollLines));
-    pendingScrollLines = 0;
+    pendingScrollLines -= clamped;
+    if (pendingScrollLines !== 0) {
+      pendingScrollFrameId = window.requestAnimationFrame(flushPendingScrollLines);
+    }
     sendMessage({ type: "scroll-history", lines: clamped });
     if (clamped > 0) {
       followOutput = false;
