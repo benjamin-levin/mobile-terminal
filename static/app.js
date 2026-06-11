@@ -28,6 +28,7 @@
     { label: "Ctrl+L", sequence: "{CTRL+L}", visible: false },
     { label: "Ctrl+R", sequence: "{CTRL+R}", visible: false },
     { label: "Ctrl+X Tab", sequence: "{CTRL+X}{TAB}", visible: false },
+    { label: "Shift+Tab", sequence: "{SHIFT+TAB}", visible: false },
     { label: "↩️", sequence: "{ENTER}", visible: true },
     { label: "▶️", sequence: "{TEXT:/resume}{ENTER}", visible: true },
   ];
@@ -37,6 +38,8 @@
     ESC: "\u001b",
     SPACE: " ",
     BACKSPACE: "\u007f",
+    BACKTAB: "\u001b[Z",
+    "SHIFT+TAB": "\u001b[Z",
     DELETE: "\u001b[3~",
     UP: "\u001b[A",
     DOWN: "\u001b[B",
@@ -2069,6 +2072,8 @@
     return [
       "{BACKSPACE}",
       "{TAB}",
+      "{BACKTAB}",
+      "{SHIFT+TAB}",
       "{UP}",
       "{DOWN}",
       "{LEFT}",
@@ -2084,6 +2089,8 @@
     const upper = sequence.toUpperCase();
     return (
       upper.includes("{TAB}") ||
+      upper.includes("{BACKTAB}") ||
+      upper.includes("{SHIFT+TAB}") ||
       upper.includes("{ENTER}") ||
       upper.includes("{LEFT}") ||
       upper.includes("{RIGHT}") ||
@@ -4963,6 +4970,13 @@
     syncComposerState();
   });
   composerInput.addEventListener("keydown", (event) => {
+    if (event.key === "Tab" && !event.altKey && !event.metaKey && !event.ctrlKey) {
+      event.preventDefault();
+      resetComposerTracking(true);
+      sendMessage({ type: "input", data: event.shiftKey ? specialMap["SHIFT+TAB"] : specialMap.TAB });
+      requestComposerRefresh();
+      return;
+    }
     if (event.key === "Enter") {
       if (event.shiftKey) {
         return;

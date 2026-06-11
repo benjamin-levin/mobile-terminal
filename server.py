@@ -410,6 +410,7 @@ def default_settings() -> dict[str, Any]:
             {"label": "Ctrl+L", "sequence": "{CTRL+L}", "visible": False},
             {"label": "Ctrl+R", "sequence": "{CTRL+R}", "visible": False},
             {"label": "Ctrl+X Tab", "sequence": "{CTRL+X}{TAB}", "visible": False},
+            {"label": "Shift+Tab", "sequence": "{SHIFT+TAB}", "visible": False},
             {"label": "↩️", "sequence": "{ENTER}", "visible": True},
             {"label": "▶️", "sequence": "{TEXT:/resume}{ENTER}", "visible": True},
         ],
