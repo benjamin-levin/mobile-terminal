@@ -316,6 +316,28 @@ def capture_history(session_name: str, lines: int = 2000) -> str:
     return result.stdout
 
 
+# Sequences xterm.js emits on its own, without a user keystroke: SGR mouse
+# reports (claude enables any-motion tracking, so mere pointer movement emits
+# these), DA/DSR-style CSI query replies, OSC replies (color queries), and DCS
+# replies (XTVERSION). These must not cancel copy-mode or drop queued scrolls.
+NON_KEYSTROKE_INPUT_RE = re.compile(
+    r"(?:\x1b\[<\d+;\d+;\d+[Mm]"  # SGR mouse report
+    r"|\x1b\[\??\d+(?:;\d+)*[cRn]"  # DA / DSR / cursor position replies
+    r"|\x1b\[>\d+(?:;\d+)*c"  # secondary DA reply
+    r"|\x1b\[[IO]"  # focus in/out report
+    r"|\x1b\[\??\d+(?:;\d+)*\$y"  # DECRQM reply
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC reply
+    r"|\x1bP[^\x1b]*\x1b\\"  # DCS reply
+    r")+"
+)
+
+
+def input_is_user_keystroke(data: str) -> bool:
+    if not data:
+        return False
+    return NON_KEYSTROKE_INPUT_RE.fullmatch(data) is None
+
+
 def pane_in_mode(session_name: str) -> bool:
     result = tmux_capture(
         "display-message",
@@ -328,10 +350,64 @@ def pane_in_mode(session_name: str) -> bool:
     return result.stdout.strip() == "1"
 
 
+MAX_SCROLL_EVENTS_PER_CALL = 200
+
+
 def scroll_session_history(session_name: str, lines: int) -> None:
-    count = abs(int(lines))
+    count = min(abs(int(lines)), MAX_SCROLL_EVENTS_PER_CALL)
     if count == 0:
         return
+    result = tmux_capture(
+        "display-message",
+        "-p",
+        "-t",
+        session_name,
+        "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{pane_in_mode} #{pane_width} #{pane_height}",
+        check=False,
+    )
+    parts = result.stdout.split()
+    alternate_on = len(parts) > 0 and parts[0] == "1"
+    # Only forward wheel events when the pane speaks SGR encoding (mode 1006);
+    # a tracking-but-not-SGR pane would misparse them, so it falls through to
+    # the arrow-key path instead.
+    mouse_tracking = len(parts) > 2 and parts[1] == "1" and parts[2] == "1"
+    in_mode = len(parts) > 3 and parts[3] == "1"
+    try:
+        pane_width = max(1, int(parts[4]))
+        pane_height = max(1, int(parts[5]))
+    except (IndexError, ValueError):
+        pane_width, pane_height = 80, 24
+
+    if (mouse_tracking or alternate_on) and in_mode:
+        # A pane stuck in copy-mode (entered before scrolling switched to key
+        # forwarding) would swallow forwarded keys as copy-mode commands.
+        tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
+
+    if mouse_tracking:
+        # Mouse-enabled TUIs (claude, codex) keep their transcript in-app: it
+        # never enters tmux history, so copy-mode has almost nothing to scroll
+        # into and paints stale pre-launch shell output over a frozen frame.
+        # Do what a real terminal does instead: forward SGR wheel events so the
+        # app scrolls its own buffer, one event per line delta (apps applying
+        # their own lines-per-event multiplier just make flicks travel
+        # farther). Coordinates land mid-pane; embedded semicolons are safe in
+        # a send-keys -l argument (only a trailing one would be parsed as a
+        # command separator).
+        x = max(1, pane_width // 2)
+        y = max(1, pane_height // 2)
+        button = 64 if lines > 0 else 65
+        sequence = f"\x1b[<{button};{x};{y}M" * count
+        tmux_capture("send-keys", "-t", session_name, "-l", sequence, check=False)
+        return
+
+    if alternate_on:
+        # Alternate screen without mouse tracking (pagers, etc.): tmux history
+        # is unreachable and copy-mode would show pre-launch content, so fall
+        # back to arrow keys the app can interpret as scrolling.
+        key = "Up" if lines > 0 else "Down"
+        tmux_capture("send-keys", "-t", session_name, "-N", str(count), key, check=False)
+        return
+
     command = "scroll-up" if lines > 0 else "scroll-down"
     # Chained into one tmux invocation: copy-mode is a no-op when the pane is
     # already in a mode, and the ";" separator makes enter+scroll atomic so the
@@ -1001,11 +1077,19 @@ async def process_request(connection: ServerConnection, request: Request) -> Res
 
 
 class TmuxBridge:
-    def __init__(self, session_name: str, shell: str, cwd: str, create_if_missing: bool = True) -> None:
+    def __init__(
+        self,
+        session_name: str,
+        shell: str,
+        cwd: str,
+        create_if_missing: bool = True,
+        initial_size: tuple[int, int] | None = None,
+    ) -> None:
         self.session_name = session_name
         self.shell = shell
         self.cwd = cwd
         self.create_if_missing = create_if_missing
+        self.initial_size = initial_size
         self.master_fd: int | None = None
         self.process: subprocess.Popen[bytes] | None = None
 
@@ -1028,7 +1112,11 @@ class TmuxBridge:
             close_fds=True,
         )
         os.close(slave_fd)
-        self.resize(140, 40)
+        # A wrong-size attach flaps the tmux window width (window-size=latest),
+        # which rewraps the pane and can destroy its history; prefer the last
+        # size this session's client reported over the generic default.
+        cols, rows = self.initial_size or (140, 40)
+        self.resize(cols, rows)
 
     def resize(self, cols: int, rows: int) -> None:
         if self.master_fd is None:
@@ -1097,6 +1185,7 @@ class AppServer:
         self.usage = load_usage()
         self.active_sessions = 0
         self.scroll_states: dict[str, dict[str, Any]] = {}
+        self.terminal_sizes: dict[str, tuple[int, int]] = {}
 
     def queue_scroll_history(self, session_name: str, lines: int) -> None:
         if lines == 0:
@@ -1114,8 +1203,11 @@ class AppServer:
         # time per session.
         while state["pending"] != 0:
             lines = state["pending"]
-            state["pending"] = 0
-            await asyncio.to_thread(scroll_session_history, session_name, lines)
+            # Consume at most one call's worth; the remainder stays pending so
+            # a burst-merged flick is deferred to the next iteration, not lost.
+            take = max(-MAX_SCROLL_EVENTS_PER_CALL, min(MAX_SCROLL_EVENTS_PER_CALL, lines))
+            state["pending"] = lines - take
+            await asyncio.to_thread(scroll_session_history, session_name, take)
 
     async def settle_scroll_history(self, session_name: str) -> None:
         # Scroll commands execute out-of-band; before any handler cancels
@@ -1512,7 +1604,11 @@ class AppServer:
             "composer-history",
             "composer-force-clear",
         ):
-            await self.settle_scroll_history(session_name)
+            # Auto-emitted terminal replies (mouse reports, DA/OSC/DCS query
+            # responses) are not user intent; letting them settle the queue
+            # would silently drop in-flight scrolling.
+            if message_type != "input" or input_is_user_keystroke(str(payload.get("data", ""))):
+                await self.settle_scroll_history(session_name)
         if message_type == "composer-sync":
             self.sync_mobile_composer(
                 bridge,
@@ -1584,16 +1680,19 @@ class AppServer:
             return
 
         if message_type == "input":
-            if pane_in_mode(session_name):
+            data = str(payload.get("data", ""))
+            user_keystroke = input_is_user_keystroke(data)
+            if user_keystroke and pane_in_mode(session_name):
                 tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
             bridge.write(payload.get("data", ""))
-            if payload.get("data"):
+            if data and user_keystroke:
                 self.reset_mobile_composer_tracking(session_name)
             return
 
         if message_type == "resize":
             cols = max(20, int(payload.get("cols", 80)))
             rows = max(6, int(payload.get("rows", 24)))
+            self.terminal_sizes[session_name] = (cols, rows)
             bridge.resize(cols, rows)
             return
 
@@ -1782,6 +1881,10 @@ class AppServer:
                 tmux_capture("rename-session", "-t", target_name, name, check=False)
                 if target_name in self.mobile_composer_states:
                     self.mobile_composer_states[name] = self.mobile_composer_states.pop(target_name)
+                if target_name in self.terminal_sizes:
+                    self.terminal_sizes[name] = self.terminal_sizes.pop(target_name)
+                if target_name in self.scroll_states:
+                    self.scroll_states[name] = self.scroll_states.pop(target_name)
                 if target_name == session_name:
                     state["session"] = name
                 await self.send_json(
@@ -1826,6 +1929,9 @@ class AppServer:
                     },
                 )
             tmux_capture("kill-session", "-t", target_name, check=False)
+            self.mobile_composer_states.pop(target_name, None)
+            self.terminal_sizes.pop(target_name, None)
+            self.scroll_states.pop(target_name, None)
             if target_name == session_name:
                 await connection.close(code=1012, reason="session killed")
                 return
@@ -1916,7 +2022,13 @@ class AppServer:
             session_name = next_session_name()
 
         state = {"session": session_name}
-        bridge = TmuxBridge(session_name, self.shell, self.cwd, create_if_missing=create_if_missing)
+        bridge = TmuxBridge(
+            session_name,
+            self.shell,
+            self.cwd,
+            create_if_missing=create_if_missing,
+            initial_size=self.terminal_sizes.get(session_name),
+        )
         bridge.open()
         history = "" if skip_history else capture_history(state["session"])
 

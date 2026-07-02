@@ -2364,7 +2364,11 @@
     if (!terminalRoot) {
       return;
     }
-    const wheelTarget = terminalRoot.querySelector(".xterm-viewport") || terminalRoot;
+    // Listen on #terminal itself: in xterm 6 the .xterm-viewport node is an
+    // absolutely-positioned sibling of the element that actually receives
+    // pointer events, so a listener there never fires. Capture phase keeps
+    // xterm from turning the wheel into SGR mouse reports for the pane.
+    const wheelTarget = terminalRoot;
 
     if (mobileComposerMode) {
       terminalRoot.addEventListener("click", () => {
@@ -2381,7 +2385,15 @@
         cancelTouchInertia();
         event.preventDefault();
         event.stopImmediatePropagation();
-        scrollTerminalByPixels(-event.deltaY);
+        // Firefox reports wheel deltas in lines (deltaMode 1), not pixels.
+        const lineHeightPx = term.options.fontSize * (term.options.lineHeight || 1);
+        let pixelDelta = event.deltaY;
+        if (event.deltaMode === 1) {
+          pixelDelta *= lineHeightPx;
+        } else if (event.deltaMode === 2) {
+          pixelDelta *= Math.max(1, term.rows) * lineHeightPx;
+        }
+        scrollTerminalByPixels(-pixelDelta);
       },
       { passive: false, capture: true },
     );
@@ -3773,6 +3785,20 @@
       persistActiveSession(activeSessionName);
       addOpenTab(activeSessionName);
       followOutput = true;
+      // Each connection gets a fresh bridge PTY on the server; the resize
+      // gate below is page-lifetime, so without resetting it an unchanged
+      // layout would leave the new bridge at the server's default size and
+      // flap the tmux window width (rewrapping the pane and its history).
+      // Only re-send once a fit has completed (lastTerminalLayoutWidth is set
+      // at the end of the first fit) — before that, term.cols/rows are
+      // xterm's 80x24 default and would shrink the live tmux window.
+      lastTerminalCols = 0;
+      lastTerminalRows = 0;
+      if (lastTerminalLayoutWidth > 0 && term.cols > 0 && term.rows > 0) {
+        lastTerminalCols = term.cols;
+        lastTerminalRows = term.rows;
+        sendMessage({ type: "resize", cols: term.cols, rows: term.rows });
+      }
       loginOverlay.classList.add("hidden");
       loginMessage.textContent = "";
       stopAuthConfigPolling();
