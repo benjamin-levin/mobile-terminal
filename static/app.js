@@ -204,6 +204,7 @@
   let sessionMenuOpen = false;
   let settingsMenuOpen = false;
   let touchScrollState = null;
+  let twoFingerNavState = null;
   let touchInertiaFrameId = null;
   let touchInertiaVelocity = 0;
   let touchInertiaLastAt = 0;
@@ -241,6 +242,12 @@
   const TOUCH_INERTIA_FRICTION_PER_MS = 0.9965;
   const TOUCH_INERTIA_MAX_FRAME_MS = 34;
   const TOUCH_VELOCITY_BLEND = 0.35;
+  // Two-finger swipe → arrow-key navigation. NAV_START is how far a finger must
+  // travel before an axis (horizontal/vertical) locks in; NAV_STEP is the pixel
+  // distance that maps to one arrow press so a longer swipe repeats the key.
+  const TWO_FINGER_NAV_START = 20;
+  const TWO_FINGER_NAV_STEP = 30;
+  const TWO_FINGER_NAV_MAX_STEPS_PER_MOVE = 6;
   const SHORTCUT_REPEAT_DELAY_MS = 320;
   const SHORTCUT_REPEAT_INTERVAL_MS = 70;
   const TERMINAL_BUFFER_SYNC_DELAYS_MS = [20, 60, 120, 220];
@@ -2359,6 +2366,116 @@
     queueScrollHistory(lines);
   }
 
+  // Signed per-move movement of whichever active touch moved farthest along the
+  // given axis since the last event. Tracking per-move deltas (rather than
+  // displacement from a fixed anchor) lets a single moving finger drive
+  // navigation while the other is held stationary: the still finger contributes
+  // a ~0 delta and never fights the moving one.
+  function twoFingerAxisDelta(touchList, axis) {
+    if (!twoFingerNavState) {
+      return 0;
+    }
+    let best = 0;
+    for (let i = 0; i < touchList.length; i += 1) {
+      const touch = touchList[i];
+      const last = twoFingerNavState.last.get(touch.identifier);
+      if (!last) {
+        continue;
+      }
+      const delta = axis === "x" ? touch.clientX - last.x : touch.clientY - last.y;
+      if (Math.abs(delta) > Math.abs(best)) {
+        best = delta;
+      }
+    }
+    return best;
+  }
+
+  function twoFingerRememberPositions(touchList) {
+    for (let i = 0; i < touchList.length; i += 1) {
+      const touch = touchList[i];
+      const last = twoFingerNavState.last.get(touch.identifier);
+      if (last) {
+        last.x = touch.clientX;
+        last.y = touch.clientY;
+      } else {
+        twoFingerNavState.last.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+      }
+    }
+  }
+
+  function beginTwoFingerNav(touchList) {
+    const last = new Map();
+    for (let i = 0; i < touchList.length; i += 1) {
+      const touch = touchList[i];
+      last.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+    }
+    // accX/accY accumulate travel until an axis locks in; residual is the
+    // along-axis distance not yet spent on an arrow press.
+    twoFingerNavState = { last, axis: null, accX: 0, accY: 0, residual: 0 };
+  }
+
+  function updateTwoFingerNav(event) {
+    if (!twoFingerNavState) {
+      return;
+    }
+    const touchList = event.touches;
+    // A newly-added finger (going 1 → 2) has no prior position; seed it in place
+    // so its first delta is measured from where it landed, not the origin.
+    for (let i = 0; i < touchList.length; i += 1) {
+      const touch = touchList[i];
+      if (!twoFingerNavState.last.has(touch.identifier)) {
+        twoFingerNavState.last.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+      }
+    }
+    // Two fingers on the pane means navigation, never scroll or pinch-zoom.
+    event.preventDefault();
+
+    const dx = twoFingerAxisDelta(touchList, "x");
+    const dy = twoFingerAxisDelta(touchList, "y");
+
+    if (!twoFingerNavState.axis) {
+      twoFingerNavState.accX += dx;
+      twoFingerNavState.accY += dy;
+      twoFingerRememberPositions(touchList);
+      const accX = twoFingerNavState.accX;
+      const accY = twoFingerNavState.accY;
+      if (Math.max(Math.abs(accX), Math.abs(accY)) < TWO_FINGER_NAV_START) {
+        return;
+      }
+      twoFingerNavState.axis = Math.abs(accX) >= Math.abs(accY) ? "x" : "y";
+      // Carry the travel so far into the first step so the swipe feels immediate.
+      twoFingerNavState.residual = twoFingerNavState.axis === "x" ? accX : accY;
+    } else {
+      twoFingerNavState.residual += twoFingerNavState.axis === "x" ? dx : dy;
+      twoFingerRememberPositions(touchList);
+    }
+
+    const axis = twoFingerNavState.axis;
+    let fired = 0;
+    while (
+      Math.abs(twoFingerNavState.residual) >= TWO_FINGER_NAV_STEP &&
+      fired < TWO_FINGER_NAV_MAX_STEPS_PER_MOVE
+    ) {
+      const positive = twoFingerNavState.residual > 0;
+      const key =
+        axis === "x"
+          ? positive
+            ? specialMap.RIGHT
+            : specialMap.LEFT
+          : positive
+            ? specialMap.DOWN
+            : specialMap.UP;
+      sendMessage({ type: "input", data: key });
+      twoFingerNavState.residual -= (positive ? 1 : -1) * TWO_FINGER_NAV_STEP;
+      fired += 1;
+    }
+    // Guard against a runaway flick: drop any residual beyond the per-move cap so
+    // it can't queue a burst of arrows on the next event.
+    if (fired >= TWO_FINGER_NAV_MAX_STEPS_PER_MOVE) {
+      twoFingerNavState.residual = 0;
+    }
+  }
+
   function installTerminalScrollHandlers() {
     const terminalRoot = document.getElementById("terminal");
     if (!terminalRoot) {
@@ -2402,6 +2519,13 @@
       "touchstart",
       (event) => {
         cancelTouchInertia();
+        if (event.touches.length >= 2) {
+          // Second finger down: switch from scrolling to arrow-key navigation.
+          touchScrollState = null;
+          beginTwoFingerNav(event.touches);
+          return;
+        }
+        twoFingerNavState = null;
         if (event.touches.length !== 1) {
           touchScrollState = null;
           return;
@@ -2419,6 +2543,10 @@
     terminalRoot.addEventListener(
       "touchmove",
       (event) => {
+        if (twoFingerNavState && event.touches.length >= 2) {
+          updateTwoFingerNav(event);
+          return;
+        }
         if (!touchScrollState || event.touches.length !== 1) {
           return;
         }
@@ -2442,7 +2570,16 @@
       { passive: false },
     );
 
-    const finishTouchScroll = () => {
+    const finishTouchScroll = (event) => {
+      if (twoFingerNavState) {
+        // Keep navigating until every finger involved has lifted; don't fall
+        // back into a scroll or inertia fling for the remaining finger.
+        if (event.touches.length < 2) {
+          twoFingerNavState = null;
+        }
+        touchScrollState = null;
+        return;
+      }
       if (
         touchScrollState &&
         touchScrollState.lastMoveAt &&
@@ -2454,6 +2591,7 @@
     };
     const cancelTouchScroll = () => {
       touchScrollState = null;
+      twoFingerNavState = null;
       cancelTouchInertia();
     };
     terminalRoot.addEventListener("touchend", finishTouchScroll, { passive: true });
