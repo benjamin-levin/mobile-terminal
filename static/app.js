@@ -1,6 +1,7 @@
 (function () {
   const STORAGE_TOKEN_KEY = "mobile-terminal.token";
   const STORAGE_SHORTCUTS_KEY = "mobile-terminal.shortcuts";
+  const STORAGE_GESTURES_KEY = "mobile-terminal.gestures";
   const STORAGE_UI_SCALE_KEY = "mobile-terminal.ui-scale";
   const STORAGE_TERMINAL_FONT_KEY = "mobile-terminal.terminal-font";
   const STORAGE_ACTIVE_SESSION_KEY = "mobile-terminal.active-session";
@@ -42,6 +43,28 @@
     { label: "↩️", sequence: "{ENTER}", visible: true },
     { label: "▶️", sequence: "{TEXT:/resume}{ENTER}", visible: true },
   ];
+
+  // Multi-touch gesture catalog. Each entry is a slot the user can bind to a key
+  // sequence (same {..} syntax as shortcut buttons, plus {FONT+}/{FONT-} to zoom)
+  // in Settings → Gestures. Order here is the order shown in the editor.
+  const GESTURE_DEFS = [
+    { id: "swipe2-up", group: "Two-finger swipe", label: "Swipe up", default: "{UP}" },
+    { id: "swipe2-down", group: "Two-finger swipe", label: "Swipe down", default: "{DOWN}" },
+    { id: "swipe2-left", group: "Two-finger swipe", label: "Swipe left", default: "{LEFT}" },
+    { id: "swipe2-right", group: "Two-finger swipe", label: "Swipe right", default: "{RIGHT}" },
+    { id: "tap2-single", group: "Two-finger tap", label: "Single tap", default: "" },
+    { id: "tap2-double", group: "Two-finger tap", label: "Double tap", default: "{ENTER}" },
+    { id: "tap2-triple", group: "Two-finger tap", label: "Triple tap", default: "" },
+    { id: "pinch-out", group: "Pinch / zoom", label: "Pinch out (spread apart)", default: "{FONT+}" },
+    { id: "pinch-in", group: "Pinch / zoom", label: "Pinch in (together)", default: "{FONT-}" },
+    { id: "swipe3-up", group: "Three-finger swipe", label: "Swipe up", default: "" },
+    { id: "swipe3-down", group: "Three-finger swipe", label: "Swipe down", default: "" },
+    { id: "swipe3-left", group: "Three-finger swipe", label: "Swipe left", default: "" },
+    { id: "swipe3-right", group: "Three-finger swipe", label: "Swipe right", default: "" },
+    { id: "tap3-single", group: "Three-finger tap", label: "Single tap", default: "" },
+    { id: "tap3-double", group: "Three-finger tap", label: "Double tap", default: "" },
+  ];
+  const GESTURE_DEF_BY_ID = new Map(GESTURE_DEFS.map((def) => [def.id, def]));
   const specialMap = {
     TAB: "\t",
     ENTER: "\r",
@@ -88,6 +111,8 @@
   const settingsMenu = document.getElementById("settingsMenu");
   const editorOverlay = document.getElementById("editorOverlay");
   const shortcutEditorList = document.getElementById("shortcutEditorList");
+  const gestureOverlay = document.getElementById("gestureOverlay");
+  const gestureEditorList = document.getElementById("gestureEditorList");
   const displayOverlay = document.getElementById("displayOverlay");
   const usageOverlay = document.getElementById("usageOverlay");
   const usageMetaLabel = document.getElementById("usageMeta");
@@ -203,6 +228,7 @@
   let lastStableViewportHeight = 0;
   let currentTabs = [];
   let shortcuts = loadShortcuts();
+  let gestureBindings = loadGestures();
   let openTabMenuKey = null;
   let currentSessions = [];
   let openTabNames = loadOpenTabs();
@@ -228,7 +254,8 @@
   // Non-persisted per-view state for the active btop tab.
   let btopMode = false;
   let touchScrollState = null;
-  let twoFingerNavState = null;
+  let gestureState = null;
+  let gestureTap = null;
   let touchInertiaFrameId = null;
   let touchInertiaVelocity = 0;
   let touchInertiaLastAt = 0;
@@ -266,12 +293,15 @@
   const TOUCH_INERTIA_FRICTION_PER_MS = 0.9965;
   const TOUCH_INERTIA_MAX_FRAME_MS = 34;
   const TOUCH_VELOCITY_BLEND = 0.35;
-  // Two-finger swipe → arrow-key navigation. NAV_START is how far a finger must
-  // travel before an axis (horizontal/vertical) locks in; NAV_STEP is the pixel
-  // distance that maps to one arrow press so a longer swipe repeats the key.
-  const TWO_FINGER_NAV_START = 20;
-  const TWO_FINGER_NAV_STEP = 30;
-  const TWO_FINGER_NAV_MAX_STEPS_PER_MOVE = 6;
+  // Multi-touch gesture recognizer tunables.
+  const GESTURE_MOVE_SLOP = 16; // px a finger may drift within a pulse and still count as a tap
+  const GESTURE_TAP_MAX_MS = 340; // a single tap pulse must be quicker than this
+  const GESTURE_MULTITAP_GAP_MS = 340; // max gap between taps of a multi-tap
+  const GESTURE_SWIPE_START = 26; // px of travel before a swipe commits + locks its axis
+  const GESTURE_SWIPE_STEP = 30; // px per repeat for continuous (arrow-key) swipes
+  const GESTURE_PINCH_START = 46; // px of spread change before a pinch commits
+  const GESTURE_PINCH_STEP = 55; // px of spread per pinch repeat step
+  const GESTURE_MAX_REPEAT = 6; // cap repeats per move event (anti-flood)
   const SHORTCUT_REPEAT_DELAY_MS = 320;
   const SHORTCUT_REPEAT_INTERVAL_MS = 70;
   const TERMINAL_BUFFER_SYNC_DELAYS_MS = [20, 60, 120, 220];
@@ -385,6 +415,84 @@
       // Ignore bad local storage payloads.
     }
     return defaultShortcuts.map((shortcut) => ({ ...shortcut }));
+  }
+
+  // Merge stored gesture bindings over the catalog defaults so new gesture slots
+  // (added in later versions) always appear with their default binding.
+  function normalizeGestureBindings(raw) {
+    const source = raw && typeof raw === "object" ? raw : {};
+    const map = {};
+    GESTURE_DEFS.forEach((def) => {
+      const entry = source[def.id];
+      const hasEntry = entry && typeof entry === "object";
+      map[def.id] = {
+        sequence:
+          hasEntry && typeof entry.sequence === "string" ? entry.sequence : def.default,
+        enabled: hasEntry ? entry.enabled !== false : true,
+      };
+    });
+    return map;
+  }
+
+  function loadGestures() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(STORAGE_GESTURES_KEY) || "null");
+      if (parsed && typeof parsed === "object") {
+        return normalizeGestureBindings(parsed);
+      }
+    } catch (_error) {
+      // Ignore bad local storage payloads.
+    }
+    return normalizeGestureBindings(null);
+  }
+
+  function saveGestures(nextBindings) {
+    gestureBindings = normalizeGestureBindings(nextBindings);
+    localStorage.setItem(STORAGE_GESTURES_KEY, JSON.stringify(gestureBindings));
+    saveHostSettings();
+  }
+
+  // The bound sequence for a gesture id, or "" when unbound/disabled.
+  function gestureBindingSequence(id) {
+    const binding = gestureBindings[id];
+    if (!binding || binding.enabled === false) {
+      return "";
+    }
+    return binding.sequence || "";
+  }
+
+  function tapGestureId(fingers, count) {
+    const name = count >= 3 ? "triple" : count === 2 ? "double" : "single";
+    return `tap${fingers}-${name}`;
+  }
+
+  // Run a gesture's bound sequence: honor the {COPY}/{PASTE}/{FONT+}/{FONT-}
+  // action tokens, otherwise send it to the terminal like a shortcut button.
+  function dispatchGestureSequence(sequence) {
+    const trimmed = String(sequence || "").trim();
+    if (!trimmed) {
+      return;
+    }
+    if (trimmed === "{COPY}") {
+      copyTerminalSelection();
+      return;
+    }
+    if (trimmed === "{PASTE}") {
+      pasteFromClipboard();
+      return;
+    }
+    if (trimmed === "{FONT+}") {
+      applyTerminalFontSize(terminalFontSize + 1);
+      return;
+    }
+    if (trimmed === "{FONT-}") {
+      applyTerminalFontSize(terminalFontSize - 1);
+      return;
+    }
+    const expanded = expandShortcutSequence(trimmed);
+    if (expanded) {
+      sendMessage({ type: "input", data: expanded });
+    }
   }
 
   function loadOpenTabs() {
@@ -776,6 +884,7 @@
       type: "save-settings",
       settings: {
         shortcuts,
+        gestures: gestureBindings,
         uiScale,
         terminalFontSize,
         fileBookmarks,
@@ -2417,19 +2526,107 @@
     queueScrollHistory(lines);
   }
 
-  // Signed per-move movement of whichever active touch moved farthest along the
-  // given axis since the last event. Tracking per-move deltas (rather than
-  // displacement from a fixed anchor) lets a single moving finger drive
-  // navigation while the other is held stationary: the still finger contributes
-  // a ~0 delta and never fights the moving one.
-  function twoFingerAxisDelta(touchList, axis) {
-    if (!twoFingerNavState) {
-      return 0;
+  // --- Unified multi-touch gesture recognizer --------------------------------
+  // Classifies a 2+ finger contact into a swipe (N-finger, per-move deltas so a
+  // held finger doesn't fight a moving one), a multi-tap (counts short still
+  // "pulses" that reach a peak finger count — this also catches "hold one finger
+  // and double-tap with the other"), or a pinch (spread change with a still
+  // midpoint). The matched gesture id is looked up in `gestureBindings` and its
+  // sequence dispatched. Single-finger touches are left to the scroll/tap paths.
+  function touchDistance(a, b) {
+    return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+  }
+
+  function touchListCentroid(touchList) {
+    let x = 0;
+    let y = 0;
+    for (let i = 0; i < touchList.length; i += 1) {
+      x += touchList[i].clientX;
+      y += touchList[i].clientY;
     }
+    const n = Math.max(1, touchList.length);
+    return { x: x / n, y: y / n };
+  }
+
+  // Repeat-per-distance only when a swipe is bound to a bare arrow key, so
+  // swipe-to-arrow keeps its "swipe further = more presses" feel while every
+  // other binding fires exactly once per swipe.
+  function gestureSwipeIsArrow(sequence) {
+    const expanded = expandShortcutSequence(sequence || "");
+    return (
+      expanded === specialMap.UP ||
+      expanded === specialMap.DOWN ||
+      expanded === specialMap.LEFT ||
+      expanded === specialMap.RIGHT
+    );
+  }
+
+  function registerGestureTouches(touchList, reanchor) {
+    for (let i = 0; i < touchList.length; i += 1) {
+      const touch = touchList[i];
+      const pos = gestureState.positions.get(touch.identifier);
+      if (!pos) {
+        gestureState.positions.set(touch.identifier, { sx: touch.clientX, sy: touch.clientY });
+      } else if (reanchor) {
+        pos.sx = touch.clientX;
+        pos.sy = touch.clientY;
+      }
+      if (!gestureState.last.has(touch.identifier)) {
+        gestureState.last.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+      }
+    }
+  }
+
+  function beginGesture(touchList) {
+    gestureState = {
+      peak: touchList.length,
+      positions: new Map(),
+      last: new Map(),
+      centroidStart: touchListCentroid(touchList),
+      moved: false,
+      rose: true,
+      riseAt: performance.now(),
+      mode: null, // null until movement commits to "swipe" or "pinch"
+      axis: null,
+      accX: 0,
+      accY: 0,
+      residual: 0,
+      swipeFingers: 0,
+      swipeLocked: false,
+      pinchAnchor: touchList.length === 2 ? touchDistance(touchList[0], touchList[1]) : 0,
+      handled: false, // true once a swipe/pinch fires (suppresses tap detection)
+    };
+    registerGestureTouches(touchList, false);
+  }
+
+  // touchstart with >= 2 fingers: engage the recognizer, or extend it when a new
+  // finger joins or re-taps during a hold. Each rise re-anchors tap stillness so
+  // a held finger's slow drift never disqualifies the other finger's taps.
+  function gestureTouchStart(event) {
+    const touchList = event.touches;
+    if (touchList.length < 2) {
+      return false;
+    }
+    if (!gestureState) {
+      beginGesture(touchList);
+    } else {
+      gestureState.peak = Math.max(gestureState.peak, touchList.length);
+      gestureState.rose = true;
+      gestureState.riseAt = performance.now();
+      gestureState.moved = false;
+      registerGestureTouches(touchList, true);
+      if (touchList.length === 2) {
+        gestureState.pinchAnchor = touchDistance(touchList[0], touchList[1]);
+      }
+    }
+    return true;
+  }
+
+  function gestureMaxAxisDelta(touchList, axis) {
     let best = 0;
     for (let i = 0; i < touchList.length; i += 1) {
       const touch = touchList[i];
-      const last = twoFingerNavState.last.get(touch.identifier);
+      const last = gestureState.last.get(touch.identifier);
       if (!last) {
         continue;
       }
@@ -2441,90 +2638,183 @@
     return best;
   }
 
-  function twoFingerRememberPositions(touchList) {
+  function gestureRememberLast(touchList) {
     for (let i = 0; i < touchList.length; i += 1) {
       const touch = touchList[i];
-      const last = twoFingerNavState.last.get(touch.identifier);
+      const last = gestureState.last.get(touch.identifier);
       if (last) {
         last.x = touch.clientX;
         last.y = touch.clientY;
       } else {
-        twoFingerNavState.last.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+        gestureState.last.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
       }
     }
   }
 
-  function beginTwoFingerNav(touchList) {
-    const last = new Map();
-    for (let i = 0; i < touchList.length; i += 1) {
-      const touch = touchList[i];
-      last.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+  function swipeDirection(axis, positive) {
+    if (axis === "x") {
+      return positive ? "right" : "left";
     }
-    // accX/accY accumulate travel until an axis locks in; residual is the
-    // along-axis distance not yet spent on an arrow press.
-    twoFingerNavState = { last, axis: null, accX: 0, accY: 0, residual: 0 };
+    return positive ? "down" : "up";
   }
 
-  function updateTwoFingerNav(event) {
-    if (!twoFingerNavState) {
-      return;
-    }
-    const touchList = event.touches;
-    // A newly-added finger (going 1 → 2) has no prior position; seed it in place
-    // so its first delta is measured from where it landed, not the origin.
-    for (let i = 0; i < touchList.length; i += 1) {
-      const touch = touchList[i];
-      if (!twoFingerNavState.last.has(touch.identifier)) {
-        twoFingerNavState.last.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
-      }
-    }
-    // Two fingers on the pane means navigation, never scroll or pinch-zoom.
-    event.preventDefault();
-
-    const dx = twoFingerAxisDelta(touchList, "x");
-    const dy = twoFingerAxisDelta(touchList, "y");
-
-    if (!twoFingerNavState.axis) {
-      twoFingerNavState.accX += dx;
-      twoFingerNavState.accY += dy;
-      twoFingerRememberPositions(touchList);
-      const accX = twoFingerNavState.accX;
-      const accY = twoFingerNavState.accY;
-      if (Math.max(Math.abs(accX), Math.abs(accY)) < TWO_FINGER_NAV_START) {
+  function handleGestureSwipe(touchList) {
+    const dx = gestureMaxAxisDelta(touchList, "x");
+    const dy = gestureMaxAxisDelta(touchList, "y");
+    gestureRememberLast(touchList);
+    if (!gestureState.axis) {
+      gestureState.accX += dx;
+      gestureState.accY += dy;
+      if (Math.max(Math.abs(gestureState.accX), Math.abs(gestureState.accY)) < GESTURE_SWIPE_START) {
         return;
       }
-      twoFingerNavState.axis = Math.abs(accX) >= Math.abs(accY) ? "x" : "y";
-      // Carry the travel so far into the first step so the swipe feels immediate.
-      twoFingerNavState.residual = twoFingerNavState.axis === "x" ? accX : accY;
+      gestureState.axis = Math.abs(gestureState.accX) >= Math.abs(gestureState.accY) ? "x" : "y";
+      gestureState.swipeFingers = Math.min(3, gestureState.peak);
+      gestureState.residual = gestureState.axis === "x" ? gestureState.accX : gestureState.accY;
+      gestureState.mode = "swipe";
     } else {
-      twoFingerNavState.residual += twoFingerNavState.axis === "x" ? dx : dy;
-      twoFingerRememberPositions(touchList);
+      gestureState.residual += gestureState.axis === "x" ? dx : dy;
     }
+    gestureState.handled = true;
 
-    const axis = twoFingerNavState.axis;
+    const axis = gestureState.axis;
+    const fingers = gestureState.swipeFingers;
+    const committedSeq = gestureBindingSequence(
+      `swipe${fingers}-${swipeDirection(axis, gestureState.residual > 0)}`,
+    );
+    if (committedSeq && gestureSwipeIsArrow(committedSeq)) {
+      let fired = 0;
+      while (Math.abs(gestureState.residual) >= GESTURE_SWIPE_STEP && fired < GESTURE_MAX_REPEAT) {
+        const positive = gestureState.residual > 0;
+        dispatchGestureSequence(
+          gestureBindingSequence(`swipe${fingers}-${swipeDirection(axis, positive)}`),
+        );
+        gestureState.residual -= (positive ? 1 : -1) * GESTURE_SWIPE_STEP;
+        fired += 1;
+      }
+      if (fired >= GESTURE_MAX_REPEAT) {
+        gestureState.residual = 0;
+      }
+    } else if (!gestureState.swipeLocked && Math.abs(gestureState.residual) >= GESTURE_SWIPE_STEP) {
+      // Non-arrow bindings fire exactly once, when the swipe is clearly committed.
+      dispatchGestureSequence(committedSeq);
+      gestureState.swipeLocked = true;
+    }
+  }
+
+  function handleGesturePinch(touchList) {
+    gestureState.handled = true;
+    const dist = touchDistance(touchList[0], touchList[1]);
     let fired = 0;
     while (
-      Math.abs(twoFingerNavState.residual) >= TWO_FINGER_NAV_STEP &&
-      fired < TWO_FINGER_NAV_MAX_STEPS_PER_MOVE
+      Math.abs(dist - gestureState.pinchAnchor) >= GESTURE_PINCH_STEP &&
+      fired < GESTURE_MAX_REPEAT
     ) {
-      const positive = twoFingerNavState.residual > 0;
-      const key =
-        axis === "x"
-          ? positive
-            ? specialMap.RIGHT
-            : specialMap.LEFT
-          : positive
-            ? specialMap.DOWN
-            : specialMap.UP;
-      sendMessage({ type: "input", data: key });
-      twoFingerNavState.residual -= (positive ? 1 : -1) * TWO_FINGER_NAV_STEP;
+      const out = dist - gestureState.pinchAnchor > 0;
+      dispatchGestureSequence(gestureBindingSequence(out ? "pinch-out" : "pinch-in"));
+      gestureState.pinchAnchor += (out ? 1 : -1) * GESTURE_PINCH_STEP;
       fired += 1;
     }
-    // Guard against a runaway flick: drop any residual beyond the per-move cap so
-    // it can't queue a burst of arrows on the next event.
-    if (fired >= TWO_FINGER_NAV_MAX_STEPS_PER_MOVE) {
-      twoFingerNavState.residual = 0;
+  }
+
+  function gestureTouchMove(event) {
+    if (!gestureState) {
+      return false;
     }
+    const touchList = event.touches;
+    if (touchList.length < 2) {
+      gestureRememberLast(touchList);
+      return true;
+    }
+    // Two+ fingers on the pane means a gesture — never scroll or browser-zoom.
+    event.preventDefault();
+
+    let drift = 0;
+    for (let i = 0; i < touchList.length; i += 1) {
+      const touch = touchList[i];
+      const pos = gestureState.positions.get(touch.identifier);
+      if (pos) {
+        drift = Math.max(drift, Math.hypot(touch.clientX - pos.sx, touch.clientY - pos.sy));
+      }
+    }
+    if (drift > GESTURE_MOVE_SLOP) {
+      gestureState.moved = true;
+    }
+
+    if (gestureState.mode === "pinch") {
+      handleGesturePinch(touchList);
+      return true;
+    }
+    if (gestureState.mode === "swipe") {
+      handleGestureSwipe(touchList);
+      return true;
+    }
+    // Undecided: a strong two-finger spread with a near-still midpoint is a pinch;
+    // otherwise feed the swipe accumulator, which self-commits by locking its axis.
+    if (touchList.length === 2 && gestureState.pinchAnchor > 0) {
+      const spread = Math.abs(touchDistance(touchList[0], touchList[1]) - gestureState.pinchAnchor);
+      const centroid = touchListCentroid(touchList);
+      const centroidMove = Math.hypot(
+        centroid.x - gestureState.centroidStart.x,
+        centroid.y - gestureState.centroidStart.y,
+      );
+      if (spread >= GESTURE_PINCH_START && spread > centroidMove) {
+        gestureState.mode = "pinch";
+        handleGesturePinch(touchList);
+        return true;
+      }
+    }
+    handleGestureSwipe(touchList);
+    return true;
+  }
+
+  function registerTapPulse(fingers) {
+    if (!gestureTap || gestureTap.fingers !== fingers) {
+      if (gestureTap && gestureTap.timer) {
+        window.clearTimeout(gestureTap.timer);
+      }
+      gestureTap = { fingers, count: 0, timer: null };
+    }
+    gestureTap.count += 1;
+    if (gestureTap.timer) {
+      window.clearTimeout(gestureTap.timer);
+    }
+    gestureTap.timer = window.setTimeout(finalizeTapGesture, GESTURE_MULTITAP_GAP_MS);
+  }
+
+  function finalizeTapGesture() {
+    if (!gestureTap) {
+      return;
+    }
+    const { fingers, count } = gestureTap;
+    gestureTap = null;
+    if (fingers >= 2) {
+      dispatchGestureSequence(gestureBindingSequence(tapGestureId(fingers, count)));
+    }
+  }
+
+  // touchend: if this drop completes a short, still pulse that reached >= 2
+  // fingers, count it toward a (possibly multi-) tap. Swipes/pinches set
+  // `handled` and are excluded. `rose` guards the final all-up drop of a hold.
+  function gestureTouchEnd(event) {
+    if (!gestureState) {
+      return false;
+    }
+    if (
+      gestureState.rose &&
+      !gestureState.moved &&
+      !gestureState.handled &&
+      gestureState.peak >= 2 &&
+      performance.now() - gestureState.riseAt <= GESTURE_TAP_MAX_MS
+    ) {
+      registerTapPulse(gestureState.peak);
+    }
+    gestureState.rose = false;
+    gestureRememberLast(event.touches);
+    if (event.touches.length === 0) {
+      gestureState = null;
+    }
+    return true;
   }
 
   function installTerminalScrollHandlers() {
@@ -2571,12 +2861,13 @@
       (event) => {
         cancelTouchInertia();
         if (event.touches.length >= 2) {
-          // Second finger down: switch from scrolling to arrow-key navigation.
+          // Second finger down: switch from scrolling to the gesture recognizer.
           touchScrollState = null;
-          beginTwoFingerNav(event.touches);
+          gestureTouchStart(event);
           return;
         }
-        twoFingerNavState = null;
+        // A fresh single-finger contact ends any prior gesture episode.
+        gestureState = null;
         if (event.touches.length !== 1) {
           touchScrollState = null;
           return;
@@ -2594,8 +2885,8 @@
     terminalRoot.addEventListener(
       "touchmove",
       (event) => {
-        if (twoFingerNavState && event.touches.length >= 2) {
-          updateTwoFingerNav(event);
+        if (gestureState) {
+          gestureTouchMove(event);
           return;
         }
         if (!touchScrollState || event.touches.length !== 1) {
@@ -2622,12 +2913,10 @@
     );
 
     const finishTouchScroll = (event) => {
-      if (twoFingerNavState) {
-        // Keep navigating until every finger involved has lifted; don't fall
-        // back into a scroll or inertia fling for the remaining finger.
-        if (event.touches.length < 2) {
-          twoFingerNavState = null;
-        }
+      if (gestureState) {
+        // Let the recognizer settle the lifted finger (tap counting, cleanup);
+        // don't fall back into a scroll or inertia fling.
+        gestureTouchEnd(event);
         touchScrollState = null;
         return;
       }
@@ -2642,7 +2931,11 @@
     };
     const cancelTouchScroll = () => {
       touchScrollState = null;
-      twoFingerNavState = null;
+      gestureState = null;
+      if (gestureTap && gestureTap.timer) {
+        window.clearTimeout(gestureTap.timer);
+      }
+      gestureTap = null;
       cancelTouchInertia();
     };
     terminalRoot.addEventListener("touchend", finishTouchScroll, { passive: true });
@@ -2917,7 +3210,27 @@
     return false;
   }
 
+  // Pin the currently-open settings overlay directly to the visual viewport so
+  // it always sits above the on-screen keyboard. This is intentionally decoupled
+  // from --app-height/updateViewportMetrics (which also drive terminal layout and
+  // apply stale-viewport resets) — inline geometry on the open overlay is the
+  // most reliable way to keep the sheet from drifting when the keyboard opens.
+  function syncOverlayToViewport() {
+    const viewport = window.visualViewport;
+    const overlays = document.querySelectorAll(".overlay");
+    for (let i = 0; i < overlays.length; i += 1) {
+      if (viewport) {
+        overlays[i].style.top = `${Math.round(viewport.offsetTop)}px`;
+        overlays[i].style.height = `${Math.round(viewport.height)}px`;
+      } else {
+        overlays[i].style.top = "";
+        overlays[i].style.height = "";
+      }
+    }
+  }
+
   function updateViewportMetrics() {
+    syncOverlayToViewport();
     const viewport = window.visualViewport;
     const viewportWidth = viewport ? viewport.width : window.innerWidth;
     let viewportHeight = viewport ? viewport.height : window.innerHeight;
@@ -4081,6 +4394,10 @@
         localStorage.setItem(STORAGE_SHORTCUTS_KEY, JSON.stringify(shortcuts));
         renderShortcutBar();
       }
+      if (nextSettings.gestures && typeof nextSettings.gestures === "object") {
+        gestureBindings = normalizeGestureBindings(nextSettings.gestures);
+        localStorage.setItem(STORAGE_GESTURES_KEY, JSON.stringify(gestureBindings));
+      }
       if (Number.isFinite(Number(nextSettings.uiScale))) {
         applyUiScale(Number(nextSettings.uiScale), false);
         localStorage.setItem(STORAGE_UI_SCALE_KEY, String(uiScale));
@@ -4445,15 +4762,40 @@
     const row = document.createElement("div");
     row.className = "shortcut-editor-row";
 
+    const fields = document.createElement("div");
+    fields.className = "shortcut-editor-fields";
+
+    const labelField = document.createElement("label");
+    labelField.className = "shortcut-field";
+    const labelCaption = document.createElement("span");
+    labelCaption.className = "shortcut-field-caption";
+    labelCaption.textContent = "Label";
     const labelInput = document.createElement("input");
     labelInput.className = "text-input shortcut-label-input";
-    labelInput.placeholder = "Label";
+    labelInput.placeholder = "Esc";
     labelInput.value = shortcut.label || "";
+    labelInput.autocapitalize = "off";
+    labelInput.autocomplete = "off";
+    labelField.appendChild(labelCaption);
+    labelField.appendChild(labelInput);
 
+    const sequenceField = document.createElement("label");
+    sequenceField.className = "shortcut-field";
+    const sequenceCaption = document.createElement("span");
+    sequenceCaption.className = "shortcut-field-caption";
+    sequenceCaption.textContent = "Sequence";
     const sequenceInput = document.createElement("input");
     sequenceInput.className = "text-input shortcut-sequence-input";
     sequenceInput.placeholder = "{CTRL+C}";
     sequenceInput.value = shortcut.sequence || "";
+    sequenceInput.autocapitalize = "off";
+    sequenceInput.autocomplete = "off";
+    sequenceInput.spellcheck = false;
+    sequenceField.appendChild(sequenceCaption);
+    sequenceField.appendChild(sequenceInput);
+
+    fields.appendChild(labelField);
+    fields.appendChild(sequenceField);
 
     const controls = document.createElement("div");
     controls.className = "shortcut-editor-controls";
@@ -4472,16 +4814,21 @@
     visibilityLabel.appendChild(visibilityInput);
     visibilityLabel.appendChild(visibilityText);
 
+    const buttonGroup = document.createElement("div");
+    buttonGroup.className = "shortcut-editor-buttons";
+
     const moveUpButton = document.createElement("button");
     moveUpButton.type = "button";
     moveUpButton.className = "ghost-button shortcut-order-button";
-    moveUpButton.textContent = "Up";
+    moveUpButton.textContent = "↑";
+    moveUpButton.setAttribute("aria-label", "Move up");
     moveUpButton.addEventListener("click", () => moveEditorRow(row, -1));
 
     const moveDownButton = document.createElement("button");
     moveDownButton.type = "button";
     moveDownButton.className = "ghost-button shortcut-order-button";
-    moveDownButton.textContent = "Down";
+    moveDownButton.textContent = "↓";
+    moveDownButton.setAttribute("aria-label", "Move down");
     moveDownButton.addEventListener("click", () => moveEditorRow(row, 1));
 
     const removeButton = document.createElement("button");
@@ -4490,13 +4837,14 @@
     removeButton.textContent = "Remove";
     removeButton.addEventListener("click", () => row.remove());
 
-    controls.appendChild(visibilityLabel);
-    controls.appendChild(moveUpButton);
-    controls.appendChild(moveDownButton);
-    controls.appendChild(removeButton);
+    buttonGroup.appendChild(moveUpButton);
+    buttonGroup.appendChild(moveDownButton);
+    buttonGroup.appendChild(removeButton);
 
-    row.appendChild(labelInput);
-    row.appendChild(sequenceInput);
+    controls.appendChild(visibilityLabel);
+    controls.appendChild(buttonGroup);
+
+    row.appendChild(fields);
     row.appendChild(controls);
     return row;
   }
@@ -4506,6 +4854,7 @@
     shortcutEditorList.innerHTML = "";
     shortcuts.forEach((shortcut) => shortcutEditorList.appendChild(buildEditorRow(shortcut)));
     editorOverlay.classList.remove("hidden");
+    syncOverlayToViewport();
   }
 
   function closeEditor() {
@@ -4525,6 +4874,76 @@
         };
       })
       .filter((shortcut) => shortcut.label && shortcut.sequence);
+  }
+
+  function buildGestureRow(def) {
+    const binding = gestureBindings[def.id] || { sequence: def.default, enabled: true };
+    const row = document.createElement("div");
+    row.className = "gesture-editor-row";
+    row.dataset.gestureId = def.id;
+
+    const enableLabel = document.createElement("label");
+    enableLabel.className = "gesture-enable-toggle";
+    const enableInput = document.createElement("input");
+    enableInput.type = "checkbox";
+    enableInput.className = "gesture-enable-input";
+    enableInput.checked = binding.enabled !== false;
+    const nameText = document.createElement("span");
+    nameText.className = "gesture-name";
+    nameText.textContent = def.label;
+    enableLabel.appendChild(enableInput);
+    enableLabel.appendChild(nameText);
+
+    const sequenceInput = document.createElement("input");
+    sequenceInput.className = "text-input gesture-sequence-input";
+    sequenceInput.placeholder = "unbound";
+    sequenceInput.value = binding.sequence || "";
+    sequenceInput.autocapitalize = "off";
+    sequenceInput.autocomplete = "off";
+    sequenceInput.spellcheck = false;
+
+    row.appendChild(enableLabel);
+    row.appendChild(sequenceInput);
+    return row;
+  }
+
+  function openGestureEditor() {
+    closeSettingsMenu();
+    gestureEditorList.innerHTML = "";
+    let currentGroup = null;
+    GESTURE_DEFS.forEach((def) => {
+      if (def.group !== currentGroup) {
+        currentGroup = def.group;
+        const heading = document.createElement("div");
+        heading.className = "gesture-group-heading";
+        heading.textContent = def.group;
+        gestureEditorList.appendChild(heading);
+      }
+      gestureEditorList.appendChild(buildGestureRow(def));
+    });
+    gestureOverlay.classList.remove("hidden");
+    syncOverlayToViewport();
+  }
+
+  function closeGestureEditor() {
+    gestureOverlay.classList.add("hidden");
+  }
+
+  function collectGestureBindings() {
+    const next = {};
+    Array.from(gestureEditorList.querySelectorAll(".gesture-editor-row")).forEach((row) => {
+      const id = row.dataset.gestureId;
+      if (!id) {
+        return;
+      }
+      const sequenceInput = row.querySelector(".gesture-sequence-input");
+      const enableInput = row.querySelector(".gesture-enable-input");
+      next[id] = {
+        sequence: sequenceInput ? sequenceInput.value.trim() : "",
+        enabled: enableInput ? enableInput.checked : true,
+      };
+    });
+    return next;
   }
 
   function syncDisplayControls(nextScale, nextSize) {
@@ -5497,6 +5916,17 @@
     saveShortcuts(nextShortcuts.length ? nextShortcuts : defaultShortcuts.slice());
     closeEditor();
   });
+  document.getElementById("editGesturesButton").addEventListener("click", openGestureEditor);
+  document.getElementById("closeGestureButton").addEventListener("click", closeGestureEditor);
+  document.getElementById("saveGesturesButton").addEventListener("click", () => {
+    saveGestures(collectGestureBindings());
+    showToast("Gestures saved.");
+    closeGestureEditor();
+  });
+  document.getElementById("resetGesturesButton").addEventListener("click", () => {
+    saveGestures(null);
+    openGestureEditor();
+  });
   document.getElementById("displayButton").addEventListener("click", openDisplay);
   document.getElementById("usageButton").addEventListener("click", openUsage);
   document.getElementById("closeUsageButton").addEventListener("click", closeUsage);
@@ -5527,6 +5957,11 @@
   editorOverlay.addEventListener("click", (event) => {
     if (event.target === editorOverlay) {
       closeEditor();
+    }
+  });
+  gestureOverlay.addEventListener("click", (event) => {
+    if (event.target === gestureOverlay) {
+      closeGestureEditor();
     }
   });
   displayOverlay.addEventListener("click", (event) => {
@@ -5609,6 +6044,28 @@
     scheduleViewportSettlePasses();
   });
   window.visualViewport?.addEventListener("scroll", updateViewportMetrics);
+  // When a field inside a settings sheet gets focus, refresh viewport metrics
+  // (so the overlay re-anchors above the keyboard) and scroll the field into
+  // view within the scrollable sheet once the keyboard animation settles.
+  document.addEventListener("focusin", (event) => {
+    const target = event.target;
+    if (!target || typeof target.closest !== "function") {
+      return;
+    }
+    if (!target.closest(".overlay .sheet")) {
+      return;
+    }
+    syncOverlayToViewport();
+    // Re-pin across the keyboard's open animation, then bring the field into view.
+    [120, 280, 480].forEach((delay) =>
+      window.setTimeout(() => {
+        syncOverlayToViewport();
+        if (delay === 480 && document.activeElement === target && typeof target.scrollIntoView === "function") {
+          target.scrollIntoView({ block: "center", behavior: "smooth" });
+        }
+      }, delay),
+    );
+  });
   window.addEventListener("resize", () => {
     updateViewportMetrics();
     scheduleViewportSettlePasses();

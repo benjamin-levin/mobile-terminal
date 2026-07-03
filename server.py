@@ -610,7 +610,27 @@ def default_settings() -> dict[str, Any]:
         "uiScale": 0.85,
         "terminalFontSize": 10,
         "fileBookmarks": [],
+        "gestures": {},
     }
+
+
+def normalize_gestures(raw_gestures: Any) -> dict[str, dict[str, Any]]:
+    """Multi-touch gesture bindings: { gestureId: {sequence, enabled} }.
+
+    Stored leniently — the client owns the gesture catalog and merges these
+    over its defaults, so unknown ids are harmless and simply preserved.
+    """
+    if not isinstance(raw_gestures, dict):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for key, value in raw_gestures.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        normalized[key[:40]] = {
+            "sequence": str(value.get("sequence", ""))[:200],
+            "enabled": value.get("enabled", True) is not False,
+        }
+    return normalized
 
 
 def normalize_shortcuts(raw_shortcuts: Any) -> list[dict[str, Any]]:
@@ -688,6 +708,7 @@ def normalize_settings(raw_settings: Any) -> dict[str, Any]:
         "uiScale": ui_scale,
         "terminalFontSize": terminal_font_size,
         "fileBookmarks": normalize_file_bookmarks(raw_settings.get("fileBookmarks")),
+        "gestures": normalize_gestures(raw_settings.get("gestures")),
     }
 
 
