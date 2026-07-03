@@ -14,9 +14,8 @@
           <div id="tabsScroller" class="top-tabs-shell">
             <div id="tabsStrip" class="tabs-strip top-tabs"></div>
           </div>
-          <button id="openSessionButton" class="action-button compact-button" type="button">O</button>
           <button id="newTabButton" class="action-button compact-button" type="button">+</button>
-          <button id="newEditorTabButton" class="action-button compact-button" type="button">Files</button>
+          <button id="auxButton" class="action-button compact-button" type="button">Aux</button>
           <div class="topbar-actions">
             <button id="settingsButton" class="ghost-button compact-button" type="button">Settings</button>
           </div>
@@ -86,7 +85,22 @@
           <button id="clearComposerButton" class="composer-clear-button" type="button" aria-label="Clear prompt">Clear</button>
         </div>
         <div id="shortcutBar" class="shortcut-bar"></div>
+        <div id="btopControls" class="btop-controls hidden">
+          <button class="btop-key-button" type="button" data-btop-key="1">1</button>
+          <button class="btop-key-button" type="button" data-btop-key="2">2</button>
+          <button class="btop-key-button" type="button" data-btop-key="3">3</button>
+          <button class="btop-key-button" type="button" data-btop-key="4">4</button>
+          <button class="btop-key-button" type="button" data-btop-key="5">5</button>
+          <button class="btop-key-button" type="button" data-btop-key="6">6</button>
+          <button class="btop-key-button btop-key-quit" type="button" data-btop-key="q">q</button>
+        </div>
       </footer>
+      <div id="btopZoom" class="btop-zoom hidden" aria-label="btop zoom">
+        <span class="btop-zoom-label">−</span>
+        <input id="btopZoomInput" class="btop-zoom-input" type="range" min="1" max="3" step="0.1" value="1"
+               orient="vertical" aria-label="Zoom out btop">
+        <span class="btop-zoom-label">＋</span>
+      </div>
     </div>
 
     <div id="tabMenu" class="tab-menu hidden">
@@ -95,6 +109,14 @@
       <button id="closeTabButton" class="tab-menu-button" type="button">Close Tab</button>
       <button id="killSessionButton" class="tab-menu-button" type="button">Kill Session</button>
     </div>
+
+    <div id="auxMenu" class="tab-menu hidden">
+      <button id="auxSessionsButton" class="tab-menu-button" type="button">Sessions</button>
+      <button id="auxFilesButton" class="tab-menu-button" type="button">Files</button>
+      <button id="auxBtopButton" class="tab-menu-button" type="button">btop</button>
+    </div>
+
+    <div id="btopTargetMenu" class="tab-menu hidden"></div>
 
     <div id="sessionMenu" class="tab-menu hidden"></div>
 

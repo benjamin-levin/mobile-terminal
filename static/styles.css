@@ -184,6 +184,7 @@ h2 {
 .tab-pill,
 .shortcut-button,
 .tab-menu-button,
+.btop-key-button,
 .value-chip {
   border-radius: var(--surface-radius);
   border: 1px solid var(--border);
@@ -196,7 +197,8 @@ h2 {
 .primary-button,
 .tab-pill,
 .shortcut-button,
-.tab-menu-button {
+.tab-menu-button,
+.btop-key-button {
   cursor: pointer;
   background: #163240;
   transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
@@ -1706,4 +1708,80 @@ code {
     margin-left: calc(14px * var(--ui-scale));
     margin-right: calc(14px * var(--ui-scale));
   }
+}
+
+/* ---- btop tab ---- */
+.menu-heading {
+  font-weight: 600;
+  color: var(--accent);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2px;
+}
+
+.tab-pill-btop {
+  background: rgba(23, 42, 33, 0.9);
+  border-color: rgba(126, 231, 179, 0.28);
+}
+
+.tab-pill-btop.is-active {
+  background: linear-gradient(135deg, rgba(126, 231, 179, 0.18), rgba(130, 207, 255, 0.16));
+  border-color: rgba(126, 231, 179, 0.5);
+}
+
+.btop-controls {
+  display: flex;
+  gap: var(--surface-gap);
+  padding: calc(8px * var(--ui-scale)) max(var(--page-pad-x), calc(10px * var(--ui-scale)));
+  background: rgba(6, 17, 23, 0.98);
+  border-top: 1px solid rgba(126, 231, 179, 0.22);
+}
+
+.btop-key-button {
+  flex: 1 1 0;
+  min-width: 0;
+  justify-content: center;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.btop-key-quit {
+  flex: 1 1 0;
+  color: var(--accent);
+  border-color: var(--border-strong);
+}
+
+.btop-zoom {
+  position: fixed;
+  right: calc(6px * var(--ui-scale));
+  top: calc(var(--app-top, 0px) + 25%);
+  bottom: calc(var(--shortcut-reserve) + 12px);
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: calc(6px * var(--ui-scale));
+  padding: calc(8px * var(--ui-scale)) calc(4px * var(--ui-scale));
+  border-radius: 999px;
+  border: 1px solid rgba(126, 231, 179, 0.28);
+  background: rgba(9, 20, 27, 0.82);
+  backdrop-filter: blur(6px);
+}
+
+.btop-zoom-label {
+  color: var(--text-muted);
+  font-size: max(11px, calc(12px * var(--ui-scale)));
+  line-height: 1;
+}
+
+.btop-zoom-input {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: calc(20px * var(--ui-scale));
+  flex: 1 1 auto;
+  accent-color: rgb(126, 231, 179);
+  touch-action: none;
+}
+
+.btop-zoom-input::-webkit-slider-thumb {
+  cursor: pointer;
 }

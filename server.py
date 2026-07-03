@@ -486,6 +486,108 @@ def next_session_name(existing: set[str] | None = None) -> str:
         counter += 1
 
 
+BTOP_SESSION_PREFIX = "btop-"
+# Only simple, tmux-safe target ids are allowed so the target round-trips
+# through the session name (btop-<target>) and survives a server restart.
+BTOP_TARGET_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def ssh_config_hosts() -> list[dict[str, str]]:
+    """[{alias, hostname}] for each non-pattern Host entry in ~/.ssh/config.
+
+    The alias is the tmux/session-safe target id; hostname is the address used
+    for the reachability ping (falls back to the alias when no HostName is set).
+    """
+    path = Path.home() / ".ssh" / "config"
+    hosts: list[dict[str, str]] = []
+    seen: set[str] = set()
+    current: dict[str, str] | None = None
+    try:
+        lines = path.read_text().splitlines()
+    except (FileNotFoundError, PermissionError, OSError):
+        return hosts
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"host\s+(.+)", stripped, re.IGNORECASE)
+        if match:
+            current = None
+            for token in match.group(1).split():
+                # Skip wildcard/negated patterns like "*" or "!prod".
+                if any(ch in token for ch in "*?!"):
+                    continue
+                # Keep only the first usable, tmux/session-safe alias per line.
+                if BTOP_TARGET_PATTERN.match(token) and token not in seen:
+                    seen.add(token)
+                    current = {"alias": token, "hostname": token}
+                    hosts.append(current)
+                break
+            continue
+        if current is not None:
+            hostname = re.match(r"hostname\s+(\S+)", stripped, re.IGNORECASE)
+            if hostname:
+                current["hostname"] = hostname.group(1)
+    return hosts
+
+
+def ssh_host_aliases() -> list[str]:
+    return [host["alias"] for host in ssh_config_hosts()]
+
+
+def btop_targets(reachable: set[str] | None = None) -> list[dict[str, str]]:
+    """Local plus every SSH host that is currently reachable.
+
+    When reachable is None (reachability not yet probed) no remotes are listed,
+    so a host only appears once it has actually pinged.
+    """
+    targets = [{"id": "local", "label": "Local (this computer)"}]
+    reachable = reachable or set()
+    for host in ssh_config_hosts():
+        if host["alias"] in reachable:
+            targets.append({"id": host["alias"], "label": host["alias"]})
+    return targets
+
+
+def btop_command_for_target(target: str) -> str | None:
+    """Shell command tmux should run in the pane for a given btop target.
+
+    Uses a login shell (`bash -lc`) so btop is found even when it lives in
+    ~/.local/bin or behind a version manager that only sets PATH on login.
+    Returns None for an unknown/invalid target.
+    """
+    if target == "local":
+        return "bash -lc btop"
+    if not BTOP_TARGET_PATTERN.match(target) or target not in ssh_host_aliases():
+        return None
+    return f"ssh -t {shlex.quote(target)} 'bash -lc btop'"
+
+
+async def ping_host(hostname: str, timeout: float = 3.0) -> bool:
+    """True if the host answers a single ICMP echo within ~1s."""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            hostname,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        returncode = await asyncio.wait_for(proc.wait(), timeout=timeout)
+        return returncode == 0
+    except (asyncio.TimeoutError, OSError):
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        return False
+
+
 def default_settings() -> dict[str, Any]:
     return {
         "shortcuts": [
@@ -1186,6 +1288,25 @@ class AppServer:
         self.active_sessions = 0
         self.scroll_states: dict[str, dict[str, Any]] = {}
         self.terminal_sizes: dict[str, tuple[int, int]] = {}
+        # Aliases of SSH hosts that answered the last ping sweep. Starts empty so
+        # a remote target only appears in the btop picker once it's reachable.
+        self.btop_reachable: set[str] = set()
+
+    async def btop_ping_loop(self, interval: float = 30.0) -> None:
+        """Refresh the reachable-SSH-host set every `interval` seconds."""
+        while True:
+            hosts = ssh_config_hosts()
+            reachable: set[str] = set()
+            if hosts:
+                results = await asyncio.gather(
+                    *(ping_host(host["hostname"]) for host in hosts),
+                    return_exceptions=True,
+                )
+                for host, ok in zip(hosts, results):
+                    if ok is True:
+                        reachable.add(host["alias"])
+            self.btop_reachable = reachable
+            await asyncio.sleep(interval)
 
     def queue_scroll_history(self, session_name: str, lines: int) -> None:
         if lines == 0:
@@ -1868,6 +1989,54 @@ class AppServer:
             await self.send_json(connection, {"type": "session-created", "session": next_name})
             return
 
+        if message_type == "request-btop-targets":
+            await self.send_json(
+                connection,
+                {"type": "btop-targets", "targets": btop_targets(self.btop_reachable)},
+            )
+            return
+
+        if message_type == "new-btop-tab":
+            target = str(payload.get("target", "")).strip()
+            command = btop_command_for_target(target)
+            if command is None:
+                await self.send_json(
+                    connection,
+                    {"type": "notice", "message": f"Unknown btop target '{target}'."},
+                )
+                return
+            btop_session = f"{BTOP_SESSION_PREFIX}{target}"
+            # Reuse an existing btop tab for this target instead of stacking
+            # duplicates; otherwise spawn a dedicated session running btop.
+            if not session_exists(btop_session):
+                path = current_path(session_name, self.cwd)
+                tmux_capture(
+                    "new-session",
+                    "-d",
+                    "-s",
+                    btop_session,
+                    "-n",
+                    "btop",
+                    "-c",
+                    path,
+                    command,
+                    check=False,
+                )
+                for option, value in (("status", "off"), ("mouse", "on")):
+                    tmux_capture("set-option", "-t", btop_session, option, value, check=False)
+            await self.send_tabs(connection, session_name)
+            await self.send_sessions(connection, session_name)
+            await self.send_json(
+                connection,
+                {
+                    "type": "session-created",
+                    "session": btop_session,
+                    "kind": "btop",
+                    "target": target,
+                },
+            )
+            return
+
         if message_type == "rename-tab":
             name = str(payload.get("name", "")).strip()[:40]
             target_name = str(payload.get("session", session_name)).strip() or session_name
@@ -2153,7 +2322,11 @@ class AppServer:
             else:
                 print("access token: disabled")
             print("")
-            await stop_event.wait()
+            ping_task = asyncio.create_task(self.btop_ping_loop())
+            try:
+                await stop_event.wait()
+            finally:
+                ping_task.cancel()
 
 
 def parse_args() -> argparse.Namespace:

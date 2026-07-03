@@ -6,6 +6,16 @@
   const STORAGE_ACTIVE_SESSION_KEY = "mobile-terminal.active-session";
   const STORAGE_OPEN_TABS_KEY = "mobile-terminal.open-tabs";
   const STORAGE_EDITOR_TABS_KEY = "mobile-terminal.editor-tabs";
+  const STORAGE_BTOP_ZOOM_KEY = "mobile-terminal.btop-zoom";
+  const BTOP_SESSION_PREFIX = "btop-";
+  // Grid btop needs to render its default layout without "terminal too small".
+  // btop reports needing ~80x32 for a full box config; we target a little above
+  // that (and lose one col to the fit guard) so it always renders. The tab's
+  // font is auto-shrunk until at least this many cells fit; the zoom slider
+  // multiplies the target up (more cells, smaller text) to zoom out.
+  const BTOP_TARGET_COLS = 84;
+  const BTOP_TARGET_ROWS = 34;
+  const BTOP_MIN_FONT = 3;
   const DEFAULT_UI_SCALE = 0.85;
   const DEFAULT_TERMINAL_FONT = 10;
   const KEYBOARD_THRESHOLD = 80;
@@ -64,7 +74,15 @@
   const loginMessage = document.getElementById("loginMessage");
   const toast = document.getElementById("toast");
   const tabMenu = document.getElementById("tabMenu");
-  const openSessionButton = document.getElementById("openSessionButton");
+  const auxButton = document.getElementById("auxButton");
+  const auxMenu = document.getElementById("auxMenu");
+  const auxSessionsButton = document.getElementById("auxSessionsButton");
+  const auxFilesButton = document.getElementById("auxFilesButton");
+  const auxBtopButton = document.getElementById("auxBtopButton");
+  const btopTargetMenu = document.getElementById("btopTargetMenu");
+  const btopControls = document.getElementById("btopControls");
+  const btopZoom = document.getElementById("btopZoom");
+  const btopZoomInput = document.getElementById("btopZoomInput");
   const sessionMenu = document.getElementById("sessionMenu");
   const settingsButton = document.getElementById("settingsButton");
   const settingsMenu = document.getElementById("settingsMenu");
@@ -97,7 +115,6 @@
   const displayTerminalPreview = document.getElementById("displayTerminalPreview");
   const terminalPanel = document.getElementById("terminalPanel");
   const terminalElement = document.getElementById("terminal");
-  const newEditorTabButton = document.getElementById("newEditorTabButton");
   const fileWorkspace = document.getElementById("fileWorkspace");
   const fileWorkspaceRoot = document.getElementById("fileWorkspaceRoot");
   const fileWorkspaceTitle = document.getElementById("fileWorkspaceTitle");
@@ -131,6 +148,7 @@
   let uiScale = loadNumericSetting(STORAGE_UI_SCALE_KEY, DEFAULT_UI_SCALE, 0.5, 1.4);
   let effectiveUiScale = uiScale;
   let terminalFontSize = loadNumericSetting(STORAGE_TERMINAL_FONT_KEY, DEFAULT_TERMINAL_FONT, 5, 24);
+  let btopZoomFactor = loadNumericSetting(STORAGE_BTOP_ZOOM_KEY, 1, 1, 3);
   let draftUiScale = uiScale;
   let draftTerminalFontSize = terminalFontSize;
   document.documentElement.style.setProperty("--ui-scale", String(effectiveUiScale));
@@ -203,6 +221,12 @@
   let hostSettingsReady = false;
   let sessionMenuOpen = false;
   let settingsMenuOpen = false;
+  let auxMenuOpen = false;
+  let btopTargetMenuOpen = false;
+  let btopTargetRefreshTimer = null;
+  let btopTargets = [{ id: "local", label: "Local (this computer)" }];
+  // Non-persisted per-view state for the active btop tab.
+  let btopMode = false;
   let touchScrollState = null;
   let twoFingerNavState = null;
   let touchInertiaFrameId = null;
@@ -1030,10 +1054,19 @@
   function renderActiveSurface() {
     const active = activeTab();
     const editorActive = active?.type === "editor";
+    const btopActive =
+      !editorActive && active?.type === "terminal" && isBtopSession(active.name);
     document.body.dataset.activeSurface = editorActive ? "editor" : "terminal";
     terminalPanel.classList.toggle("hidden", editorActive);
     fileWorkspace.classList.toggle("hidden", !editorActive);
     shortcutsPanel.classList.toggle("hidden", editorActive);
+    // A btop tab is a terminal, but with its own chrome (no composer, digit
+    // keys instead of shortcuts) and independent auto-scaling.
+    if (btopActive) {
+      enterBtopMode();
+    } else {
+      exitBtopMode();
+    }
     if (editorActive) {
       if (mobileComposerMode) {
         if (document.activeElement === composerInput) {
@@ -1174,6 +1207,10 @@
 
   function openComposer(focus = true) {
     if (!mobileComposerMode) {
+      return;
+    }
+    // btop tabs have no prompt and keep the keyboard hidden.
+    if (btopMode) {
       return;
     }
     composerPanel.classList.remove("hidden");
@@ -2156,10 +2193,18 @@
     window.clearTimeout(fitTimer);
     fitTimer = window.setTimeout(() => {
       measureShortcutHeight();
-      fitTerminal({ preserveCols: preserveTerminalCols });
+      // In a btop tab, re-derive the auto-scale font (rotation/resize changes
+      // the pane) so it never falls under btop's minimum grid.
+      if (btopMode) {
+        applyBtopFont();
+      } else {
+        fitTerminal({ preserveCols: preserveTerminalCols });
+      }
       positionTabMenu();
       positionSessionMenu();
       positionSettingsMenu();
+      positionAuxMenu();
+      positionBtopTargetMenu();
     }, 40);
   }
 
@@ -2167,10 +2212,16 @@
     window.clearTimeout(fitTimer);
     fitTimer = 0;
     measureShortcutHeight();
-    fitTerminal({ preserveCols: preserveTerminalCols });
+    if (btopMode) {
+      applyBtopFont();
+    } else {
+      fitTerminal({ preserveCols: preserveTerminalCols });
+    }
     positionTabMenu();
     positionSessionMenu();
     positionSettingsMenu();
+    positionAuxMenu();
+    positionBtopTargetMenu();
   }
 
   function refreshFollowOutput() {
@@ -2897,9 +2948,14 @@
     tabsStrip.innerHTML = "";
     currentTabs.forEach((tab) => {
       const button = document.createElement("button");
-      button.className = `tab-pill tab-pill-${tab.type || "terminal"}${tab.active ? " is-active" : ""}`;
+      const btopPill = tab.type !== "editor" && isBtopSession(tab.name);
+      button.className = `tab-pill tab-pill-${btopPill ? "btop" : tab.type || "terminal"}${tab.active ? " is-active" : ""}`;
       button.type = "button";
-      button.textContent = tab.type === "editor" ? `Files: ${tab.name || "root"}` : tab.name || "session";
+      button.textContent = tab.type === "editor"
+        ? `Files: ${tab.name || "root"}`
+        : btopPill
+          ? btopTabLabel(tab.name)
+          : tab.name || "session";
       button.addEventListener("click", () => {
         if (Date.now() < suppressTabClickUntil) {
           return;
@@ -3995,6 +4051,16 @@
       }
       return;
     }
+    if (payload.type === "btop-targets") {
+      if (Array.isArray(payload.targets) && payload.targets.length) {
+        btopTargets = payload.targets;
+      }
+      if (btopTargetMenuOpen) {
+        renderBtopTargetMenu();
+        positionBtopTargetMenu();
+      }
+      return;
+    }
     if (payload.type === "stats") {
       renderUsage(payload);
       return;
@@ -4079,6 +4145,8 @@
   function toggleTabMenu(tabKey) {
     closeSessionMenu();
     closeSettingsMenu();
+    closeAuxMenu();
+    closeBtopTargetMenu();
     if (openTabMenuKey === tabKey) {
       closeTabMenu();
       return;
@@ -4120,6 +4188,8 @@
   function toggleSessionMenu() {
     closeTabMenu();
     closeSettingsMenu();
+    closeAuxMenu();
+    closeBtopTargetMenu();
     sessionMenuOpen = !sessionMenuOpen;
     sessionMenu.classList.toggle("hidden", !sessionMenuOpen);
     if (!sessionMenuOpen) {
@@ -4136,7 +4206,7 @@
     if (!sessionMenuOpen) {
       return;
     }
-    const rect = openSessionButton.getBoundingClientRect();
+    const rect = auxButton.getBoundingClientRect();
     const menuWidth = Math.max(196, sessionMenu.offsetWidth || 196);
     const left = Math.min(
       window.innerWidth - menuWidth - 12,
@@ -4154,6 +4224,8 @@
   function toggleSettingsMenu() {
     closeSessionMenu();
     closeTabMenu();
+    closeAuxMenu();
+    closeBtopTargetMenu();
     settingsMenuOpen = !settingsMenuOpen;
     settingsMenu.classList.toggle("hidden", !settingsMenuOpen);
     if (settingsMenuOpen) {
@@ -4178,6 +4250,127 @@
   function closeSettingsMenu() {
     settingsMenuOpen = false;
     settingsMenu.classList.add("hidden");
+  }
+
+  function toggleAuxMenu() {
+    closeSessionMenu();
+    closeSettingsMenu();
+    closeTabMenu();
+    closeBtopTargetMenu();
+    auxMenuOpen = !auxMenuOpen;
+    auxMenu.classList.toggle("hidden", !auxMenuOpen);
+    if (auxMenuOpen) {
+      positionAuxMenu();
+    }
+  }
+
+  function positionAuxMenu() {
+    if (!auxMenuOpen) {
+      return;
+    }
+    positionMenuUnder(auxMenu, auxButton, 160);
+  }
+
+  function closeAuxMenu() {
+    auxMenuOpen = false;
+    auxMenu.classList.add("hidden");
+  }
+
+  // Shared positioner: place a fixed .tab-menu under a trigger button, kept
+  // within the viewport horizontally.
+  function positionMenuUnder(menu, button, minWidth) {
+    const rect = button.getBoundingClientRect();
+    const menuWidth = Math.max(minWidth, menu.offsetWidth || minWidth);
+    const left = Math.min(
+      window.innerWidth - menuWidth - 12,
+      Math.max(12, rect.right - menuWidth),
+    );
+    menu.style.left = `${left}px`;
+    menu.style.top = `${rect.bottom + 8}px`;
+  }
+
+  function openBtopTargetMenu() {
+    closeAuxMenu();
+    closeSessionMenu();
+    closeSettingsMenu();
+    closeTabMenu();
+    btopTargetMenuOpen = true;
+    renderBtopTargetMenu();
+    btopTargetMenu.classList.remove("hidden");
+    positionBtopTargetMenu();
+    requestBtopTargets();
+    // Keep the list live while open: the server re-pings hosts every 30s, so a
+    // host that comes online shows up without reopening the menu.
+    window.clearInterval(btopTargetRefreshTimer);
+    btopTargetRefreshTimer = window.setInterval(() => {
+      if (btopTargetMenuOpen) {
+        requestBtopTargets();
+      }
+    }, 12000);
+  }
+
+  function requestBtopTargets() {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      sendMessage({ type: "request-btop-targets" });
+    }
+  }
+
+  function renderBtopTargetMenu() {
+    btopTargetMenu.innerHTML = "";
+    const heading = document.createElement("div");
+    heading.className = "menu-empty menu-heading";
+    heading.textContent = "Open btop on…";
+    btopTargetMenu.appendChild(heading);
+    btopTargets.forEach((target) => {
+      const button = document.createElement("button");
+      button.className = "tab-menu-button";
+      button.type = "button";
+      button.textContent = target.label || target.id;
+      button.addEventListener("click", () => launchBtop(target.id));
+      btopTargetMenu.appendChild(button);
+    });
+    if (btopTargets.length <= 1) {
+      const note = document.createElement("div");
+      note.className = "menu-empty";
+      note.textContent = "No reachable remote hosts";
+      btopTargetMenu.appendChild(note);
+    }
+  }
+
+  function positionBtopTargetMenu() {
+    if (!btopTargetMenuOpen) {
+      return;
+    }
+    positionMenuUnder(btopTargetMenu, auxButton, 200);
+  }
+
+  function closeBtopTargetMenu() {
+    btopTargetMenuOpen = false;
+    window.clearInterval(btopTargetRefreshTimer);
+    btopTargetRefreshTimer = null;
+    btopTargetMenu.classList.add("hidden");
+  }
+
+  function launchBtop(target) {
+    closeBtopTargetMenu();
+    if (!target) {
+      return;
+    }
+    resetComposerTracking(true);
+    sendMessage({ type: "new-btop-tab", target });
+  }
+
+  function isBtopSession(name) {
+    return typeof name === "string" && name.startsWith(BTOP_SESSION_PREFIX);
+  }
+
+  function btopTargetFromSession(name) {
+    return isBtopSession(name) ? name.slice(BTOP_SESSION_PREFIX.length) : "";
+  }
+
+  function btopTabLabel(name) {
+    const target = btopTargetFromSession(name);
+    return target === "local" ? "btop: local" : `btop: ${target}`;
   }
 
   function switchSession(sessionName) {
@@ -4391,6 +4584,109 @@
       localStorage.setItem(STORAGE_TERMINAL_FONT_KEY, String(terminalFontSize));
     }
     scheduleLayoutRefresh();
+  }
+
+  // How many cells the pane would give at a candidate font size right now.
+  // Measures the real cell size (proposeDimensions caches stale metrics after a
+  // font change, so force a fresh char measure first).
+  function btopGridAtFont(size) {
+    term.options.fontSize = size;
+    try {
+      term._core?._charSizeService?.measure?.();
+    } catch (_error) {
+      // Internal API — ignore if the shape changes.
+    }
+    if (typeof fitAddon.proposeDimensions !== "function") {
+      return { cols: 0, rows: 0 };
+    }
+    const proposed = fitAddon.proposeDimensions();
+    if (!proposed || !Number.isFinite(proposed.rows) || !Number.isFinite(proposed.cols)) {
+      return { cols: 0, rows: 0 };
+    }
+    // Match fitTerminal's guard so the value reflects what btop actually gets.
+    return { cols: Math.floor(proposed.cols) - TERMINAL_COL_GUARD, rows: Math.floor(proposed.rows) };
+  }
+
+  function applyBtopFont() {
+    // Make sure the reserve for the btop control bar is applied before we read
+    // the pane height, otherwise the grid overshoots and btop says "too small".
+    measureShortcutHeight();
+    if (terminalElement.clientWidth <= 0 || terminalElement.clientHeight <= 0) {
+      return;
+    }
+    const targetCols = BTOP_TARGET_COLS * btopZoomFactor;
+    const targetRows = BTOP_TARGET_ROWS * btopZoomFactor;
+    // Binary-search the largest 0.5px font whose real grid still clears btop's
+    // minimum (smaller font -> more cells, so the predicate is monotonic). This
+    // guarantees it renders regardless of layout/measurement timing quirks.
+    let loHalf = Math.round(BTOP_MIN_FONT * 2);
+    let hiHalf = 48; // 24px
+    let bestHalf = loHalf;
+    while (loHalf <= hiHalf) {
+      const midHalf = Math.floor((loHalf + hiHalf) / 2);
+      const grid = btopGridAtFont(midHalf / 2);
+      if (grid.cols >= targetCols && grid.rows >= targetRows) {
+        bestHalf = midHalf;
+        loHalf = midHalf + 1;
+      } else {
+        hiHalf = midHalf - 1;
+      }
+    }
+    const size = bestHalf / 2;
+    // Set xterm font directly (bypassing applyTerminalFontSize's 5px floor and
+    // its global persist) so the btop tab scales independently of the UI.
+    term.options.fontSize = size;
+    document.documentElement.style.setProperty("--terminal-font-size", `${size}px`);
+    fitTerminal({ preserveCols: false });
+  }
+
+  function enterBtopMode() {
+    const firstEnter = !btopMode;
+    btopMode = true;
+    document.body.dataset.btop = "true";
+    shortcutBar.classList.add("hidden");
+    btopControls.classList.remove("hidden");
+    btopZoom.classList.remove("hidden");
+    btopZoomInput.value = String(btopZoomFactor);
+    // No prompt/composer and no auto-keyboard in a btop tab.
+    if (composerPanel) {
+      setComposerActive(false);
+      composerPanel.classList.add("hidden");
+    }
+    if (document.activeElement === composerInput) {
+      composerInput.blur();
+    }
+    if (firstEnter) {
+      // Give layout a frame to settle before measuring the pane.
+      window.requestAnimationFrame(applyBtopFont);
+    } else {
+      applyBtopFont();
+    }
+  }
+
+  function exitBtopMode() {
+    if (!btopMode) {
+      return;
+    }
+    btopMode = false;
+    delete document.body.dataset.btop;
+    btopControls.classList.add("hidden");
+    btopZoom.classList.add("hidden");
+    shortcutBar.classList.remove("hidden");
+    // Restore the normal (global) terminal font size for other tabs.
+    term.options.fontSize = terminalFontSize;
+    document.documentElement.style.setProperty("--terminal-font-size", `${terminalFontSize}px`);
+    fitTerminal({ preserveCols: false });
+  }
+
+  function setBtopZoom(nextFactor, persist = true) {
+    btopZoomFactor = Math.min(3, Math.max(1, Number(nextFactor) || 1));
+    if (persist) {
+      localStorage.setItem(STORAGE_BTOP_ZOOM_KEY, String(btopZoomFactor));
+    }
+    if (btopMode) {
+      applyBtopFont();
+    }
   }
 
   function openDisplay() {
@@ -4945,7 +5241,19 @@
 
   clearComposerButton.addEventListener("click", forceClearComposer);
 
-  newEditorTabButton.addEventListener("click", () => openFileRootPicker("new"));
+  auxButton.addEventListener("click", toggleAuxMenu);
+  auxSessionsButton.addEventListener("click", toggleSessionMenu);
+  auxFilesButton.addEventListener("click", () => {
+    closeAuxMenu();
+    openFileRootPicker("new");
+  });
+  auxBtopButton.addEventListener("click", openBtopTargetMenu);
+  btopControls.querySelectorAll("[data-btop-key]").forEach((button) => {
+    button.addEventListener("click", () => {
+      sendMessage({ type: "input", data: button.dataset.btopKey });
+    });
+  });
+  btopZoomInput.addEventListener("input", () => setBtopZoom(btopZoomInput.value));
   fileRootForm.addEventListener("submit", (event) => {
     event.preventDefault();
     if (fileRootForm.dataset.mode === "change") {
@@ -5024,8 +5332,6 @@
       saveActiveFile();
     }
   });
-
-  openSessionButton.addEventListener("click", toggleSessionMenu);
 
   document.getElementById("renameTabButton").addEventListener("click", () => {
     const current = currentTabs.find((tab) => tab.key === openTabMenuKey) || activeTab();
@@ -5328,7 +5634,8 @@
     if (
       sessionMenuOpen &&
       !sessionMenu.contains(event.target) &&
-      !openSessionButton.contains(event.target)
+      !auxButton.contains(event.target) &&
+      !auxMenu.contains(event.target)
     ) {
       closeSessionMenu();
     }
@@ -5338,6 +5645,21 @@
       !settingsButton.contains(event.target)
     ) {
       closeSettingsMenu();
+    }
+    if (
+      auxMenuOpen &&
+      !auxMenu.contains(event.target) &&
+      !auxButton.contains(event.target)
+    ) {
+      closeAuxMenu();
+    }
+    if (
+      btopTargetMenuOpen &&
+      !btopTargetMenu.contains(event.target) &&
+      !auxButton.contains(event.target) &&
+      !auxMenu.contains(event.target)
+    ) {
+      closeBtopTargetMenu();
     }
   });
   document.addEventListener("focusin", updateViewportMetrics);
