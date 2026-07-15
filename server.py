@@ -2884,6 +2884,52 @@ class AppServer:
         output_task = asyncio.create_task(relay_output())
         tab_task = asyncio.create_task(watch_tabs())
 
+        async def switch_session(target: str, skip: bool) -> None:
+            # Re-attach to a different session on the SAME connection (no WS
+            # reconnect / handshake), so switching tabs costs ~1 round-trip.
+            nonlocal bridge, output_task
+            new_session, created = self.resolve_user_session(state["user"], str(target).strip())
+            if new_session == state["session"]:
+                return
+            output_task.cancel()
+            try:
+                await output_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            bridge.close()
+            bridge = TmuxBridge(
+                new_session,
+                self.shell,
+                self.cwd,
+                create_if_missing=created,
+                initial_size=self.terminal_sizes.get(new_session),
+            )
+            bridge.open()
+            state["session"] = new_session
+            output_task = asyncio.create_task(relay_output())
+            await self.send_json(
+                connection,
+                {
+                    "type": "ready",
+                    "session": new_session,
+                    "shell": self.shell,
+                    "cwd": self.cwd,
+                    "requireToken": self.token_required_for(trusted_client),
+                    "tailscaleMode": self.tailscale_mode,
+                    "allowedClients": self.allowed_clients,
+                    "multiTenant": self.multi_tenant,
+                    "user": user if self.multi_tenant else None,
+                    "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
+                },
+            )
+            if not skip:
+                hist = capture_history(new_session, CONNECT_HISTORY_LINES)
+                if hist:
+                    await connection.send(hist.encode("utf-8", "surrogateescape"))
+            await self.send_tabs(connection, state["user"], new_session)
+            await self.send_sessions(connection, state["user"], new_session)
+            await self.send_composer_state(connection, new_session)
+
         try:
             await self.send_json(
                 connection,
@@ -2924,6 +2970,9 @@ class AppServer:
                 except json.JSONDecodeError:
                     continue
                 msg_type = payload.get("type")
+                if msg_type == "switch-session":
+                    await switch_session(payload.get("session", ""), bool(payload.get("skipHistory", True)))
+                    continue
                 if msg_type and msg_type != "request-stats":
                     session_summary["inputEvents"] += 1
                 if msg_type == "composer-enter":

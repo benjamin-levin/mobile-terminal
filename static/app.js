@@ -5405,8 +5405,17 @@
     }
     resetComposerTracking(true);
     term.reset();
+    // Fast path: switch on the live connection (no WS reconnect/handshake).
+    // The server re-attaches the target session and streams it; `ready` arrives
+    // and re-inits for the new session. tmux redraws on attach, so skip history.
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      selectedSessionName = sessionName;
+      sendMessage({ type: "switch-session", session: sessionName, skipHistory: true });
+      return;
+    }
+    // No live socket: fall back to a fresh connect for this session.
     skipHistoryOnNextConnect = true;
-    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+    if (socket && socket.readyState === WebSocket.CONNECTING) {
       reconnectForSessionSwitch = true;
       socket.close(1000, "switch-session");
       return;
