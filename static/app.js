@@ -215,7 +215,9 @@
     fontFamily: '"JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
     fontSize: terminalFontSize,
     lineHeight: 1.2,
-    scrollback: 5000,
+    // Deep local scrollback so shell/codex panes (which scroll locally, 0 RTT)
+    // stay scrollable far back without round-tripping to a distant server.
+    scrollback: 20000,
     theme: {
       background: "#08131a",
       foreground: "#e6edf3",
@@ -6918,4 +6920,13 @@
     }
     connect();
   });
+
+  // Cache the UI shell for instant, round-trip-free loads. Only registers in a
+  // secure context (HTTPS/localhost); over plain HTTP `navigator.serviceWorker`
+  // is undefined, so this is a harmless no-op until the app is served via HTTPS.
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+    });
+  }
 })();
