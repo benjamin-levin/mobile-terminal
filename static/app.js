@@ -1,5 +1,11 @@
 (function () {
   const STORAGE_TOKEN_KEY = "mobile-terminal.token";
+  const STORAGE_USER_KEY = "mobile-terminal.user";
+  const STORAGE_DEVICE_ID_KEY = "mobile-terminal.device-id";
+  // Tracks which user the device-cached settings belong to. localStorage is
+  // per-origin, so when a different user logs in on the same browser we clear
+  // the cached prefs and let them load their own per-user settings from the host.
+  const STORAGE_SETTINGS_OWNER_KEY = "mobile-terminal.settings-owner";
   const STORAGE_SHORTCUTS_KEY = "mobile-terminal.shortcuts";
   const STORAGE_GESTURES_KEY = "mobile-terminal.gestures";
   const STORAGE_UI_SCALE_KEY = "mobile-terminal.ui-scale";
@@ -93,8 +99,17 @@
   const clearComposerButton = document.getElementById("clearComposerButton");
   const loginOverlay = document.getElementById("loginOverlay");
   const loginForm = document.getElementById("loginForm");
+  const userInput = document.getElementById("userInput");
+  const userField = document.getElementById("userField");
   const tokenInput = document.getElementById("tokenInput");
   const loginMessage = document.getElementById("loginMessage");
+  const accountButton = document.getElementById("accountButton");
+  const accountOverlay = document.getElementById("accountOverlay");
+  const accountUserLabel = document.getElementById("accountUserLabel");
+  const deviceList = document.getElementById("deviceList");
+  const rotateTokenButton = document.getElementById("rotateTokenButton");
+  const signOutButton = document.getElementById("signOutButton");
+  const closeAccountButton = document.getElementById("closeAccountButton");
   const toast = document.getElementById("toast");
   const tabMenu = document.getElementById("tabMenu");
   const auxButton = document.getElementById("auxButton");
@@ -168,7 +183,23 @@
     requireToken: true,
     tailscaleMode: false,
     allowedClients: [],
+    multiTenant: false,
   };
+  let currentUser = localStorage.getItem(STORAGE_USER_KEY) || "";
+  let currentUserLabel = "";
+
+  // A stable per-device id so the host can list the devices registered to a
+  // user. Generated once and kept in localStorage; not a secret.
+  function getDeviceId() {
+    let id = localStorage.getItem(STORAGE_DEVICE_ID_KEY);
+    if (!id) {
+      id =
+        (window.crypto && window.crypto.randomUUID && window.crypto.randomUUID()) ||
+        `dev-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+      localStorage.setItem(STORAGE_DEVICE_ID_KEY, id);
+    }
+    return id;
+  }
 
   let uiScale = loadNumericSetting(STORAGE_UI_SCALE_KEY, DEFAULT_UI_SCALE, 0.5, 1.4);
   let effectiveUiScale = uiScale;
@@ -189,7 +220,7 @@
       background: "#08131a",
       foreground: "#e6edf3",
       cursor: "#ffd166",
-      selectionBackground: "rgba(255, 209, 102, 0.22)",
+      selectionBackground: "rgba(255, 209, 102, 0.38)",
       black: "#0b1318",
       red: "#ff6b6b",
       green: "#86efac",
@@ -1018,6 +1049,445 @@
     }
   }
 
+  // --- Touch text selection (press-and-hold, then drag the handles) ---------
+  // xterm paints its rows with `user-select: none`, so the browser never offers
+  // native selection handles on a long-press. Instead we recognise a long-press
+  // ourselves, drive xterm's own mouse-based selection with synthetic
+  // MouseEvents, and render our own draggable handles + a Copy chip on top.
+  const TERM_LONGPRESS_MS = 300; // hold this long to start selecting a word
+  const TERM_LONGPRESS_SLOP = 12; // px the finger may drift before it's a scroll
+  const TERM_DOUBLETAP_MS = 120; // max gap between the two taps of a double-tap
+  const TERM_DOUBLETAP_DIST = 28; // px the two taps may be apart
+  // A lone tap opens the keyboard, but only after this delay so a second tap
+  // (double-tap → select a word) can cancel it first. Kept just above the
+  // double-tap window: long enough to catch a fast double-tap, short enough that
+  // the keyboard still feels like it opens promptly on a deliberate single tap.
+  const TERM_TAP_KEYBOARD_DELAY_MS = 160;
+  let termSel = null; // in-flight press/drag session, or null
+  let termSelHandles = null; // lazily-created { layer, start, end, copy } DOM
+  let suppressNextTerminalClick = false;
+  let suppressComposerOpenThisTouch = false; // set when a tap only dismisses a selection
+  let terminalComposerOpenTimer = null; // pending delayed keyboard open, or null
+  let lastTermTapAt = 0; // for double-tap-to-select-word recognition
+  let lastTermTapX = 0;
+  let lastTermTapY = 0;
+
+  // The keyboard opens on a plain tap, but only after the double-tap window has
+  // passed with no second tap — a quick double-press selects a word instead and
+  // cancels this pending open.
+  function cancelPendingComposerOpen() {
+    if (terminalComposerOpenTimer) {
+      window.clearTimeout(terminalComposerOpenTimer);
+      terminalComposerOpenTimer = null;
+    }
+  }
+
+  function scheduleComposerOpen() {
+    cancelPendingComposerOpen();
+    // btop tabs have no prompt — never raise the keyboard there.
+    if (btopMode) {
+      return;
+    }
+    terminalComposerOpenTimer = window.setTimeout(() => {
+      terminalComposerOpenTimer = null;
+      openComposer(true);
+    }, TERM_TAP_KEYBOARD_DELAY_MS);
+  }
+
+  function hapticPulse(ms) {
+    try {
+      if (typeof navigator.vibrate === "function") {
+        navigator.vibrate(ms || 12);
+      }
+    } catch (_error) {
+      // Vibration is best-effort; ignore unsupported platforms.
+    }
+  }
+
+  function terminalScreenEl() {
+    return terminalElement.querySelector(".xterm-screen");
+  }
+
+  function mouseEventsCaptured() {
+    // Apps like btop/vim enable SGR mouse reporting; xterm then disables text
+    // selection and forwards clicks. Don't hijack those with a fake selection.
+    const svc = term._core?._coreMouseService || term._core?.coreMouseService;
+    return !!svc?.areMouseEventsActive;
+  }
+
+  function terminalCellSize() {
+    const dims = term._core?._renderService?.dimensions;
+    const cell = dims?.css?.cell;
+    if (cell && cell.width > 0 && cell.height > 0) {
+      return { width: cell.width, height: cell.height };
+    }
+    const screen = terminalScreenEl();
+    if (screen && term.cols > 0 && term.rows > 0) {
+      const rect = screen.getBoundingClientRect();
+      return { width: rect.width / term.cols, height: rect.height / term.rows };
+    }
+    return { width: 8, height: 16 };
+  }
+
+  function terminalHelperTextarea() {
+    return terminalElement.querySelector(".xterm-helper-textarea");
+  }
+
+  // Feed xterm's selection service a synthetic mouse event at a screen point.
+  // xterm binds mousedown on the .xterm element and mousemove/mouseup on the
+  // document, so dispatching on the screen node (which bubbles to both) drives
+  // the exact same code path as a real mouse drag.
+  function dispatchTerminalMouse(type, clientX, clientY, detail) {
+    const target = terminalScreenEl() || terminalElement;
+    // When the foreground app has mouse reporting on (tmux `mouse on`, vim,
+    // btop…) xterm would forward the click instead of selecting. Holding Shift
+    // makes xterm force a *local* text selection instead — exactly what we want.
+    // In a plain shell, shift-click means "extend", so only force it when needed.
+    const forceShift = mouseEventsCaptured();
+    // xterm focuses its hidden textarea on mousedown, which in composer mode
+    // would pop the keyboard on the wrong field. That focus is often deferred a
+    // frame, so it can't be caught here — guardTerminalHelperTextarea() handles
+    // it via a focusin listener on the textarea itself instead.
+    target.dispatchEvent(
+      new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        button: 0,
+        buttons: type === "mouseup" ? 0 : 1,
+        detail: detail || 1,
+        shiftKey: forceShift,
+        clientX,
+        clientY,
+      }),
+    );
+  }
+
+  // xterm focuses its hidden textarea on every mousedown so it can receive
+  // keyboard input. In composer mode the app never types through it (input goes
+  // through the composer), so that focus only ever pops the keyboard on the
+  // wrong field — and because xterm often defers the focus a frame, a
+  // synchronous guard around the dispatch misses it. Instead: keep the textarea
+  // permanently readonly (a readonly field can't raise the soft keyboard) and
+  // bounce focus off it whenever xterm grabs it — back to the composer if the
+  // user was typing there, otherwise to nothing.
+  function guardTerminalHelperTextarea() {
+    if (!mobileComposerMode) {
+      return;
+    }
+    const helper = terminalHelperTextarea();
+    if (!helper) {
+      return;
+    }
+    helper.readOnly = true;
+    helper.setAttribute("inputmode", "none");
+    helper.addEventListener("focusin", (event) => {
+      if (!btopMode && event.relatedTarget === composerInput) {
+        // The user was typing — keep the keyboard where it was.
+        composerInput.focus({ preventScroll: true });
+      } else {
+        helper.blur();
+      }
+    });
+  }
+
+  function isSelectionUIVisible() {
+    return !!(termSelHandles && termSelHandles.layer.style.display !== "none");
+  }
+
+  function selectionUIBusy() {
+    return !!(termSel && (termSel.active || termSel.draggingHandle));
+  }
+
+  function clearTerminalSelectionUI() {
+    if (termSelHandles) {
+      termSelHandles.layer.style.display = "none";
+    }
+  }
+
+  function dismissTerminalSelection() {
+    if (typeof term.clearSelection === "function") {
+      term.clearSelection();
+    }
+    clearTerminalSelectionUI();
+  }
+
+  function ensureSelectionHandles() {
+    if (termSelHandles) {
+      return termSelHandles;
+    }
+    const layer = document.createElement("div");
+    layer.className = "term-select-layer";
+    const makeHandle = (side) => {
+      const handle = document.createElement("div");
+      handle.className = `term-select-handle term-select-handle-${side}`;
+      handle.dataset.handle = side;
+      const knob = document.createElement("span");
+      knob.className = "term-select-knob";
+      handle.appendChild(knob);
+      attachHandleDrag(handle);
+      return handle;
+    };
+    const start = makeHandle("start");
+    const end = makeHandle("end");
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "term-select-copy";
+    copy.textContent = "Copy";
+    // Stop the tap from bubbling to #terminal, whose touchstart would otherwise
+    // dismiss the very selection we're about to copy.
+    copy.addEventListener("touchstart", (event) => event.stopPropagation(), {
+      passive: true,
+    });
+    copy.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      await copyTerminalSelection();
+      dismissTerminalSelection();
+    });
+    layer.append(start, end, copy);
+    terminalElement.appendChild(layer);
+    termSelHandles = { layer, start, end, copy };
+    return termSelHandles;
+  }
+
+  // Reposition the handles + copy chip to the current selection's endpoints.
+  // Endpoints that have scrolled out of the viewport are hidden.
+  function updateTerminalSelectionUI() {
+    const pos =
+      typeof term.getSelectionPosition === "function" ? term.getSelectionPosition() : null;
+    if (!pos || !terminalSelectionText()) {
+      clearTerminalSelectionUI();
+      return;
+    }
+    const screen = terminalScreenEl();
+    if (!screen) {
+      clearTerminalSelectionUI();
+      return;
+    }
+    const handles = ensureSelectionHandles();
+    const cell = terminalCellSize();
+    const screenRect = screen.getBoundingClientRect();
+    const hostRect = terminalElement.getBoundingClientRect();
+    const ydisp = term.buffer.active.viewportY;
+    const place = (el, col, absRow) => {
+      const vrow = absRow - ydisp;
+      if (vrow < 0 || vrow >= term.rows) {
+        el.style.display = "none";
+        return null;
+      }
+      const left = screenRect.left - hostRect.left + col * cell.width;
+      const top = screenRect.top - hostRect.top + vrow * cell.height;
+      el.style.display = "block";
+      el.style.left = `${left}px`;
+      el.style.top = `${top}px`;
+      el.style.height = `${cell.height}px`;
+      return { left, top, bottom: top + cell.height };
+    };
+    const startBox = place(handles.start, pos.start.x, pos.start.y);
+    const endBox = place(handles.end, pos.end.x, pos.end.y);
+    // The start knob sits ~30px above the top line and the end knob ~30px below
+    // the bottom line, so the Copy chip has to clear that much to not cover a
+    // handle. Place it above the topmost endpoint; if that clips off the top of
+    // the pane, drop it below the lowest endpoint instead.
+    const KNOB_CLEARANCE = 42;
+    const topBox = startBox && endBox ? (startBox.top <= endBox.top ? startBox : endBox) : startBox || endBox;
+    const bottomBox =
+      startBox && endBox ? (startBox.bottom >= endBox.bottom ? startBox : endBox) : startBox || endBox;
+    if (topBox) {
+      const aboveTop = topBox.top - KNOB_CLEARANCE;
+      const below = aboveTop < 8;
+      handles.copy.classList.toggle("is-below", below);
+      handles.copy.style.left = `${topBox.left}px`;
+      handles.copy.style.top = below
+        ? `${bottomBox.bottom + KNOB_CLEARANCE}px`
+        : `${aboveTop}px`;
+      handles.copy.style.display = "block";
+    } else {
+      handles.copy.style.display = "none";
+    }
+    handles.layer.style.display = "block";
+  }
+
+  // Drag a handle to move one end of the selection. We re-drive xterm from the
+  // fixed (opposite) endpoint to the finger so it reselects with per-character
+  // precision, reversed ranges included.
+  function attachHandleDrag(handle) {
+    const anchorFromFixed = () => {
+      const pos = term.getSelectionPosition();
+      if (!pos) {
+        return null;
+      }
+      const cell = terminalCellSize();
+      const screen = terminalScreenEl();
+      if (!screen) {
+        return null;
+      }
+      const screenRect = screen.getBoundingClientRect();
+      const ydisp = term.buffer.active.viewportY;
+      const side = handle.dataset.handle;
+      // Dragging "start" pivots on the last selected cell; "end" on the first.
+      const col = side === "start" ? Math.max(0, pos.end.x - 1) : pos.start.x;
+      const row = side === "start" ? pos.end.y : pos.start.y;
+      return {
+        clientX: screenRect.left + (col + 0.5) * cell.width,
+        clientY: screenRect.top + (row - ydisp + 0.5) * cell.height,
+      };
+    };
+    handle.addEventListener(
+      "touchstart",
+      (event) => {
+        if (event.touches.length !== 1) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        const anchor = anchorFromFixed();
+        if (!anchor) {
+          return;
+        }
+        termSel = { draggingHandle: handle.dataset.handle, anchor };
+        const touch = event.touches[0];
+        dispatchTerminalMouse("mousedown", anchor.clientX, anchor.clientY, 1);
+        dispatchTerminalMouse("mousemove", touch.clientX, touch.clientY, 1);
+        updateTerminalSelectionUI();
+      },
+      { passive: false },
+    );
+    handle.addEventListener(
+      "touchmove",
+      (event) => {
+        if (!termSel || !termSel.draggingHandle || event.touches.length !== 1) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        const touch = event.touches[0];
+        dispatchTerminalMouse("mousemove", touch.clientX, touch.clientY, 1);
+        updateTerminalSelectionUI();
+      },
+      { passive: false },
+    );
+    const finishHandleDrag = (event) => {
+      if (!termSel || !termSel.draggingHandle) {
+        return;
+      }
+      event.stopPropagation();
+      const touch = event.changedTouches && event.changedTouches[0];
+      const clientX = touch ? touch.clientX : termSel.anchor.clientX;
+      const clientY = touch ? touch.clientY : termSel.anchor.clientY;
+      dispatchTerminalMouse("mouseup", clientX, clientY, 1);
+      termSel = null;
+      updateTerminalSelectionUI();
+    };
+    handle.addEventListener("touchend", finishHandleDrag, { passive: false });
+    handle.addEventListener("touchcancel", finishHandleDrag, { passive: false });
+  }
+
+  // Select the word under a point (long-press fire or double-tap). Returns true
+  // when something was selected. mouseEventsCaptured() no longer blocks this —
+  // dispatchTerminalMouse() forces a local selection with Shift when needed.
+  // Select the whitespace-delimited word under a point using xterm's select()
+  // API directly. Unlike a synthetic mousedown, this never focuses xterm's
+  // hidden textarea, so it can't pop the on-screen keyboard.
+  function selectWordAt(clientX, clientY) {
+    const screen = terminalScreenEl();
+    if (!screen) {
+      return false;
+    }
+    const cell = terminalCellSize();
+    const rect = screen.getBoundingClientRect();
+    let col = Math.floor((clientX - rect.left) / cell.width);
+    const viewportRow = Math.floor((clientY - rect.top) / cell.height);
+    if (viewportRow < 0 || viewportRow >= term.rows) {
+      return false;
+    }
+    const buffer = term.buffer.active;
+    const absRow = viewportRow + buffer.viewportY;
+    const line = buffer.getLine(absRow);
+    if (!line) {
+      return false;
+    }
+    const text = line.translateToString(true); // trims trailing blanks
+    if (col < 0) {
+      col = 0;
+    }
+    if (col >= text.length || /\s/.test(text[col])) {
+      return false; // tapped past the content or on whitespace → no word
+    }
+    let start = col;
+    let end = col;
+    while (start > 0 && !/\s/.test(text[start - 1])) {
+      start -= 1;
+    }
+    while (end < text.length - 1 && !/\s/.test(text[end + 1])) {
+      end += 1;
+    }
+    term.select(start, absRow, end - start + 1);
+    if (!terminalSelectionText()) {
+      return false;
+    }
+    suppressNextTerminalClick = true;
+    hapticPulse();
+    updateTerminalSelectionUI();
+    return true;
+  }
+
+  // Arm the long-press timer on a fresh single-finger contact.
+  function beginTerminalSelectionPress(touch) {
+    cancelTerminalSelectionPress();
+    termSel = {
+      startX: touch.clientX,
+      startY: touch.clientY,
+      lastX: touch.clientX,
+      lastY: touch.clientY,
+      active: false,
+      draggingHandle: null,
+      timer: null,
+    };
+    termSel.timer = window.setTimeout(activateTerminalSelection, TERM_LONGPRESS_MS);
+  }
+
+  // Long-press fired: word-select under the finger and keep the drag open so a
+  // continued move extends the selection.
+  function activateTerminalSelection() {
+    if (!termSel || termSel.draggingHandle) {
+      return;
+    }
+    termSel.timer = null;
+    termSel.active = true;
+    touchScrollState = null; // this contact is a selection, not a scroll
+    cancelTouchInertia();
+    hapticPulse();
+    // Word-select under the finger as the anchor, keeping the drag "down" so a
+    // continued move extends the selection.
+    dispatchTerminalMouse("mousedown", termSel.startX, termSel.startY, 2);
+  }
+
+  function finishTerminalSelectionPress() {
+    if (!termSel || termSel.draggingHandle) {
+      return;
+    }
+    if (termSel.timer) {
+      window.clearTimeout(termSel.timer);
+    }
+    if (termSel.active) {
+      dispatchTerminalMouse("mouseup", termSel.lastX, termSel.lastY, 1);
+      suppressNextTerminalClick = true;
+      updateTerminalSelectionUI();
+    }
+    termSel = null;
+  }
+
+  function cancelTerminalSelectionPress() {
+    if (termSel && !termSel.draggingHandle) {
+      if (termSel.timer) {
+        window.clearTimeout(termSel.timer);
+      }
+      termSel = null;
+    }
+  }
+
   function persistActiveSession(sessionName) {
     if (!sessionName) {
       localStorage.removeItem(STORAGE_ACTIVE_SESSION_KEY);
@@ -1138,6 +1608,7 @@
           type: "terminal",
           key: terminalTabKey(name),
           name,
+          label: session.label || name,
           active: false,
           attached: session.attached,
           windows: session.windows,
@@ -2268,8 +2739,10 @@
         requireToken: true,
         tailscaleMode: false,
         allowedClients: [],
+        multiTenant: false,
       };
     }
+    syncLoginFields();
   }
 
   function activeTab() {
@@ -2829,10 +3302,31 @@
     const wheelTarget = terminalRoot;
 
     if (mobileComposerMode) {
+      // The keyboard is opened from touchend (see finishTouchScroll) so a
+      // double-tap can pre-empt it; the browser's synthesized click is just
+      // swallowed here and never opens the keyboard on its own.
       terminalRoot.addEventListener("click", () => {
-        openComposer(true);
+        suppressNextTerminalClick = false;
       });
     }
+
+    // Keep the selection handles glued to the text as the pane scrolls or
+    // re-renders, and tear the UI down if the selection is cleared elsewhere.
+    term.onRender(() => {
+      if (isSelectionUIVisible()) {
+        updateTerminalSelectionUI();
+      }
+    });
+    term.onSelectionChange(() => {
+      if (selectionUIBusy()) {
+        return;
+      }
+      if (!terminalSelectionText()) {
+        clearTerminalSelectionUI();
+      } else if (isSelectionUIVisible()) {
+        updateTerminalSelectionUI();
+      }
+    });
 
     wheelTarget.addEventListener(
       "wheel",
@@ -2860,9 +3354,13 @@
       "touchstart",
       (event) => {
         cancelTouchInertia();
+        // Any new contact pre-empts a pending keyboard open (a scroll, long-press
+        // or the second tap of a double-tap should all cancel it).
+        cancelPendingComposerOpen();
         if (event.touches.length >= 2) {
           // Second finger down: switch from scrolling to the gesture recognizer.
           touchScrollState = null;
+          cancelTerminalSelectionPress();
           gestureTouchStart(event);
           return;
         }
@@ -2870,14 +3368,45 @@
         gestureState = null;
         if (event.touches.length !== 1) {
           touchScrollState = null;
+          cancelTerminalSelectionPress();
+          return;
+        }
+        const touch = event.touches[0];
+        suppressComposerOpenThisTouch = false;
+        // A tap anywhere on the pane dismisses a lingering selection (and its
+        // handles) before it can start scrolling or a new long-press. Handle
+        // drags stopPropagation before reaching here, so they're unaffected.
+        if (isSelectionUIVisible()) {
+          dismissTerminalSelection();
+          suppressNextTerminalClick = true;
+          // This tap only dismissed the selection; it shouldn't also raise the
+          // keyboard on lift.
+          suppressComposerOpenThisTouch = true;
+        }
+        // Double-tap selects the word under the finger (the standard mobile
+        // gesture, alongside long-press).
+        const now = performance.now();
+        if (
+          now - lastTermTapAt < TERM_DOUBLETAP_MS &&
+          Math.hypot(touch.clientX - lastTermTapX, touch.clientY - lastTermTapY) <
+            TERM_DOUBLETAP_DIST
+        ) {
+          lastTermTapAt = 0;
+          termSel = { doubleTap: true };
+          touchScrollState = null;
+          // selectWordAt() uses term.select() (no synthetic mouse event), so it
+          // never focuses xterm's textarea and can run synchronously without
+          // popping the keyboard.
+          selectWordAt(touch.clientX, touch.clientY);
           return;
         }
         touchScrollState = {
-          lastY: event.touches[0].clientY,
+          lastY: touch.clientY,
           lastAt: performance.now(),
           velocity: 0,
           lastMoveAt: 0,
         };
+        beginTerminalSelectionPress(touch);
       },
       { passive: true },
     );
@@ -2888,6 +3417,30 @@
         if (gestureState) {
           gestureTouchMove(event);
           return;
+        }
+        if (
+          event.touches.length === 1 &&
+          termSel &&
+          !termSel.draggingHandle &&
+          !termSel.doubleTap
+        ) {
+          const touch = event.touches[0];
+          if (termSel.active) {
+            // Long-press engaged: drag extends the selection, never scrolls.
+            termSel.lastX = touch.clientX;
+            termSel.lastY = touch.clientY;
+            event.preventDefault();
+            dispatchTerminalMouse("mousemove", touch.clientX, touch.clientY, 1);
+            return;
+          }
+          if (
+            termSel.timer &&
+            Math.hypot(touch.clientX - termSel.startX, touch.clientY - termSel.startY) >
+              TERM_LONGPRESS_SLOP
+          ) {
+            // Finger traveled before the hold completed — treat it as a scroll.
+            cancelTerminalSelectionPress();
+          }
         }
         if (!touchScrollState || event.touches.length !== 1) {
           return;
@@ -2918,19 +3471,48 @@
         // don't fall back into a scroll or inertia fling.
         gestureTouchEnd(event);
         touchScrollState = null;
+        cancelTerminalSelectionPress();
         return;
       }
+      // A completed double-tap selection needs no scroll/inertia handling.
+      if (termSel && termSel.doubleTap) {
+        termSel = null;
+        touchScrollState = null;
+        return;
+      }
+      // Did this contact engage a long-press selection? (Set before finishing.)
+      const wasLongPressSelection = !!(termSel && termSel.active);
+      // Finalize a long-press selection (no-op for a quick tap or a scroll).
+      finishTerminalSelectionPress();
+      // Remember this lift as a candidate first tap of a double-tap.
+      const tapTouch = event.changedTouches && event.changedTouches[0];
+      if (tapTouch) {
+        lastTermTapAt = performance.now();
+        lastTermTapX = tapTouch.clientX;
+        lastTermTapY = tapTouch.clientY;
+      }
+      const scrolled = !!(touchScrollState && touchScrollState.lastMoveAt);
+      // A plain tap (no scroll, no long-press selection) opens the keyboard — but
+      // only after the double-tap window, so a following second tap (which
+      // selects a word) can cancel it via cancelPendingComposerOpen() on its
+      // touchstart. Driving this from touchend (not click) keeps the ordering
+      // reliable: touchend of tap 1 always precedes touchstart of tap 2.
       if (
-        touchScrollState &&
-        touchScrollState.lastMoveAt &&
-        performance.now() - touchScrollState.lastMoveAt < 80
+        mobileComposerMode &&
+        !wasLongPressSelection &&
+        !scrolled &&
+        !suppressComposerOpenThisTouch
       ) {
+        scheduleComposerOpen();
+      }
+      if (scrolled && performance.now() - touchScrollState.lastMoveAt < 80) {
         startTouchInertia(touchScrollState.velocity);
       }
       touchScrollState = null;
     };
     const cancelTouchScroll = () => {
       touchScrollState = null;
+      cancelTerminalSelectionPress();
       gestureState = null;
       if (gestureTap && gestureTap.timer) {
         window.clearTimeout(gestureTap.timer);
@@ -3267,8 +3849,8 @@
       button.textContent = tab.type === "editor"
         ? `Files: ${tab.name || "root"}`
         : btopPill
-          ? btopTabLabel(tab.name)
-          : tab.name || "session";
+          ? tab.label || btopTabLabel(tab.name)
+          : tab.label || tab.name || "session";
       button.addEventListener("click", () => {
         if (Date.now() < suppressTabClickUntil) {
           return;
@@ -4213,9 +4795,13 @@
 
   function connect() {
     const token = localStorage.getItem(STORAGE_TOKEN_KEY);
-    if (serverConfig.requireToken && !token) {
+    currentUser = localStorage.getItem(STORAGE_USER_KEY) || "";
+    const needsToken = serverConfig.requireToken && !token;
+    const needsUser = serverConfig.multiTenant && !currentUser;
+    if (needsToken || needsUser) {
+      syncLoginFields();
       loginOverlay.classList.remove("hidden");
-      tokenInput.focus();
+      (needsUser && userInput ? userInput : tokenInput).focus();
       scheduleAuthConfigPolling();
       return;
     }
@@ -4227,7 +4813,14 @@
     socket.binaryType = "arraybuffer";
 
     socket.addEventListener("open", () => {
-      socket.send(JSON.stringify({ type: "auth", token: token || "" }));
+      socket.send(
+        JSON.stringify({
+          type: "auth",
+          user: currentUser,
+          token: token || "",
+          deviceId: getDeviceId(),
+        }),
+      );
     });
 
     socket.addEventListener("message", async (event) => {
@@ -4283,6 +4876,31 @@
       resetComposerRevisionState();
       resetSemanticPromptState();
       resetTerminalBufferSyncState();
+      if (payload.multiTenant) {
+        currentUser = payload.user || currentUser;
+        currentUserLabel = payload.userLabel || currentUser;
+        if (currentUser) {
+          localStorage.setItem(STORAGE_USER_KEY, currentUser);
+          // If a different user is now signed in on this browser, drop the
+          // previous user's cached prefs + tab state so they don't bleed across
+          // users. The per-user host settings message (sent right after this
+          // ready) then repopulates this user's own settings.
+          if (localStorage.getItem(STORAGE_SETTINGS_OWNER_KEY) !== currentUser) {
+            [
+              STORAGE_UI_SCALE_KEY,
+              STORAGE_TERMINAL_FONT_KEY,
+              STORAGE_SHORTCUTS_KEY,
+              STORAGE_GESTURES_KEY,
+              STORAGE_BTOP_ZOOM_KEY,
+              STORAGE_ACTIVE_SESSION_KEY,
+              STORAGE_OPEN_TABS_KEY,
+              STORAGE_EDITOR_TABS_KEY,
+            ].forEach((key) => localStorage.removeItem(key));
+            localStorage.setItem(STORAGE_SETTINGS_OWNER_KEY, currentUser);
+          }
+        }
+      }
+      updateUserBadge();
       activeSessionName = payload.session || "";
       selectedSessionName = activeSessionName;
       const keepEditorActive = activeEditorTab() !== null;
@@ -4398,13 +5016,22 @@
         gestureBindings = normalizeGestureBindings(nextSettings.gestures);
         localStorage.setItem(STORAGE_GESTURES_KEY, JSON.stringify(gestureBindings));
       }
-      if (Number.isFinite(Number(nextSettings.uiScale))) {
+      // Display zoom is per-device ("this device wins"). Only adopt the host's
+      // values when this device has never chosen its own — the host acts as the
+      // default for a fresh device. Once the user sets zoom locally (slider or
+      // pinch), that local override is authoritative, so a focus/reconnect
+      // settings push must not snap it back. Deliberately do NOT persist the
+      // adopted host value into localStorage here: that would freeze this device
+      // onto the host default and defeat the "no local override -> track host"
+      // behaviour (and was the source of the zoom-out-on-reconnect bug).
+      if (localStorage.getItem(STORAGE_UI_SCALE_KEY) === null && Number.isFinite(Number(nextSettings.uiScale))) {
         applyUiScale(Number(nextSettings.uiScale), false);
-        localStorage.setItem(STORAGE_UI_SCALE_KEY, String(uiScale));
       }
-      if (Number.isFinite(Number(nextSettings.terminalFontSize))) {
+      if (
+        localStorage.getItem(STORAGE_TERMINAL_FONT_KEY) === null &&
+        Number.isFinite(Number(nextSettings.terminalFontSize))
+      ) {
         applyTerminalFontSize(Number(nextSettings.terminalFontSize), false);
-        localStorage.setItem(STORAGE_TERMINAL_FONT_KEY, String(terminalFontSize));
       }
       fileBookmarks = normalizeFileBookmarks(nextSettings.fileBookmarks);
       if (!fileRootOverlay.classList.contains("hidden")) {
@@ -4456,6 +5083,19 @@
     }
     if (payload.type === "auth-error") {
       loginMessage.textContent = payload.message || "Authentication failed.";
+      return;
+    }
+    if (payload.type === "devices") {
+      renderDeviceList(payload.devices || []);
+      return;
+    }
+    if (payload.type === "token-rotated") {
+      if (payload.token) {
+        localStorage.setItem(STORAGE_TOKEN_KEY, payload.token);
+      }
+      showToast("Token rotated. Other devices have been signed out.");
+      sendMessage({ type: "request-devices" });
+      return;
     }
   }
 
@@ -4988,6 +5628,9 @@
     }
     if (persist) {
       localStorage.setItem(STORAGE_UI_SCALE_KEY, String(uiScale));
+      // Write through to the host so the stored default tracks the latest choice
+      // (and so the next focus/reconnect push carries this value, not a stale one).
+      saveHostSettings();
     }
     scheduleLayoutRefresh();
   }
@@ -5001,6 +5644,9 @@
     }
     if (persist) {
       localStorage.setItem(STORAGE_TERMINAL_FONT_KEY, String(terminalFontSize));
+      // Write through to the host (see applyUiScale) so pinch/{FONT+}/{FONT-}
+      // changes survive a reconnect instead of being reverted to a stale value.
+      saveHostSettings();
     }
     scheduleLayoutRefresh();
   }
@@ -5641,14 +6287,119 @@
   loginForm.addEventListener("submit", (event) => {
     event.preventDefault();
     const token = tokenInput.value.trim();
-    if (!token) {
+    const userName = userInput ? userInput.value.trim() : "";
+    if (serverConfig.multiTenant && !userName) {
+      loginMessage.textContent = "Enter your username first.";
+      return;
+    }
+    if (serverConfig.requireToken && !token) {
       loginMessage.textContent = "Enter the access token first.";
       return;
     }
-    localStorage.setItem(STORAGE_TOKEN_KEY, token);
+    if (serverConfig.multiTenant) {
+      currentUser = userName;
+      localStorage.setItem(STORAGE_USER_KEY, userName);
+    }
+    if (token) {
+      localStorage.setItem(STORAGE_TOKEN_KEY, token);
+    }
     loginMessage.textContent = "";
     connect();
   });
+
+  // Show/prefill the username field only when the host is multi-tenant.
+  function syncLoginFields() {
+    if (userField) {
+      userField.classList.toggle("hidden", !serverConfig.multiTenant);
+    }
+    if (userInput && serverConfig.multiTenant && !userInput.value) {
+      userInput.value = currentUser;
+    }
+  }
+
+  function signOut() {
+    localStorage.removeItem(STORAGE_TOKEN_KEY);
+    if (serverConfig.multiTenant) {
+      localStorage.removeItem(STORAGE_USER_KEY);
+      currentUser = "";
+    }
+    if (socket) {
+      reconnectForSessionSwitch = false;
+      try {
+        socket.close();
+      } catch (_error) {
+        // ignore
+      }
+    }
+    syncLoginFields();
+    loginOverlay.classList.remove("hidden");
+    loginMessage.textContent = "";
+    (serverConfig.multiTenant && userInput ? userInput : tokenInput).focus();
+  }
+
+  function updateUserBadge() {
+    if (accountButton) {
+      accountButton.classList.toggle("hidden", !serverConfig.multiTenant);
+    }
+    if (accountUserLabel) {
+      accountUserLabel.textContent = `Signed in as ${currentUserLabel || currentUser || "user"}`;
+    }
+  }
+
+  function renderDeviceList(devices) {
+    if (!deviceList) {
+      return;
+    }
+    deviceList.innerHTML = "";
+    if (!Array.isArray(devices) || !devices.length) {
+      const empty = document.createElement("div");
+      empty.className = "menu-empty";
+      empty.textContent = "No devices recorded yet.";
+      deviceList.appendChild(empty);
+      return;
+    }
+    const thisId = getDeviceId();
+    devices.forEach((device) => {
+      const row = document.createElement("div");
+      row.className = "file-bookmark-item";
+      const isThis = Boolean(device.id) && typeof thisId === "string" && thisId.startsWith(device.id);
+      const seen = (device.lastSeen || "").replace("T", " ");
+      row.textContent = `${device.label || "device"}${isThis ? " (this device)" : ""} · ${seen}`;
+      deviceList.appendChild(row);
+    });
+  }
+
+  function openAccount() {
+    closeSettingsMenu();
+    updateUserBadge();
+    renderDeviceList([]);
+    sendMessage({ type: "request-devices" });
+    accountOverlay.classList.remove("hidden");
+  }
+
+  function closeAccount() {
+    accountOverlay.classList.add("hidden");
+  }
+
+  if (accountButton) {
+    accountButton.addEventListener("click", openAccount);
+  }
+  if (closeAccountButton) {
+    closeAccountButton.addEventListener("click", closeAccount);
+  }
+  if (signOutButton) {
+    signOutButton.addEventListener("click", () => {
+      closeAccount();
+      signOut();
+    });
+  }
+  if (rotateTokenButton) {
+    rotateTokenButton.addEventListener("click", () => {
+      if (window.confirm("Rotate the token? This signs out every device for this user.")) {
+        sendMessage({ type: "rotate-token" });
+      }
+    });
+  }
 
   document.getElementById("newTabButton").addEventListener("click", () => {
     closeTabMenu();
@@ -6127,6 +6878,7 @@
   renderShortcutBar();
   applyUiScale(uiScale, false);
   applyTerminalFontSize(terminalFontSize, false);
+  guardTerminalHelperTextarea();
   installTerminalScrollHandlers();
   installTabStripScrollHandlers();
   installShortcutBarScrollHandlers();

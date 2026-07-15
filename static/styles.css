@@ -308,6 +308,91 @@ h2 {
 #terminal {
   height: 100%;
   padding: 0;
+  position: relative;
+}
+
+/* Touch text selection: xterm renders with user-select:none, so the browser's
+   native selection handles never appear. We draw our own draggable handles and
+   a copy chip over the pane and drive xterm's own selection underneath. */
+.term-select-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+  display: none;
+}
+
+.term-select-handle {
+  position: absolute;
+  width: 2px;
+  margin-left: -1px;
+  z-index: 31;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.term-select-handle::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: 1px;
+  background: #ffd166;
+  box-shadow: 0 0 4px rgba(255, 209, 102, 0.6);
+}
+
+.term-select-knob {
+  position: absolute;
+  left: 50%;
+  width: 30px;
+  height: 30px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.term-select-knob::after {
+  content: "";
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #ffd166;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.55);
+}
+
+.term-select-handle-start .term-select-knob {
+  top: -30px;
+}
+
+.term-select-handle-end .term-select-knob {
+  bottom: -30px;
+}
+
+.term-select-copy {
+  position: absolute;
+  z-index: 32;
+  pointer-events: auto;
+  transform: translate(-50%, -100%);
+  margin: 0;
+  padding: 7px 16px;
+  border: 1px solid rgba(255, 209, 102, 0.5);
+  border-radius: 9px;
+  background: #16242e;
+  color: #e6edf3;
+  font: 600 13px/1 var(--app-font, inherit);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
+  white-space: nowrap;
+}
+
+.term-select-copy.is-below {
+  transform: translate(-50%, 0);
+}
+
+.term-select-copy:active {
+  background: #22394a;
 }
 
 #terminal .xterm {
@@ -1381,12 +1466,14 @@ code {
   min-height: max(48px, var(--button-min-height));
 }
 
-#settingsMenu {
+#settingsMenu,
+#auxMenu {
   min-width: 196px;
 }
 
 @media (max-width: 720px) {
-  #settingsMenu {
+  #settingsMenu,
+  #auxMenu {
     left: var(--page-pad-x) !important;
     right: var(--page-pad-x);
     top: calc(env(safe-area-inset-top) + var(--button-min-height) + (var(--page-pad-y) * 2)) !important;
@@ -1395,7 +1482,8 @@ code {
     max-width: none;
   }
 
-  #settingsMenu .tab-menu-button {
+  #settingsMenu .tab-menu-button,
+  #auxMenu .tab-menu-button {
     font-size: max(16px, var(--body-font));
   }
 

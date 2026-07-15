@@ -4,6 +4,7 @@ import asyncio
 import base64
 import datetime
 import fcntl
+import gzip
 import hmac
 import ipaddress
 import json
@@ -297,6 +298,12 @@ def current_path(session_name: str, fallback: str) -> str:
     )
     path = result.stdout.strip()
     return path or fallback
+
+
+# Lines of scrollback sent on connect. Kept small for a fast first paint —
+# scrolling up past this still reaches the full tmux history via the copy-mode
+# scroll path, so nothing is lost; only the initial payload shrinks.
+CONNECT_HISTORY_LINES = 500
 
 
 def capture_history(session_name: str, lines: int = 2000) -> str:
@@ -827,6 +834,152 @@ def save_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+# ---------------------------------------------------------------------------
+# Multi-tenancy (optional)
+#
+# When mobile-terminal-users.json exists, the server runs multi-tenant: each
+# user has a shared token, their own set of tmux sessions (tabs), their own
+# settings, and a device registry. Tenancy is enforced only in-app under the one
+# OS account — it is an organizational boundary, not a security boundary (every
+# tab is a real shell as this user). Absent the file, the server is single-tenant
+# exactly as before.
+# ---------------------------------------------------------------------------
+
+USERS_PATH = Path(os.environ.get("MOBILE_TERMINAL_USERS", str(ROOT / "mobile-terminal-users.json")))
+STATE_ROOT = ROOT / "state" / "users"
+USER_NAME_RE = re.compile(r"[^a-z0-9_-]+")
+# New per-user sessions are named "mt_<user>__<n>" so they're globally unique
+# under the one tmux server and cheaply attributable to a tenant.
+USER_SESSION_SEP = "__"
+
+
+def sanitize_user(name: Any) -> str:
+    return USER_NAME_RE.sub("-", str(name).strip().lower())[:32]
+
+
+def device_label(user_agent: str) -> str:
+    ua = (user_agent or "").lower()
+    for needle, label in (
+        ("iphone", "iPhone"),
+        ("ipad", "iPad"),
+        ("android", "Android"),
+        ("macintosh", "Mac"),
+        ("mac os", "Mac"),
+        ("windows", "Windows"),
+        ("cros", "ChromeOS"),
+        ("linux", "Linux"),
+    ):
+        if needle in ua:
+            return label
+    return "device"
+
+
+def load_users_config() -> dict[str, Any] | None:
+    """Parse mobile-terminal-users.json → {owner, users:{name:{token,label}}} or None."""
+    if not USERS_PATH.is_file():
+        return None
+    try:
+        raw = json.loads(USERS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    raw_users = raw.get("users") if isinstance(raw, dict) else None
+    if not isinstance(raw_users, dict) or not raw_users:
+        return None
+    users: dict[str, dict[str, Any]] = {}
+    for name, value in raw_users.items():
+        user = sanitize_user(name)
+        if not user or not isinstance(value, dict):
+            continue
+        token = str(value.get("token", "")).strip()
+        if not token:
+            continue
+        users[user] = {"token": token, "label": (str(value.get("label", name)).strip() or user)}
+    if not users:
+        return None
+    owner = sanitize_user(raw.get("owner", "")) if isinstance(raw, dict) else ""
+    if owner not in users:
+        owner = next(iter(users))
+    return {"owner": owner, "users": users}
+
+
+def persist_users_config(users: dict[str, dict[str, Any]], owner: str) -> None:
+    payload = {
+        "owner": owner,
+        "users": {name: {"token": meta["token"], "label": meta.get("label", name)} for name, meta in users.items()},
+    }
+    USERS_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def user_dir(user: str) -> Path:
+    return STATE_ROOT / sanitize_user(user)
+
+
+def user_settings_path(user: str) -> Path:
+    return user_dir(user) / "settings.json"
+
+
+def load_user_settings(user: str) -> dict[str, Any]:
+    path = user_settings_path(user)
+    if not path.is_file():
+        return default_settings()
+    try:
+        return normalize_settings(json.loads(path.read_text()))
+    except (OSError, json.JSONDecodeError):
+        return default_settings()
+
+
+def save_user_settings(user: str, settings: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_settings(settings)
+    path = user_settings_path(user)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(normalized, indent=2) + "\n")
+    return normalized
+
+
+def user_state_path(user: str) -> Path:
+    return user_dir(user) / "sessions.json"
+
+
+def load_user_state(user: str) -> dict[str, Any]:
+    """Per-user owned-session map + device registry: {owned:{name:{label}}, devices:{id:{...}}}."""
+    state: dict[str, Any] = {"owned": {}, "devices": {}}
+    path = user_state_path(user)
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text())
+            if isinstance(raw, dict):
+                if isinstance(raw.get("owned"), dict):
+                    state["owned"] = raw["owned"]
+                if isinstance(raw.get("devices"), dict):
+                    state["devices"] = raw["devices"]
+        except (OSError, json.JSONDecodeError):
+            pass
+    return state
+
+
+def save_user_state(user: str, state: dict[str, Any]) -> None:
+    path = user_state_path(user)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def migrate_to_multitenant(owner: str) -> None:
+    """One-time seeding: owner inherits the global settings file and every
+    tmux session currently running, so the machine owner keeps their setup."""
+    owner_dir = user_dir(owner)
+    owner_dir.mkdir(parents=True, exist_ok=True)
+    settings_dest = user_settings_path(owner)
+    if not settings_dest.is_file() and SETTINGS_PATH.is_file():
+        try:
+            save_user_settings(owner, json.loads(SETTINGS_PATH.read_text()))
+        except (OSError, json.JSONDecodeError):
+            pass
+    state_dest = user_state_path(owner)
+    if not state_dest.is_file():
+        owned = {session["name"]: {"label": session["name"]} for session in list_sessions()}
+        save_user_state(owner, {"owned": owned, "devices": {}})
+
+
 def empty_usage_bucket() -> dict[str, int]:
     return {field: 0 for field in USAGE_DAY_FIELDS}
 
@@ -1160,23 +1313,125 @@ def safe_join(path: str) -> tuple[Path | None, str | None]:
     return candidate, content_type
 
 
-def http_response(status: int, body: bytes, content_type: str) -> Response:
-    headers = Headers(
-        {
-            "Content-Type": content_type,
-            "Content-Length": str(len(body)),
-            "Cache-Control": "no-cache",
-        }
-    )
+# Add-to-home-screen icon: a terminal window with the machine's label baked in
+# (e.g. "ph", "lat"), so each deployment's home-screen icon is distinguishable.
+# Rendered on demand with Pillow and cached per (label, size).
+_APP_ICON_CACHE: dict[tuple[str, int], bytes] = {}
+_ICON_FONTS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+)
+
+
+def render_app_icon(label: str, size: int) -> bytes:
+    key = (label, size)
+    cached = _APP_ICON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    bg = (11, 18, 27)
+    prompt_color = (255, 183, 3)
+    text_color = (130, 207, 255)
+    img = Image.new("RGB", (size, size), bg)
+    draw = ImageDraw.Draw(img)
+
+    def load_font(px: int) -> Any:
+        for path in _ICON_FONTS:
+            try:
+                return ImageFont.truetype(path, px)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    # Title-bar traffic-light dots.
+    dot_r = max(3, int(size * 0.03))
+    dot_y = int(size * 0.2)
+    for i, color in enumerate([(255, 95, 86), (255, 189, 46), (39, 201, 63)]):
+        cx = int(size * 0.16) + i * int(size * 0.1)
+        draw.ellipse([cx - dot_r, dot_y - dot_r, cx + dot_r, dot_y + dot_r], fill=color)
+
+    # ">_" prompt above the label.
+    prompt_font = load_font(int(size * 0.17))
+    draw.text((int(size * 0.15), int(size * 0.31)), ">_", font=prompt_font, fill=prompt_color)
+
+    # Label, shrunk to fit the width.
+    text = label or "term"
+    max_w = int(size * 0.6)
+    font_px = int(size * 0.38)
+    while font_px > 10:
+        font = load_font(font_px)
+        if draw.textlength(text, font=font) <= max_w:
+            break
+        font_px -= 2
+    font = load_font(font_px)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    tx = (size - tw) / 2 - bbox[0]
+    ty = int(size * 0.5) - bbox[1]
+    draw.text((tx, ty), text, font=font, fill=text_color)
+
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    data = buf.getvalue()
+    _APP_ICON_CACHE[key] = data
+    return data
+
+
+def http_response(
+    status: int, body: bytes, content_type: str, extra_headers: dict[str, str] | None = None
+) -> Response:
+    fields = {
+        "Content-Type": content_type,
+        "Content-Length": str(len(body)),
+        "Cache-Control": "no-cache",
+    }
+    if extra_headers:
+        fields.update(extra_headers)
     reason = {
         200: "OK",
+        304: "Not Modified",
         403: "Forbidden",
         401: "Unauthorized",
         404: "Not Found",
         405: "Method Not Allowed",
         500: "Internal Server Error",
     }.get(status, "OK")
-    return Response(status, reason, headers, body)
+    return Response(status, reason, Headers(fields), body)
+
+
+_COMPRESSIBLE = ("text/", "application/javascript", "application/json", "application/manifest", "image/svg")
+
+
+def static_file_response(target: Path, content_type: str | None, request: Request) -> Response:
+    """Serve a static file with an ETag (so unchanged assets 304 with no body)
+    and gzip for text. Versioned /vendor/ assets are cached long + immutable;
+    everything else must revalidate via the ETag."""
+    ctype = content_type or "application/octet-stream"
+    try:
+        stat = target.stat()
+    except OSError:
+        return http_response(404, b"Not Found", "text/plain; charset=utf-8")
+    etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+    # Vendor assets (xterm) rarely change: cache a day, then revalidate via ETag.
+    # Everything else must revalidate every load (ETag -> 304 when unchanged).
+    is_vendor = urlsplit(request.path).path.startswith("/vendor/")
+    cache_control = "public, max-age=86400" if is_vendor else "no-cache"
+    if etag in request.headers.get("If-None-Match", ""):
+        return http_response(304, b"", ctype, {"ETag": etag, "Cache-Control": cache_control})
+    if request.headers.get(":method") == "HEAD":
+        return http_response(200, b"", ctype, {"ETag": etag, "Cache-Control": cache_control})
+    body = target.read_bytes()
+    extra = {"ETag": etag, "Cache-Control": cache_control}
+    accepts_gzip = "gzip" in request.headers.get("Accept-Encoding", "")
+    if accepts_gzip and len(body) > 1024 and ctype.startswith(_COMPRESSIBLE):
+        body = gzip.compress(body, 6)
+        extra["Content-Encoding"] = "gzip"
+        extra["Vary"] = "Accept-Encoding"
+    return http_response(200, body, ctype, extra)
 
 
 async def process_request(connection: ServerConnection, request: Request) -> Response | None:
@@ -1194,9 +1449,7 @@ async def process_request(connection: ServerConnection, request: Request) -> Res
     target, content_type = safe_join(path)
     if not target or not target.is_file():
         return http_response(404, b"Not Found", "text/plain; charset=utf-8")
-
-    body = b"" if request.headers.get(":method") == "HEAD" else target.read_bytes()
-    return http_response(200, body, content_type or "application/octet-stream")
+    return static_file_response(target, content_type, request)
 
 
 class TmuxBridge:
@@ -1293,9 +1546,12 @@ class AppServer:
         require_token: bool,
         allowed_clients: list[str],
         tailscale_mode: bool,
+        users_config: dict[str, Any] | None = None,
+        label: str = "term",
     ) -> None:
         self.host = host
         self.port = port
+        self.label = (label or "term").strip()[:12] or "term"
         self.session_name = session_name
         self.shell = shell
         self.cwd = cwd
@@ -1303,6 +1559,11 @@ class AppServer:
         self.require_token = require_token
         self.allowed_clients = allowed_clients
         self.tailscale_mode = tailscale_mode
+        self.multi_tenant = users_config is not None
+        self.users: dict[str, dict[str, Any]] = (users_config or {}).get("users", {})
+        self.owner = (users_config or {}).get("owner", "")
+        if self.multi_tenant:
+            migrate_to_multitenant(self.owner)
         self.settings = load_settings()
         self.mobile_composer_states: dict[str, dict[str, Any]] = {}
         self.usage = load_usage()
@@ -1381,6 +1642,159 @@ class AppServer:
             return False
         return self.client_is_allowed(remote_address_value)
 
+    def token_required_for(self, trusted_client: bool) -> bool:
+        """Whether the client must supply a token. In single-tenant mode an
+        allow-listed (trusted) IP is token-exempt for convenience. In
+        multi-tenant mode the per-user token is always required (the IP
+        allow-list is only a network gate) so users are genuinely authenticated."""
+        if not self.require_token:
+            return False
+        if self.multi_tenant:
+            return True
+        return not trusted_client
+
+    # --- multi-tenancy: scoping, settings, ownership, devices ---------------
+
+    def owned_names(self, user: str) -> set[str]:
+        return set(load_user_state(user)["owned"].keys())
+
+    def claimed_by_others(self, user: str) -> set[str]:
+        claimed: set[str] = set()
+        for other in self.users:
+            if other == user:
+                continue
+            claimed |= set(load_user_state(other)["owned"].keys())
+        return claimed
+
+    def visible_session_names(self, user: str) -> set[str]:
+        """Sessions a user may see/act on. Non-owner: only their owned set.
+        Owner: everything not claimed by another user (so ad-hoc tmux sessions
+        started outside the app still appear)."""
+        names = {session["name"] for session in list_sessions()}
+        if not self.multi_tenant:
+            return names
+        if user == self.owner:
+            return names - self.claimed_by_others(user)
+        return names & self.owned_names(user)
+
+    def tabs_for_user(self, user: str, active_session: str) -> list[dict[str, Any]]:
+        visible = self.visible_session_names(user)
+        owned = load_user_state(user)["owned"] if self.multi_tenant else {}
+        tabs: list[dict[str, Any]] = []
+        for session in list_sessions():
+            if session["name"] not in visible:
+                continue
+            meta = owned.get(session["name"])
+            label = meta.get("label") if isinstance(meta, dict) else None
+            tabs.append(
+                {
+                    "name": session["name"],
+                    "label": label or session["name"],
+                    "active": session["name"] == active_session,
+                    "attached": session["attached"],
+                    "windows": session["windows"],
+                }
+            )
+        return tabs
+
+    def sessions_for_user(self, user: str) -> list[dict[str, Any]]:
+        visible = self.visible_session_names(user)
+        owned = load_user_state(user)["owned"] if self.multi_tenant else {}
+        result: list[dict[str, Any]] = []
+        for session in list_sessions():
+            if session["name"] not in visible:
+                continue
+            meta = owned.get(session["name"])
+            label = meta.get("label") if isinstance(meta, dict) else None
+            result.append({**session, "label": label or session["name"]})
+        return result
+
+    def can_access(self, user: str, session_name: str) -> bool:
+        if not self.multi_tenant:
+            return True
+        return session_name in self.visible_session_names(user)
+
+    def claim_session(self, user: str, name: str, label: str) -> None:
+        if not self.multi_tenant:
+            return
+        state = load_user_state(user)
+        state["owned"][name] = {"label": label}
+        save_user_state(user, state)
+
+    def release_session(self, user: str, name: str) -> None:
+        if not self.multi_tenant:
+            return
+        state = load_user_state(user)
+        if name in state["owned"]:
+            del state["owned"][name]
+            save_user_state(user, state)
+
+    def create_user_session(self, user: str, cwd: str | None = None) -> str:
+        existing = {session["name"] for session in list_sessions()}
+        if self.multi_tenant:
+            base = f"mt_{sanitize_user(user)}{USER_SESSION_SEP}"
+            counter = 1
+            while f"{base}{counter}" in existing:
+                counter += 1
+            name = f"{base}{counter}"
+            label = str(counter)
+        else:
+            name = next_session_name(existing)
+            label = name
+        path = cwd or self.cwd
+        tmux_capture(
+            "new-session", "-d", "-s", name, "-n", "shell", "-c", path, f"{self.shell} -l", check=False
+        )
+        for option, value in (("status", "off"), ("mouse", "on")):
+            tmux_capture("set-option", "-t", name, option, value, check=False)
+        self.claim_session(user, name, label)
+        return name
+
+    def resolve_user_session(self, user: str, requested: str) -> tuple[str, bool]:
+        """Return (session_name, created). A user may only attach to a session in
+        their visible set; anything else falls back to an existing owned session
+        or a freshly created one."""
+        if requested and self.can_access(user, requested) and session_exists(requested):
+            return requested, False
+        if self.multi_tenant:
+            for name in load_user_state(user)["owned"]:
+                if session_exists(name):
+                    return name, False
+            return self.create_user_session(user), True
+        # Legacy single-tenant behaviour.
+        if session_exists(self.session_name):
+            return self.session_name, False
+        return next_session_name(), True
+
+    def settings_for(self, user: str) -> dict[str, Any]:
+        return load_user_settings(user) if self.multi_tenant else self.settings
+
+    def save_settings_for(self, user: str, raw: Any) -> dict[str, Any]:
+        if self.multi_tenant:
+            return save_user_settings(user, raw or {})
+        self.settings = save_settings(raw or {})
+        return self.settings
+
+    def settings_persisted(self, user: str) -> bool:
+        return user_settings_path(user).is_file() if self.multi_tenant else SETTINGS_PATH.is_file()
+
+    def device_remembered(self, user: str, device_id: str) -> bool:
+        if not device_id:
+            return False
+        return device_id in load_user_state(user).get("devices", {})
+
+    def register_device(self, user: str, device_id: str, label: str) -> None:
+        if not self.multi_tenant or not device_id:
+            return
+        state = load_user_state(user)
+        devices = state["devices"]
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        entry = devices.get(device_id) if isinstance(devices.get(device_id), dict) else {"firstSeen": now}
+        entry["label"] = (label or entry.get("label") or "device")[:60]
+        entry["lastSeen"] = now
+        devices[device_id] = entry
+        save_user_state(user, state)
+
     async def process_request(self, connection: ServerConnection, request: Request) -> Response | None:
         path = urlsplit(request.path).path
         if not self.client_is_allowed(connection.remote_address):
@@ -1388,9 +1802,11 @@ class AppServer:
         if path == "/config":
             trusted_client = self.client_is_trusted(connection.remote_address)
             payload = {
-                "requireToken": self.require_token and not trusted_client,
+                "requireToken": self.token_required_for(trusted_client),
                 "tailscaleMode": self.tailscale_mode,
                 "allowedClients": self.allowed_clients,
+                "multiTenant": self.multi_tenant,
+                "label": self.label,
                 "host": self.host,
                 "port": self.port,
             }
@@ -1399,7 +1815,39 @@ class AppServer:
         if path == "/stats":
             body = json.dumps(self.usage_payload()).encode("utf-8")
             return http_response(200, body, "application/json; charset=utf-8")
+        if path == "/manifest.webmanifest":
+            body = json.dumps(self.manifest()).encode("utf-8")
+            return http_response(200, body, "application/manifest+json; charset=utf-8")
+        if path.startswith("/app-icon"):
+            match = re.search(r"(\d{2,4})", path)
+            size = min(1024, max(48, int(match.group(1)))) if match else 180
+            try:
+                return http_response(200, render_app_icon(self.label, size), "image/png")
+            except Exception:
+                return http_response(404, b"", "text/plain; charset=utf-8")
+        # Serve index.html with the machine label injected so the home-screen
+        # name + title match this deployment (icon carries the label too).
+        if path in ("/", "/index.html"):
+            try:
+                html = (STATIC_ROOT / "index.html").read_text().replace("__MT_LABEL__", self.label)
+                return http_response(200, html.encode("utf-8"), "text/html; charset=utf-8")
+            except OSError:
+                return http_response(404, b"Not Found", "text/plain; charset=utf-8")
         return await process_request(connection, request)
+
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "name": f"{self.label} terminal",
+            "short_name": self.label,
+            "display": "standalone",
+            "background_color": "#0b121b",
+            "theme_color": "#0b121b",
+            "icons": [
+                {"src": "/app-icon-192.png?v=2", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+                {"src": "/app-icon-512.png?v=2", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+                {"src": "/app-icon-512.png?v=2", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            ],
+        }
 
     def usage_payload(self) -> dict[str, Any]:
         return {
@@ -1422,29 +1870,54 @@ class AppServer:
     async def send_stats(self, connection: ServerConnection) -> None:
         await self.send_json(connection, {"type": "stats", **self.usage_payload()})
 
-    async def send_tabs(self, connection: ServerConnection, session_name: str) -> list[dict[str, Any]]:
-        tabs = session_tabs(session_name)
+    async def send_tabs(
+        self, connection: ServerConnection, user: str, session_name: str
+    ) -> list[dict[str, Any]]:
+        tabs = self.tabs_for_user(user, session_name)
         await self.send_json(connection, {"type": "tabs", "tabs": tabs})
         return tabs
 
-    async def send_sessions(self, connection: ServerConnection, active_session: str) -> list[dict[str, Any]]:
-        sessions = list_sessions()
+    async def send_sessions(
+        self, connection: ServerConnection, user: str, active_session: str
+    ) -> list[dict[str, Any]]:
+        sessions = self.sessions_for_user(user)
         await self.send_json(
             connection,
             {"type": "sessions", "sessions": sessions, "activeSession": active_session},
         )
         return sessions
 
-    async def send_settings(self, connection: ServerConnection) -> dict[str, Any]:
+    async def send_settings(self, connection: ServerConnection, user: str) -> dict[str, Any]:
+        settings = self.settings_for(user)
         await self.send_json(
             connection,
             {
                 "type": "settings",
-                "settings": self.settings,
-                "persisted": SETTINGS_PATH.is_file(),
+                "settings": settings,
+                "persisted": self.settings_persisted(user),
             },
         )
-        return self.settings
+        return settings
+
+    async def send_devices(self, connection: ServerConnection, user: str) -> None:
+        devices: list[dict[str, Any]] = []
+        if self.multi_tenant:
+            for device_id, meta in load_user_state(user)["devices"].items():
+                if not isinstance(meta, dict):
+                    continue
+                devices.append(
+                    {
+                        "id": device_id[:8],
+                        "label": meta.get("label", ""),
+                        "firstSeen": meta.get("firstSeen", ""),
+                        "lastSeen": meta.get("lastSeen", ""),
+                    }
+                )
+        devices.sort(key=lambda entry: entry.get("lastSeen", ""), reverse=True)
+        await self.send_json(
+            connection,
+            {"type": "devices", "devices": devices, "multiTenant": self.multi_tenant},
+        )
 
     def mobile_composer_state(self, session_name: str) -> dict[str, Any]:
         state = self.mobile_composer_states.get(session_name)
@@ -1734,6 +2207,7 @@ class AppServer:
         payload: dict[str, Any],
     ) -> None:
         session_name = state["session"]
+        user = state.get("user", "")
         message_type = payload.get("type")
         try:
             revision = int(payload.get("revision", 0))
@@ -1844,15 +2318,35 @@ class AppServer:
             return
 
         if message_type == "request-tabs":
-            await self.send_tabs(connection, session_name)
+            await self.send_tabs(connection, user, session_name)
             return
 
         if message_type == "request-sessions":
-            await self.send_sessions(connection, session_name)
+            await self.send_sessions(connection, user, session_name)
             return
 
         if message_type == "request-settings":
-            await self.send_settings(connection)
+            await self.send_settings(connection, user)
+            return
+
+        if message_type == "request-devices":
+            await self.send_devices(connection, user)
+            return
+
+        if message_type == "rotate-token":
+            if not self.multi_tenant or user not in self.users:
+                await self.send_json(
+                    connection,
+                    {"type": "notice", "message": "Token rotation is unavailable."},
+                )
+                return
+            new_token = secrets.token_urlsafe(16)
+            self.users[user]["token"] = new_token
+            persist_users_config(self.users, self.owner)
+            cleared = load_user_state(user)
+            cleared["devices"] = {}
+            save_user_state(user, cleared)
+            await self.send_json(connection, {"type": "token-rotated", "token": new_token})
             return
 
         if message_type == "request-stats":
@@ -1860,8 +2354,8 @@ class AppServer:
             return
 
         if message_type == "save-settings":
-            self.settings = save_settings(payload.get("settings", {}))
-            await self.send_settings(connection)
+            self.save_settings_for(user, payload.get("settings", {}))
+            await self.send_settings(connection, user)
             return
 
         if message_type == "fs-default-root":
@@ -1989,24 +2483,9 @@ class AppServer:
             return
 
         if message_type == "new-tab":
-            path = current_path(session_name, self.cwd)
-            next_name = next_session_name()
-            tmux_capture(
-                "new-session",
-                "-d",
-                "-s",
-                next_name,
-                "-n",
-                "shell",
-                "-c",
-                path,
-                f"{self.shell} -l",
-                check=False,
-            )
-            for option, value in (("status", "off"), ("mouse", "on")):
-                tmux_capture("set-option", "-t", next_name, option, value, check=False)
-            await self.send_tabs(connection, session_name)
-            await self.send_sessions(connection, session_name)
+            next_name = self.create_user_session(user, current_path(session_name, self.cwd))
+            await self.send_tabs(connection, user, session_name)
+            await self.send_sessions(connection, user, session_name)
             await self.send_json(connection, {"type": "session-created", "session": next_name})
             return
 
@@ -2026,7 +2505,14 @@ class AppServer:
                     {"type": "notice", "message": f"Unknown btop target '{target}'."},
                 )
                 return
-            btop_session = f"{BTOP_SESSION_PREFIX}{target}"
+            # Namespace the btop session per user so tenants don't collide on or
+            # reuse each other's monitor tabs. The "btop-" prefix is preserved so
+            # the client still recognises it as a btop tab.
+            btop_session = (
+                f"{BTOP_SESSION_PREFIX}{sanitize_user(user)}{USER_SESSION_SEP}{target}"
+                if self.multi_tenant
+                else f"{BTOP_SESSION_PREFIX}{target}"
+            )
             # Reuse an existing btop tab for this target instead of stacking
             # duplicates; otherwise spawn a dedicated session running btop.
             if not session_exists(btop_session):
@@ -2045,8 +2531,9 @@ class AppServer:
                 )
                 for option, value in (("status", "off"), ("mouse", "on")):
                     tmux_capture("set-option", "-t", btop_session, option, value, check=False)
-            await self.send_tabs(connection, session_name)
-            await self.send_sessions(connection, session_name)
+            self.claim_session(user, btop_session, f"btop {target}")
+            await self.send_tabs(connection, user, session_name)
+            await self.send_sessions(connection, user, session_name)
             await self.send_json(
                 connection,
                 {
@@ -2061,6 +2548,24 @@ class AppServer:
         if message_type == "rename-tab":
             name = str(payload.get("name", "")).strip()[:40]
             target_name = str(payload.get("session", session_name)).strip() or session_name
+            if name and self.multi_tenant:
+                # Per-user tabs keep a namespaced tmux name; renaming only updates
+                # the stored display label, and only for a session the user owns.
+                if not self.can_access(user, target_name):
+                    await self.send_json(
+                        connection,
+                        {"type": "notice", "message": "You can only rename your own tabs."},
+                    )
+                    return
+                tenant_state = load_user_state(user)
+                meta = tenant_state["owned"].get(target_name)
+                meta = meta if isinstance(meta, dict) else {}
+                meta["label"] = name
+                tenant_state["owned"][target_name] = meta
+                save_user_state(user, tenant_state)
+                await self.send_tabs(connection, user, state["session"])
+                await self.send_sessions(connection, user, state["session"])
+                return
             if name:
                 if target_name != name and session_exists(name):
                     await self.send_json(
@@ -2081,8 +2586,8 @@ class AppServer:
                     connection,
                     {"type": "session-renamed", "oldSession": target_name, "session": name},
                 )
-                await self.send_tabs(connection, state["session"])
-                await self.send_sessions(connection, state["session"])
+                await self.send_tabs(connection, user, state["session"])
+                await self.send_sessions(connection, user, state["session"])
             return
 
         if message_type == "close-tab":
@@ -2097,19 +2602,31 @@ class AppServer:
 
         if message_type == "kill-session":
             target_name = str(payload.get("session", session_name)).strip() or session_name
+            if not self.can_access(user, target_name):
+                await self.send_json(
+                    connection,
+                    {"type": "notice", "message": "You can only close your own tabs."},
+                )
+                await self.send_tabs(connection, user, state["session"])
+                await self.send_sessions(connection, user, state["session"])
+                return
             sessions = list_sessions()
             if not any(session["name"] == target_name for session in sessions):
                 await self.send_json(
                     connection,
                     {"type": "notice", "message": f"Session '{target_name}' is not running."},
                 )
-                await self.send_tabs(connection, state["session"])
-                await self.send_sessions(connection, state["session"])
+                await self.send_tabs(connection, user, state["session"])
+                await self.send_sessions(connection, user, state["session"])
                 return
             if target_name == session_name:
-                remaining = [session["name"] for session in sessions if session["name"] != target_name]
-                remaining_names = {session["name"] for session in sessions if session["name"] != target_name}
-                fallback = remaining[0] if remaining else next_session_name(remaining_names)
+                visible = self.visible_session_names(user)
+                remaining = [
+                    session["name"]
+                    for session in sessions
+                    if session["name"] != target_name and session["name"] in visible
+                ]
+                fallback = remaining[0] if remaining else self.create_user_session(user)
                 await self.send_json(
                     connection,
                     {
@@ -2122,15 +2639,22 @@ class AppServer:
             self.mobile_composer_states.pop(target_name, None)
             self.terminal_sizes.pop(target_name, None)
             self.scroll_states.pop(target_name, None)
+            self.release_session(user, target_name)
             if target_name == session_name:
                 await connection.close(code=1012, reason="session killed")
                 return
-            await self.send_tabs(connection, session_name)
-            await self.send_sessions(connection, session_name)
+            await self.send_tabs(connection, user, session_name)
+            await self.send_sessions(connection, user, session_name)
             return
 
         if message_type == "detach-other-clients":
             target_name = str(payload.get("session", session_name)).strip() or session_name
+            if not self.can_access(user, target_name):
+                await self.send_json(
+                    connection,
+                    {"type": "notice", "message": "You can only manage your own tabs."},
+                )
+                return
             keep_pid = bridge.process.pid if target_name == session_name and bridge.process else None
             detached = detach_other_clients(target_name, keep_pid=keep_pid)
             if detached:
@@ -2149,8 +2673,8 @@ class AppServer:
                         "message": f"No other tmux clients were attached to {target_name}.",
                     },
                 )
-            await self.send_tabs(connection, session_name)
-            await self.send_sessions(connection, session_name)
+            await self.send_tabs(connection, user, session_name)
+            await self.send_sessions(connection, user, session_name)
             return
 
     async def websocket_handler(self, connection: ServerConnection) -> None:
@@ -2163,34 +2687,59 @@ class AppServer:
             return
 
         trusted_client = self.client_is_trusted(connection.remote_address)
-        if not trusted_client:
+        user = self.owner if self.multi_tenant else ""
+        device_id = ""
+        require_token_here = self.token_required_for(trusted_client)
+        # A user must always be identified in multi-tenant mode (even on a
+        # trusted, token-less network); the token is additionally required
+        # unless the client's IP is on the trusted allow-list.
+        if self.multi_tenant or require_token_here:
             try:
                 raw_auth = await asyncio.wait_for(connection.recv(), timeout=20)
             except TimeoutError:
                 await connection.close(code=4001, reason="auth timeout")
                 return
-
             if not isinstance(raw_auth, str):
                 await connection.close(code=4001, reason="auth required")
                 return
-
             try:
                 auth_payload = json.loads(raw_auth)
             except json.JSONDecodeError:
                 await connection.close(code=4001, reason="auth required")
                 return
-
-            token_ok = True
-            if self.require_token:
-                token_ok = self.token is not None and hmac.compare_digest(
-                    str(auth_payload.get("token", "")),
-                    self.token,
-                )
-
-            if auth_payload.get("type") != "auth" or not token_ok:
-                await self.send_json(connection, {"type": "auth-error", "message": "Invalid access token."})
+            if auth_payload.get("type") != "auth":
+                await self.send_json(connection, {"type": "auth-error", "message": "Authentication required."})
                 await connection.close(code=4001, reason="auth failed")
                 return
+            device_id = str(auth_payload.get("deviceId", ""))[:64]
+            if self.multi_tenant:
+                user = sanitize_user(auth_payload.get("user", ""))
+                user_meta = self.users.get(user)
+                # A device that has authenticated with the token once is
+                # remembered (its deviceId is in the user's registry), so it can
+                # reconnect without the token. The deviceId is a 122-bit random
+                # secret held only by that browser, so it acts as a persistent
+                # per-device credential (like a "remember this device" session).
+                remembered = user_meta is not None and self.device_remembered(user, device_id)
+                token_ok = user_meta is not None and (
+                    not require_token_here
+                    or remembered
+                    or hmac.compare_digest(str(auth_payload.get("token", "")), user_meta["token"])
+                )
+                message = "Invalid user or access token."
+            else:
+                token_ok = not require_token_here or (
+                    self.token is not None
+                    and hmac.compare_digest(str(auth_payload.get("token", "")), self.token)
+                )
+                message = "Invalid access token."
+            if not token_ok:
+                await self.send_json(connection, {"type": "auth-error", "message": message})
+                await connection.close(code=4001, reason="auth failed")
+                return
+
+        if self.multi_tenant:
+            self.register_device(user, device_id, device_label(connection.request.headers.get("User-Agent", "")))
 
         requested_session = parse_qs(request_url.query).get("session", [""])[0].strip()
         skip_history = parse_qs(request_url.query).get("skip_history", [""])[0].strip().lower() in (
@@ -2198,20 +2747,11 @@ class AppServer:
             "true",
             "yes",
         )
-        session_name = self.session_name
-        create_if_missing = True
-        requested_session_missing = False
-        if requested_session:
-            if session_exists(requested_session):
-                session_name = requested_session
-                create_if_missing = False
-            else:
-                requested_session_missing = True
-                session_name = next_session_name()
-        elif not session_exists(session_name):
-            session_name = next_session_name()
+        session_name, created = self.resolve_user_session(user, requested_session)
+        create_if_missing = created
+        requested_session_missing = bool(requested_session) and requested_session != session_name
 
-        state = {"session": session_name}
+        state = {"session": session_name, "user": user}
         bridge = TmuxBridge(
             session_name,
             self.shell,
@@ -2220,7 +2760,7 @@ class AppServer:
             initial_size=self.terminal_sizes.get(session_name),
         )
         bridge.open()
-        history = "" if skip_history else capture_history(state["session"])
+        history = "" if skip_history else capture_history(state["session"], CONNECT_HISTORY_LINES)
 
         session_summary: dict[str, int] = {
             "sessions": 1,
@@ -2245,7 +2785,7 @@ class AppServer:
         async def watch_tabs() -> None:
             previous = ""
             while True:
-                tabs = session_tabs(state["session"])
+                tabs = self.tabs_for_user(state["user"], state["session"])
                 snapshot = json.dumps(tabs, sort_keys=True)
                 if snapshot != previous:
                     previous = snapshot
@@ -2263,9 +2803,12 @@ class AppServer:
                     "session": state["session"],
                     "shell": self.shell,
                     "cwd": self.cwd,
-                    "requireToken": self.require_token and not trusted_client,
+                    "requireToken": self.token_required_for(trusted_client),
                     "tailscaleMode": self.tailscale_mode,
                     "allowedClients": self.allowed_clients,
+                    "multiTenant": self.multi_tenant,
+                    "user": user if self.multi_tenant else None,
+                    "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
                 },
             )
             if history:
@@ -2275,12 +2818,12 @@ class AppServer:
                     connection,
                     {
                         "type": "notice",
-                        "message": f"Session '{requested_session}' is not running. Attached to {session_name}.",
+                        "message": f"Session '{requested_session}' is not available. Attached to {session_name}.",
                     },
                 )
-            await self.send_tabs(connection, state["session"])
-            await self.send_sessions(connection, state["session"])
-            await self.send_settings(connection)
+            await self.send_tabs(connection, state["user"], state["session"])
+            await self.send_sessions(connection, state["user"], state["session"])
+            await self.send_settings(connection, state["user"])
             await self.send_composer_state(connection, state["session"])
 
             async for raw_message in connection:
@@ -2338,7 +2881,11 @@ class AppServer:
                 print("network mode: tailscale-only")
             if self.allowed_clients:
                 print(f"allowed clients: {', '.join(self.allowed_clients)}")
-            if self.require_token:
+            if self.multi_tenant:
+                print(f"multi-tenant: {len(self.users)} users (owner: {self.owner})")
+                print(f"users: {', '.join(sorted(self.users))}")
+                print(f"access token: {'per-user' if self.require_token else 'disabled'}")
+            elif self.require_token:
                 print(f"access token: {self.token}")
             else:
                 print("access token: disabled")
@@ -2355,6 +2902,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=os.environ.get("MOBILE_TERMINAL_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("MOBILE_TERMINAL_PORT", "8085")))
     parser.add_argument("--session", default=os.environ.get("MOBILE_TERMINAL_SESSION", "mobile-terminal"))
+    parser.add_argument(
+        "--label",
+        default=os.environ.get("MOBILE_TERMINAL_LABEL", ""),
+        help="Short machine label shown in the add-to-home-screen icon (e.g. 'ph', 'lat').",
+    )
     parser.add_argument("--cwd", default=os.environ.get("MOBILE_TERMINAL_CWD", str(Path.home())))
     parser.add_argument("--shell", default=os.environ.get("MOBILE_TERMINAL_SHELL", os.environ.get("SHELL", "/bin/bash")))
     parser.add_argument("--token", default=os.environ.get("MOBILE_TERMINAL_TOKEN"))
@@ -2391,6 +2943,10 @@ def main() -> None:
         raise SystemExit("--no-token requires --tailscale, --allow-client, or a loopback-only host")
     require_token = not args.no_token
     token = (args.token or secrets.token_urlsafe(16)) if require_token else None
+    users_config = load_users_config()
+    import socket
+
+    label = args.label.strip() or socket.gethostname().split(".")[0][:12] or "term"
     server = AppServer(
         host=args.host,
         port=args.port,
@@ -2401,6 +2957,8 @@ def main() -> None:
         require_token=require_token,
         allowed_clients=allowed_clients,
         tailscale_mode=args.tailscale,
+        users_config=users_config,
+        label=label,
     )
     try:
         asyncio.run(server.run())

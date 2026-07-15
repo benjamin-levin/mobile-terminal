@@ -1,0 +1,14 @@
+{
+  "//": "Copy to mobile-terminal-users.json to enable multi-tenancy. Each user has a shared token; devices log in with a username + that token. Tenancy is enforced only in-app under the one OS account -- it is an organizational boundary, not a security boundary (every tab is a real shell as this user). The 'owner' inherits the pre-existing tmux sessions and sees any session not claimed by another user. Point elsewhere with MOBILE_TERMINAL_USERS=/path/to/file.json. Delete the file to return to single-tenant mode.",
+  "owner": "ben",
+  "users": {
+    "ben": {
+      "token": "REPLACE_WITH_A_LONG_RANDOM_STRING_1",
+      "label": "Ben"
+    },
+    "guest": {
+      "token": "REPLACE_WITH_A_LONG_RANDOM_STRING_2",
+      "label": "Guest"
+    }
+  }
+}
