@@ -914,7 +914,13 @@ def load_users_config() -> dict[str, Any] | None:
         token = str(value.get("token", "")).strip()
         if not token:
             continue
-        users[user] = {"token": token, "label": (str(value.get("label", name)).strip() or user)}
+        users[user] = {
+            "token": token,
+            "label": (str(value.get("label", name)).strip() or user),
+            # Optional: the Tailscale identity (e.g. "alice@github") that maps to
+            # this user, for token-less auto-login behind `tailscale serve`.
+            "tailscaleLogin": str(value.get("tailscaleLogin", "")).strip().lower(),
+        }
     if not users:
         return None
     owner = sanitize_user(raw.get("owner", "")) if isinstance(raw, dict) else ""
@@ -926,7 +932,14 @@ def load_users_config() -> dict[str, Any] | None:
 def persist_users_config(users: dict[str, dict[str, Any]], owner: str) -> None:
     payload = {
         "owner": owner,
-        "users": {name: {"token": meta["token"], "label": meta.get("label", name)} for name, meta in users.items()},
+        "users": {
+            name: {
+                "token": meta["token"],
+                "label": meta.get("label", name),
+                **({"tailscaleLogin": meta["tailscaleLogin"]} if meta.get("tailscaleLogin") else {}),
+            }
+            for name, meta in users.items()
+        },
     }
     USERS_PATH.write_text(json.dumps(payload, indent=2) + "\n")
 
@@ -1674,6 +1687,30 @@ class AppServer:
             return False
         return host in self.allowed_clients
 
+    def proxy_login(self, connection: ServerConnection) -> str | None:
+        """The Tailscale identity that `tailscale serve` injected, but only when
+        the request actually came through the local proxy (loopback source). A
+        direct connection could forge the header, so it's ignored there."""
+        host = remote_ip(connection.remote_address)
+        if host not in ("127.0.0.1", "::1"):
+            return None
+        login = connection.request.headers.get("Tailscale-User-Login")
+        return login.strip().lower() if login else None
+
+    def auto_auth_user(self, connection: ServerConnection) -> str | None:
+        """Map the proxy-provided Tailscale identity to a user for token-less
+        login. Returns the username (multi-tenant), "" for the single implicit
+        user (single-tenant), or None when no auto-login applies."""
+        login = self.proxy_login(connection)
+        if not login:
+            return None
+        if not self.multi_tenant:
+            return ""  # single-tenant: any tailnet identity via serve skips the token
+        for name, meta in self.users.items():
+            if meta.get("tailscaleLogin") and meta["tailscaleLogin"] == login:
+                return name
+        return None
+
     def token_required_for(self, trusted_client: bool) -> bool:
         """Whether the client must supply a token. In single-tenant mode an
         allow-listed (trusted) IP is token-exempt for convenience. In
@@ -1833,11 +1870,16 @@ class AppServer:
             return http_response(403, b"Forbidden\n", "text/plain; charset=utf-8")
         if path == "/config":
             trusted_client = self.client_is_trusted(connection.remote_address)
+            # Auto-login by Tailscale identity behind `tailscale serve`: when the
+            # proxy identifies a mapped user, no token/username prompt is needed.
+            auto_user = self.auto_auth_user(connection)
+            auto = auto_user is not None
             payload = {
-                "requireToken": self.token_required_for(trusted_client),
+                "requireToken": self.token_required_for(trusted_client) and not auto,
                 "tailscaleMode": self.tailscale_mode,
                 "allowedClients": self.allowed_clients,
                 "multiTenant": self.multi_tenant,
+                "autoUser": (auto_user if self.multi_tenant else None) if auto else None,
                 "label": self.label,
                 "host": self.host,
                 "port": self.port,
@@ -2719,13 +2761,14 @@ class AppServer:
             return
 
         trusted_client = self.client_is_trusted(connection.remote_address)
+        # Token-less auto-login by Tailscale identity behind `tailscale serve`.
+        auto_user = self.auto_auth_user(connection)
         user = self.owner if self.multi_tenant else ""
         device_id = ""
-        require_token_here = self.token_required_for(trusted_client)
-        # A user must always be identified in multi-tenant mode (even on a
-        # trusted, token-less network); the token is additionally required
-        # unless the client's IP is on the trusted allow-list.
-        if self.multi_tenant or require_token_here:
+        require_token_here = self.token_required_for(trusted_client) and auto_user is None
+        # Read the client's auth frame when auth is needed, or (when the proxy
+        # identity already authed us) just to capture the deviceId.
+        if self.multi_tenant or require_token_here or auto_user is not None:
             try:
                 raw_auth = await asyncio.wait_for(connection.recv(), timeout=20)
             except TimeoutError:
@@ -2744,7 +2787,12 @@ class AppServer:
                 await connection.close(code=4001, reason="auth failed")
                 return
             device_id = str(auth_payload.get("deviceId", ""))[:64]
-            if self.multi_tenant:
+            if auto_user is not None:
+                # Authenticated by the Tailscale identity the serve proxy injected;
+                # the token is not consulted, and the identity is authoritative for
+                # the user (overrides any client-claimed username).
+                user = auto_user if self.multi_tenant else ""
+            elif self.multi_tenant:
                 user = sanitize_user(auth_payload.get("user", ""))
                 user_meta = self.users.get(user)
                 # A device that has authenticated with the token once is
@@ -2758,17 +2806,19 @@ class AppServer:
                     or remembered
                     or hmac.compare_digest(str(auth_payload.get("token", "")), user_meta["token"])
                 )
-                message = "Invalid user or access token."
+                if not token_ok:
+                    await self.send_json(connection, {"type": "auth-error", "message": "Invalid user or access token."})
+                    await connection.close(code=4001, reason="auth failed")
+                    return
             else:
                 token_ok = not require_token_here or (
                     self.token is not None
                     and hmac.compare_digest(str(auth_payload.get("token", "")), self.token)
                 )
-                message = "Invalid access token."
-            if not token_ok:
-                await self.send_json(connection, {"type": "auth-error", "message": message})
-                await connection.close(code=4001, reason="auth failed")
-                return
+                if not token_ok:
+                    await self.send_json(connection, {"type": "auth-error", "message": "Invalid access token."})
+                    await connection.close(code=4001, reason="auth failed")
+                    return
 
         if self.multi_tenant:
             self.register_device(user, device_id, device_label(connection.request.headers.get("User-Agent", "")))

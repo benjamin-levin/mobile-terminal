@@ -4812,6 +4812,11 @@
   function connect() {
     const token = localStorage.getItem(STORAGE_TOKEN_KEY);
     currentUser = localStorage.getItem(STORAGE_USER_KEY) || "";
+    // Auto-login by Tailscale identity (behind `tailscale serve`): the server
+    // already knows who this is, so no token/username prompt is needed.
+    if (serverConfig.autoUser) {
+      currentUser = serverConfig.autoUser;
+    }
     const needsToken = serverConfig.requireToken && !token;
     const needsUser = serverConfig.multiTenant && !currentUser;
     if (needsToken || needsUser) {
