@@ -437,24 +437,13 @@ def scroll_session_history(session_name: str, lines: int) -> None:
         return
 
     command = "scroll-up" if lines > 0 else "scroll-down"
-    # Chained into one tmux invocation: copy-mode is a no-op when the pane is
-    # already in a mode, and the ";" separator makes enter+scroll atomic so the
-    # mode can't exit between a separate check and the scroll keys.
-    tmux_capture(
-        "copy-mode",
-        "-e",
-        "-t",
-        session_name,
-        ";",
-        "send-keys",
-        "-t",
-        session_name,
-        "-X",
-        "-N",
-        str(count),
-        command,
-        check=False,
-    )
+    # Enter copy-mode only if we're not already in it. Re-entering on every scroll
+    # message resets the scroll position to the bottom, so a drag could never get
+    # more than one message's worth of rows from the bottom. -e makes copy-mode
+    # exit automatically once scrolled back to the bottom (returns to live output).
+    if not in_mode:
+        tmux_capture("copy-mode", "-e", "-t", session_name, check=False)
+    tmux_capture("send-keys", "-t", session_name, "-X", "-N", str(count), command, check=False)
 
 
 def list_session_clients(session_name: str) -> list[dict[str, str]]:
