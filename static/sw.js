@@ -10,15 +10,10 @@
  * the server (e.g. Japan -> US) boots the UI immediately and only the WebSocket
  * pays the distance. At most one load is stale after a deploy; the next is fresh.
  */
-const CACHE = "mobile-terminal-v1";
-const PRECACHE = [
-  "/",
-  "/static/app.js",
-  "/static/styles.css",
-  "/vendor/@xterm/xterm/lib/xterm.js",
-  "/vendor/@xterm/addon-fit/lib/addon-fit.js",
-  "/vendor/@xterm/xterm/css/xterm.css",
-];
+const CACHE = "mobile-terminal-v2";
+// The app shell (xterm, app.js, CSS) is inlined into the HTML, so caching "/"
+// caches everything needed to boot; icons/manifest are cached on demand.
+const PRECACHE = ["/"];
 
 // Never intercept live endpoints — these must always hit the network.
 const BYPASS = new Set(["/_ws", "/config", "/stats", "/health"]);

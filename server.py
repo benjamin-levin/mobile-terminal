@@ -1340,6 +1340,9 @@ def safe_join(path: str) -> tuple[Path | None, str | None]:
 # (e.g. "ph", "lat"), so each deployment's home-screen icon is distinguishable.
 # Rendered on demand with Pillow and cached per (label, size).
 _APP_ICON_CACHE: dict[tuple[str, int], bytes] = {}
+# Assembled (body, gzipped_body, etag) of index.html with CSS/JS inlined, per
+# label. Built once per process; a deploy restarts the server and rebuilds it.
+_INLINED_INDEX_CACHE: dict[str, tuple[bytes, bytes, str]] = {}
 _ICON_FONTS = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
@@ -1892,11 +1895,61 @@ class AppServer:
         # name + title match this deployment (icon carries the label too).
         if path in ("/", "/index.html"):
             try:
-                html = (STATIC_ROOT / "index.html").read_text().replace("__MT_LABEL__", self.label)
-                return http_response(200, html.encode("utf-8"), "text/html; charset=utf-8")
+                body, gzipped, etag = self.inlined_index()
             except OSError:
                 return http_response(404, b"Not Found", "text/plain; charset=utf-8")
+            headers = {"ETag": etag, "Cache-Control": "no-cache"}
+            if etag in request.headers.get("If-None-Match", ""):
+                return http_response(304, b"", "text/html; charset=utf-8", headers)
+            if request.headers.get(":method") == "HEAD":
+                return http_response(200, b"", "text/html; charset=utf-8", headers)
+            if "gzip" in request.headers.get("Accept-Encoding", ""):
+                return http_response(
+                    200,
+                    gzipped,
+                    "text/html; charset=utf-8",
+                    {**headers, "Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+                )
+            return http_response(200, body, "text/html; charset=utf-8", headers)
         return await process_request(connection, request)
+
+    def inlined_index(self) -> tuple[bytes, bytes, str]:
+        """index.html with its CSS and JS embedded inline, so a cold first load
+        gets the whole app shell in one response (no separate asset round-trips).
+        Returns (body, gzipped_body, etag), cached per label for the process."""
+        cached = _INLINED_INDEX_CACHE.get(self.label)
+        if cached is not None:
+            return cached
+        raw = (STATIC_ROOT / "index.html").read_text()
+        mtimes = [(STATIC_ROOT / "index.html").stat().st_mtime_ns]
+
+        def read_asset(href: str) -> str | None:
+            target, _ = safe_join(href)
+            if not target or not target.is_file():
+                return None
+            mtimes.append(target.stat().st_mtime_ns)
+            return target.read_text()
+
+        def css_sub(match: "re.Match[str]") -> str:
+            content = read_asset(match.group(1))
+            if content is None:
+                return match.group(0)
+            return "<style>" + content.replace("</style", "<\\/style") + "</style>"
+
+        def js_sub(match: "re.Match[str]") -> str:
+            content = read_asset(match.group(1))
+            if content is None:
+                return match.group(0)
+            return "<script>" + content.replace("</script", "<\\/script") + "</script>"
+
+        html = re.sub(r'<link rel="stylesheet" href="([^"]+)">', css_sub, raw)
+        html = re.sub(r'<script defer src="([^"]+)"></script>', js_sub, html)
+        html = html.replace("__MT_LABEL__", self.label)
+        body = html.encode("utf-8")
+        etag = f'"idx-{(sum(mtimes) & 0xFFFFFFFFFFFF):x}-{len(body):x}"'
+        result = (body, gzip.compress(body, 6), etag)
+        _INLINED_INDEX_CACHE[self.label] = result
+        return result
 
     def manifest(self) -> dict[str, Any]:
         return {
