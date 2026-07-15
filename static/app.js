@@ -3031,11 +3031,17 @@
     // Normal-buffer panes (shell, codex) keep their transcript in xterm's own
     // buffer -> scroll it locally, instantly, with no server round-trip. xterm's
     // onScroll updates followOutput. Positive `lines` = scroll up into history,
-    // which is term.scrollLines(-lines). Alt-screen / mouse TUIs fall through to
-    // the server-driven path (copy-mode / wheel / arrows).
+    // which is term.scrollLines(-lines).
     if (activePaneLocalScroll) {
+      const before = term.buffer.active.viewportY;
       term.scrollLines(-lines);
-      return;
+      if (term.buffer.active.viewportY !== before || lines <= 0) {
+        return; // local scroll moved (or we're scrolling down at the bottom)
+      }
+      // Nothing to scroll locally: some TUIs (e.g. codex) render in place with
+      // no xterm scrollback — their history lives in the tmux buffer. Fall back
+      // to the server (tmux copy-mode) for the rest of this pane's session.
+      activePaneLocalScroll = false;
     }
     pendingScrollLines += lines;
     if (pendingScrollFrameId === null) {

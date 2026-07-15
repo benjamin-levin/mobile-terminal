@@ -2878,11 +2878,11 @@ class AppServer:
                     await self.send_json(connection, {"type": "tabs", "tabs": tabs})
                 # Tell the client whether the active pane can scroll locally
                 # (normal buffer) or must scroll via the server (alt-screen/mouse).
+                # (No copy-mode auto-cancel here: the client may deliberately be in
+                # copy-mode as its scroll fallback for panes with no xterm
+                # scrollback; cancelling every second would fight it. Copy-mode is
+                # still cleared on attach/switch and on the next keystroke.)
                 local = pane_scrolls_locally(state["session"])
-                if local and pane_in_mode(state["session"]):
-                    # Local-scroll panes must never be stranded in copy-mode
-                    # (the client scrolls its own buffer) — unstick it.
-                    tmux_capture("send-keys", "-t", state["session"], "-X", "cancel", check=False)
                 if local != prev_local:
                     prev_local = local
                     await self.send_json(connection, {"type": "pane-scroll", "local": local})
