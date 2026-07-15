@@ -2922,7 +2922,12 @@ class AppServer:
                     "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
                 },
             )
-            if not skip:
+            # Normal-buffer panes (shell, codex, plain ssh) scroll locally in the
+            # client's xterm, so they need the scrollback delivered on switch or
+            # there's nothing to scroll. Alt-screen panes redraw their own view,
+            # so skip (their `capture` would just be stale pre-launch shell lines).
+            del skip  # server decides by pane type, not the client's hint
+            if pane_scrolls_locally(new_session):
                 hist = capture_history(new_session, CONNECT_HISTORY_LINES)
                 if hist:
                     await connection.send(hist.encode("utf-8", "surrogateescape"))

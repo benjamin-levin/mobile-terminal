@@ -243,6 +243,38 @@
   });
   const fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
+  // Snapshots a tab's rendered buffer so switching back to it paints instantly
+  // (0 round-trips) from the last-seen state, then the live re-attach reconciles.
+  const serializeAddon =
+    typeof SerializeAddon !== "undefined" ? new SerializeAddon.SerializeAddon() : null;
+  if (serializeAddon) {
+    term.loadAddon(serializeAddon);
+  }
+  // session name -> serialized screen (+ limited scrollback). Bounded LRU.
+  const sessionSnapshots = new Map();
+  const SESSION_SNAPSHOT_MAX = 12;
+  const SESSION_SNAPSHOT_SCROLLBACK = 1000;
+
+  function snapshotActiveSession() {
+    // Only snapshot normal-buffer panes (shell/codex). Alt-screen TUIs (claude,
+    // pagers) keep their view in the alternate buffer, which the serializer
+    // doesn't capture — snapshotting them would restore stale scrollback and
+    // land scrolled up. Those tabs re-attach cleanly on their full-screen redraw.
+    if (!serializeAddon || !activeSessionName || !activePaneLocalScroll) {
+      return;
+    }
+    try {
+      const data = serializeAddon.serialize({ scrollback: SESSION_SNAPSHOT_SCROLLBACK });
+      sessionSnapshots.delete(activeSessionName);
+      sessionSnapshots.set(activeSessionName, data);
+      while (sessionSnapshots.size > SESSION_SNAPSHOT_MAX) {
+        sessionSnapshots.delete(sessionSnapshots.keys().next().value);
+      }
+    } catch (_error) {
+      // Serialization is best-effort; a miss just costs one round-trip.
+    }
+  }
+
   term.open(terminalElement);
   installSemanticPromptHandlers();
 
@@ -274,6 +306,14 @@
   let pendingFileRequests = new Map();
   let lastDefaultFileRoot = "";
   let followOutput = true;
+  // During a tab switch, pin the view to the bottom until the re-attach settles
+  // (so a snapshot restore / redraw can't leave it scrolled up). A real user
+  // scroll clears it. Timestamp (performance.now) until which the pin holds.
+  let bottomPinUntil = 0;
+  // Set on a tab switch: the snapshot is shown as an instant preview, then the
+  // authoritative re-attach content arrives — reset once on that `ready` so the
+  // preview and the redraw don't stack (which stranded the view scrolled up).
+  let pendingSwitchReset = false;
   // When true, the active pane is a normal-buffer app (shell, codex, ...) whose
   // transcript lives in xterm's own buffer, so we scroll locally with no server
   // round-trip. Set from the server's "pane-scroll" message; false = scroll via
@@ -2814,6 +2854,12 @@
   }
 
   function refreshFollowOutput() {
+    // While the post-switch bottom-pin is active, keep following the bottom even
+    // though the snapshot/redraw writes momentarily move the viewport.
+    if (performance.now() < bottomPinUntil) {
+      followOutput = true;
+      return;
+    }
     const buffer = term.buffer.active;
     followOutput = buffer.viewportY >= buffer.baseY;
   }
@@ -2977,6 +3023,8 @@
   }
 
   function queueScrollHistory(lines) {
+    // A real user scroll releases the post-switch bottom-pin immediately.
+    bottomPinUntil = 0;
     // Normal-buffer panes (shell, codex) keep their transcript in xterm's own
     // buffer -> scroll it locally, instantly, with no server round-trip. xterm's
     // onScroll updates followOutput. Positive `lines` = scroll up into history,
@@ -4809,6 +4857,17 @@
     return window.matchMedia("(max-aspect-ratio: 4 / 5), (max-width: 720px)").matches;
   }
 
+  function closeBootSocket() {
+    if (window.__mtBoot && window.__mtBoot.ws) {
+      try {
+        window.__mtBoot.ws.close();
+      } catch (_error) {
+        // ignore
+      }
+    }
+    window.__mtBoot = null;
+  }
+
   function connect() {
     const token = localStorage.getItem(STORAGE_TOKEN_KEY);
     currentUser = localStorage.getItem(STORAGE_USER_KEY) || "";
@@ -4820,6 +4879,7 @@
     const needsToken = serverConfig.requireToken && !token;
     const needsUser = serverConfig.multiTenant && !currentUser;
     if (needsToken || needsUser) {
+      closeBootSocket(); // can't use the pre-opened socket if we must prompt first
       syncLoginFields();
       loginOverlay.classList.remove("hidden");
       (needsUser && userInput ? userInput : tokenInput).focus();
@@ -4830,10 +4890,23 @@
     window.clearTimeout(reconnectTimer);
     stopAuthConfigPolling();
     loginOverlay.classList.add("hidden");
-    socket = new WebSocket(wsUrl());
+
+    // Adopt the socket the inline <head> bootstrap opened during page parse (its
+    // TLS+WS handshake overlapped asset download); otherwise open a fresh one.
+    const boot = window.__mtBoot;
+    let bootQueue = null;
+    if (boot && boot.ws && (boot.ws.readyState === WebSocket.OPEN || boot.ws.readyState === WebSocket.CONNECTING)) {
+      socket = boot.ws;
+      socket.removeEventListener("message", boot.onMsg);
+      bootQueue = boot.queue;
+      window.__mtBoot = null;
+    } else {
+      closeBootSocket();
+      socket = new WebSocket(wsUrl());
+    }
     socket.binaryType = "arraybuffer";
 
-    socket.addEventListener("open", () => {
+    const sendAuth = () => {
       socket.send(
         JSON.stringify({
           type: "auth",
@@ -4842,9 +4915,14 @@
           deviceId: getDeviceId(),
         }),
       );
-    });
+    };
+    if (socket.readyState === WebSocket.OPEN) {
+      sendAuth();
+    } else {
+      socket.addEventListener("open", sendAuth, { once: true });
+    }
 
-    socket.addEventListener("message", async (event) => {
+    const onSocketMessage = async (event) => {
       if (typeof event.data === "string") {
         const payload = JSON.parse(event.data);
         handleServerMessage(payload);
@@ -4855,7 +4933,7 @@
         chunk = await chunk.arrayBuffer();
       }
       term.write(decoder.decode(chunk, { stream: true }), () => {
-        if (followOutput) {
+        if (followOutput || performance.now() < bottomPinUntil) {
           term.scrollToBottom();
         }
         if (semanticPromptState.seenMarker) {
@@ -4865,7 +4943,15 @@
           scheduleLayoutRefresh();
         }
       });
-    });
+    };
+    socket.addEventListener("message", onSocketMessage);
+    // Replay anything the bootstrap socket buffered before app.js attached.
+    if (bootQueue && bootQueue.length) {
+      const pending = bootQueue.splice(0, bootQueue.length);
+      for (const bufferedEvent of pending) {
+        onSocketMessage(bufferedEvent);
+      }
+    }
 
     socket.addEventListener("close", (event) => {
       if (reconnectForSessionSwitch) {
@@ -4897,6 +4983,13 @@
       resetComposerRevisionState();
       resetSemanticPromptState();
       resetTerminalBufferSyncState();
+      // A switch showed a cached preview; clear it now so the authoritative
+      // re-attach content (sent right after this) paints clean instead of
+      // stacking on top of the preview (which stranded the view scrolled up).
+      if (pendingSwitchReset) {
+        pendingSwitchReset = false;
+        term.reset();
+      }
       // New pane: default to server-driven scroll until the server's pane-scroll
       // message (sent right after) tells us whether this pane scrolls locally.
       activePaneLocalScroll = false;
@@ -5404,13 +5497,29 @@
       performLayoutNow({ preserveTerminalCols: false });
     }
     resetComposerTracking(true);
+    snapshotActiveSession(); // cache the tab we're leaving, before we clear it
     term.reset();
+    followOutput = true;
+    // Keep the view pinned to the bottom until the re-attach settles, so the
+    // snapshot restore + live redraw can't strand it scrolled up.
+    bottomPinUntil = performance.now() + 1500;
     // Fast path: switch on the live connection (no WS reconnect/handshake).
     // The server re-attaches the target session and streams it; `ready` arrives
     // and re-inits for the new session. tmux redraws on attach, so skip history.
     if (socket && socket.readyState === WebSocket.OPEN) {
       selectedSessionName = sessionName;
-      sendMessage({ type: "switch-session", session: sessionName, skipHistory: true });
+      // Paint the last-seen buffer instantly (0 RTT) from cache as a preview.
+      const snapshot = sessionSnapshots.get(sessionName);
+      if (snapshot) {
+        term.write(snapshot, () => {
+          term.scrollToBottom();
+        });
+      }
+      // If we showed a preview, ask for authoritative history and reset once on
+      // `ready` so the preview and the re-attach don't stack. With no preview
+      // (alt-screen / first visit) rely on tmux's clean redraw-on-attach.
+      pendingSwitchReset = Boolean(snapshot);
+      sendMessage({ type: "switch-session", session: sessionName, skipHistory: !snapshot });
       return;
     }
     // No live socket: fall back to a fresh connect for this session.

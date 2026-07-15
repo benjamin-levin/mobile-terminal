@@ -4,6 +4,27 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
     <title>__MT_LABEL__ terminal</title>
+    <script>
+      // Open the terminal WebSocket as early as possible (during <head> parse)
+      // so its TLS+WS handshake overlaps asset download instead of running after
+      // app.js loads. app.js adopts this socket (window.__mtBoot) and sends auth.
+      window.__mtBoot = (function () {
+        try {
+          var active = "";
+          try { active = localStorage.getItem("mobile-terminal.active-session") || ""; } catch (e) {}
+          var proto = location.protocol === "https:" ? "wss:" : "ws:";
+          var url = proto + "//" + location.host + "/_ws" + (active ? "?session=" + encodeURIComponent(active) : "");
+          var ws = new WebSocket(url);
+          ws.binaryType = "arraybuffer";
+          var queue = [];
+          var onMsg = function (e) { queue.push(e); };
+          ws.addEventListener("message", onMsg);
+          return { ws: ws, queue: queue, onMsg: onMsg };
+        } catch (e) {
+          return null;
+        }
+      })();
+    </script>
     <!-- Add-to-home-screen: terminal icon with this machine's label baked in.
          The server injects __MT_LABEL__ and renders /app-icon-*.png per machine. -->
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -328,6 +349,7 @@ Desktop  Downloads  mobile-terminal</pre>
 
     <script defer src="/vendor/@xterm/xterm/lib/xterm.js"></script>
     <script defer src="/vendor/@xterm/addon-fit/lib/addon-fit.js"></script>
+    <script defer src="/vendor/@xterm/addon-serialize/lib/addon-serialize.js"></script>
     <script defer src="/static/app.js"></script>
   </body>
 </html>
