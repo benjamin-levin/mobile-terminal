@@ -1653,15 +1653,26 @@ class AppServer:
         await connection.send(json.dumps(payload))
 
     def client_is_allowed(self, remote_address_value: Any) -> bool:
+        host = remote_ip(remote_address_value)
+        # Loopback = a reverse proxy on this host (tailscale serve), which
+        # terminates TLS and forwards the real, tailnet-authenticated client.
+        # Let it past the network gate; the token still gates access (see
+        # client_is_trusted, which deliberately does NOT trust loopback).
+        if host in ("127.0.0.1", "::1"):
+            return True
         if not self.allowed_clients:
             return True
-        host = remote_ip(remote_address_value)
         return host in self.allowed_clients
 
     def client_is_trusted(self, remote_address_value: Any) -> bool:
         if not self.allowed_clients:
             return False
-        return self.client_is_allowed(remote_address_value)
+        host = remote_ip(remote_address_value)
+        # A proxied (loopback) connection carries no client IP, so never treat it
+        # as token-exempt — require the token for anything coming via the proxy.
+        if host in ("127.0.0.1", "::1"):
+            return False
+        return host in self.allowed_clients
 
     def token_required_for(self, trusted_client: bool) -> bool:
         """Whether the client must supply a token. In single-tenant mode an
