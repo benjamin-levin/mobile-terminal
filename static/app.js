@@ -272,6 +272,11 @@
   let pendingFileRequests = new Map();
   let lastDefaultFileRoot = "";
   let followOutput = true;
+  // When true, the active pane is a normal-buffer app (shell, codex, ...) whose
+  // transcript lives in xterm's own buffer, so we scroll locally with no server
+  // round-trip. Set from the server's "pane-scroll" message; false = scroll via
+  // the server (alt-screen/mouse TUIs). Default false until the server tells us.
+  let activePaneLocalScroll = false;
   let reconnectForSessionSwitch = false;
   let skipHistoryOnNextConnect = false;
   let authConfigPollTimer = 0;
@@ -2970,6 +2975,15 @@
   }
 
   function queueScrollHistory(lines) {
+    // Normal-buffer panes (shell, codex) keep their transcript in xterm's own
+    // buffer -> scroll it locally, instantly, with no server round-trip. xterm's
+    // onScroll updates followOutput. Positive `lines` = scroll up into history,
+    // which is term.scrollLines(-lines). Alt-screen / mouse TUIs fall through to
+    // the server-driven path (copy-mode / wheel / arrows).
+    if (activePaneLocalScroll) {
+      term.scrollLines(-lines);
+      return;
+    }
     pendingScrollLines += lines;
     if (pendingScrollFrameId === null) {
       pendingScrollFrameId = window.requestAnimationFrame(flushPendingScrollLines);
@@ -4876,6 +4890,9 @@
       resetComposerRevisionState();
       resetSemanticPromptState();
       resetTerminalBufferSyncState();
+      // New pane: default to server-driven scroll until the server's pane-scroll
+      // message (sent right after) tells us whether this pane scrolls locally.
+      activePaneLocalScroll = false;
       if (payload.multiTenant) {
         currentUser = payload.user || currentUser;
         currentUserLabel = payload.userLabel || currentUser;
@@ -4950,6 +4967,10 @@
         payload.tabs?.find((tab) => tab.active)?.name || activeSessionName;
       updateSessionInventory(payload.tabs || [], nextActiveSession);
       scheduleLayoutRefresh();
+      return;
+    }
+    if (payload.type === "pane-scroll") {
+      activePaneLocalScroll = payload.local === true;
       return;
     }
     if (payload.type === "notice") {

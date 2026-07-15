@@ -300,10 +300,11 @@ def current_path(session_name: str, fallback: str) -> str:
     return path or fallback
 
 
-# Lines of scrollback sent on connect. Kept small for a fast first paint —
-# scrolling up past this still reaches the full tmux history via the copy-mode
-# scroll path, so nothing is lost; only the initial payload shrinks.
-CONNECT_HISTORY_LINES = 500
+# Lines of scrollback sent on connect. Normal-buffer panes scroll this locally
+# in the client's xterm buffer (no round-trip), so we send enough to cover the
+# full tmux history range. It's gzip-compressed over the socket, and xterm paints
+# the visible screen immediately, so first paint stays fast.
+CONNECT_HISTORY_LINES = 2000
 
 
 def capture_history(session_name: str, lines: int = 2000) -> str:
@@ -355,6 +356,26 @@ def pane_in_mode(session_name: str) -> bool:
         check=False,
     )
     return result.stdout.strip() == "1"
+
+
+def pane_scrolls_locally(session_name: str) -> bool:
+    """True when the pane is a normal-buffer app (shell, codex, ...): not on the
+    alternate screen and not mouse-tracking. Such panes keep their transcript in
+    the client's xterm buffer, so the client can scroll it locally with no server
+    round-trip. Alt-screen / mouse-tracking TUIs (claude, pagers) redraw their own
+    viewport, so those still scroll via the server (copy-mode / wheel / arrows)."""
+    result = tmux_capture(
+        "display-message",
+        "-p",
+        "-t",
+        session_name,
+        "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}",
+        check=False,
+    )
+    parts = result.stdout.split()
+    alternate_on = len(parts) > 0 and parts[0] == "1"
+    mouse_tracking = len(parts) > 2 and parts[1] == "1" and parts[2] == "1"
+    return not alternate_on and not mouse_tracking
 
 
 MAX_SCROLL_EVENTS_PER_CALL = 200
@@ -2784,12 +2805,19 @@ class AppServer:
 
         async def watch_tabs() -> None:
             previous = ""
+            prev_local = None
             while True:
                 tabs = self.tabs_for_user(state["user"], state["session"])
                 snapshot = json.dumps(tabs, sort_keys=True)
                 if snapshot != previous:
                     previous = snapshot
                     await self.send_json(connection, {"type": "tabs", "tabs": tabs})
+                # Tell the client whether the active pane can scroll locally
+                # (normal buffer) or must scroll via the server (alt-screen/mouse).
+                local = pane_scrolls_locally(state["session"])
+                if local != prev_local:
+                    prev_local = local
+                    await self.send_json(connection, {"type": "pane-scroll", "local": local})
                 await asyncio.sleep(1)
 
         output_task = asyncio.create_task(relay_output())
