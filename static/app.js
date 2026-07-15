@@ -317,8 +317,11 @@
   // When true, the active pane is a normal-buffer app (shell, codex, ...) whose
   // transcript lives in xterm's own buffer, so we scroll locally with no server
   // round-trip. Set from the server's "pane-scroll" message; false = scroll via
-  // the server (alt-screen/mouse TUIs). Default false until the server tells us.
-  let activePaneLocalScroll = false;
+  // the server (alt-screen/mouse TUIs). Default TRUE so scroll never hits the
+  // server's copy-mode path before we've learned the pane type (which stranded
+  // panes like codex-over-ssh in copy-mode); server-scroll is used only once the
+  // server confirms an alt-screen/mouse pane.
+  let activePaneLocalScroll = true;
   let reconnectForSessionSwitch = false;
   let skipHistoryOnNextConnect = false;
   let authConfigPollTimer = 0;
@@ -4990,9 +4993,10 @@
         pendingSwitchReset = false;
         term.reset();
       }
-      // New pane: default to server-driven scroll until the server's pane-scroll
-      // message (sent right after) tells us whether this pane scrolls locally.
-      activePaneLocalScroll = false;
+      // New pane: assume local scroll until the server's pane-scroll message
+      // (sent right after) says otherwise — avoids the server copy-mode path
+      // running before we know the pane type.
+      activePaneLocalScroll = true;
       if (payload.multiTenant) {
         currentUser = payload.user || currentUser;
         currentUserLabel = payload.userLabel || currentUser;

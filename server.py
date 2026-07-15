@@ -2842,6 +2842,9 @@ class AppServer:
             initial_size=self.terminal_sizes.get(session_name),
         )
         bridge.open()
+        if pane_scrolls_locally(session_name) and pane_in_mode(session_name):
+            # Don't attach into a stranded copy-mode view on a local-scroll pane.
+            tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
         history = "" if skip_history else capture_history(state["session"], CONNECT_HISTORY_LINES)
 
         session_summary: dict[str, int] = {
@@ -2876,6 +2879,10 @@ class AppServer:
                 # Tell the client whether the active pane can scroll locally
                 # (normal buffer) or must scroll via the server (alt-screen/mouse).
                 local = pane_scrolls_locally(state["session"])
+                if local and pane_in_mode(state["session"]):
+                    # Local-scroll panes must never be stranded in copy-mode
+                    # (the client scrolls its own buffer) — unstick it.
+                    tmux_capture("send-keys", "-t", state["session"], "-X", "cancel", check=False)
                 if local != prev_local:
                     prev_local = local
                     await self.send_json(connection, {"type": "pane-scroll", "local": local})
@@ -2927,7 +2934,12 @@ class AppServer:
             # there's nothing to scroll. Alt-screen panes redraw their own view,
             # so skip (their `capture` would just be stale pre-launch shell lines).
             del skip  # server decides by pane type, not the client's hint
-            if pane_scrolls_locally(new_session):
+            local = pane_scrolls_locally(new_session)
+            if local and pane_in_mode(new_session):
+                # A local-scroll pane stranded in tmux copy-mode is frozen; cancel
+                # it so we capture/stream the live pane, not a stuck scrollback view.
+                tmux_capture("send-keys", "-t", new_session, "-X", "cancel", check=False)
+            if local:
                 hist = capture_history(new_session, CONNECT_HISTORY_LINES)
                 if hist:
                     await connection.send(hist.encode("utf-8", "surrogateescape"))
