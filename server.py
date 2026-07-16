@@ -2971,20 +2971,16 @@ class AppServer:
                     "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
                 },
             )
-            # Normal-buffer panes (shell, codex, plain ssh) scroll locally in the
-            # client's xterm, so they need the scrollback delivered on switch or
-            # there's nothing to scroll. Alt-screen panes redraw their own view,
-            # so skip (their `capture` would just be stale pre-launch shell lines).
-            del skip  # server decides by pane type, not the client's hint
-            local = pane_scrolls_locally(new_session)
-            if local and pane_in_mode(new_session):
+            # No scrollback push on switch: the client instantly shows its cached
+            # snapshot of this tab, and tmux redraws the live screen over it on
+            # attach — so the switch is seamless (no reset/repaint flash). Local
+            # scroll uses the snapshot's scrollback; panes with none (e.g. codex)
+            # fall back to the server copy-mode scroll on demand.
+            del skip
+            if pane_scrolls_locally(new_session) and pane_in_mode(new_session):
                 # A local-scroll pane stranded in tmux copy-mode is frozen; cancel
-                # it so we capture/stream the live pane, not a stuck scrollback view.
+                # it so we stream the live pane, not a stuck scrollback view.
                 tmux_capture("send-keys", "-t", new_session, "-X", "cancel", check=False)
-            if local:
-                hist = capture_history(new_session, CONNECT_HISTORY_LINES)
-                if hist:
-                    await connection.send(hist.encode("utf-8", "surrogateescape"))
             await self.send_tabs(connection, state["user"], new_session)
             await self.send_sessions(connection, state["user"], new_session)
             await self.send_composer_state(connection, new_session)

@@ -310,10 +310,6 @@
   // (so a snapshot restore / redraw can't leave it scrolled up). A real user
   // scroll clears it. Timestamp (performance.now) until which the pin holds.
   let bottomPinUntil = 0;
-  // Set on a tab switch: the snapshot is shown as an instant preview, then the
-  // authoritative re-attach content arrives — reset once on that `ready` so the
-  // preview and the redraw don't stack (which stranded the view scrolled up).
-  let pendingSwitchReset = false;
   // When true, the active pane is a normal-buffer app (shell, codex, ...) whose
   // transcript lives in xterm's own buffer, so we scroll locally with no server
   // round-trip. Set from the server's "pane-scroll" message; false = scroll via
@@ -4992,13 +4988,6 @@
       resetComposerRevisionState();
       resetSemanticPromptState();
       resetTerminalBufferSyncState();
-      // A switch showed a cached preview; clear it now so the authoritative
-      // re-attach content (sent right after this) paints clean instead of
-      // stacking on top of the preview (which stranded the view scrolled up).
-      if (pendingSwitchReset) {
-        pendingSwitchReset = false;
-        term.reset();
-      }
       // New pane: assume local scroll until the server's pane-scroll message
       // (sent right after) says otherwise — avoids the server copy-mode path
       // running before we know the pane type.
@@ -5518,18 +5507,17 @@
     // and re-inits for the new session. tmux redraws on attach, so skip history.
     if (socket && socket.readyState === WebSocket.OPEN) {
       selectedSessionName = sessionName;
-      // Paint the last-seen buffer instantly (0 RTT) from cache as a preview.
+      // Paint the last-seen buffer instantly (0 RTT) from cache. tmux redraws the
+      // live screen over it on attach, so the switch is seamless — the snapshot IS
+      // the ready state, with no reset/repaint flash. No history is requested; the
+      // snapshot carries the scrollback (panes with none use the server fallback).
       const snapshot = sessionSnapshots.get(sessionName);
       if (snapshot) {
         term.write(snapshot, () => {
           term.scrollToBottom();
         });
       }
-      // If we showed a preview, ask for authoritative history and reset once on
-      // `ready` so the preview and the re-attach don't stack. With no preview
-      // (alt-screen / first visit) rely on tmux's clean redraw-on-attach.
-      pendingSwitchReset = Boolean(snapshot);
-      sendMessage({ type: "switch-session", session: sessionName, skipHistory: !snapshot });
+      sendMessage({ type: "switch-session", session: sessionName, skipHistory: true });
       return;
     }
     // No live socket: fall back to a fresh connect for this session.
