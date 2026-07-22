@@ -201,6 +201,95 @@
     return id;
   }
 
+  // --- device-bound key (silent auth) -------------------------------------
+  // A non-extractable ECDSA P-256 key pair lives in IndexedDB. JS can sign with
+  // the private key but can never read it out, so unlike a stored token it can't
+  // be copied to another device; to connect we just sign the server's nonce.
+  const DEVICE_KEY_DB = "mobile-terminal-keys";
+  const DEVICE_KEY_STORE = "keys";
+  const DEVICE_KEY_ID = "device-ecdsa";
+  let hasDeviceKey = false; // cached; gates whether we can skip the token prompt
+
+  function deviceKeySupported() {
+    return !!(window.crypto && window.crypto.subtle && window.indexedDB);
+  }
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DEVICE_KEY_DB, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(DEVICE_KEY_STORE);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  function idbRun(mode, fn) {
+    return idbOpen().then(
+      (db) =>
+        new Promise((resolve, reject) => {
+          const tx = db.transaction(DEVICE_KEY_STORE, mode);
+          const store = tx.objectStore(DEVICE_KEY_STORE);
+          const out = fn(store);
+          tx.oncomplete = () => resolve(out && out.result !== undefined ? out.result : undefined);
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+        }),
+    );
+  }
+  async function loadDeviceKey() {
+    if (!deviceKeySupported()) return null;
+    try {
+      return (await idbRun("readonly", (s) => s.get(DEVICE_KEY_ID))) || null;
+    } catch (e) {
+      return null;
+    }
+  }
+  async function ensureDeviceKey() {
+    let rec = await loadDeviceKey();
+    if (rec && rec.privateKey) return rec;
+    // extractable:false → private key can never leave the browser; the public
+    // key stays exportable so we can register it with the server.
+    const pair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["sign", "verify"],
+    );
+    rec = { privateKey: pair.privateKey, publicKey: pair.publicKey };
+    await idbRun("readwrite", (s) => s.put(rec, DEVICE_KEY_ID)); // CryptoKey is structured-cloneable
+    return rec;
+  }
+  async function forgetDeviceKey() {
+    try {
+      await idbRun("readwrite", (s) => s.delete(DEVICE_KEY_ID));
+    } catch (e) {}
+    hasDeviceKey = false;
+  }
+  function bytesToBase64(buf) {
+    const bytes = new Uint8Array(buf);
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+  }
+  function base64ToBytes(b64) {
+    const bin = atob(b64.replace(/-/g, "+").replace(/_/g, "/"));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function base64urlOf(buf) {
+    return bytesToBase64(buf).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  async function exportPublicSpki(publicKey) {
+    return bytesToBase64(await crypto.subtle.exportKey("spki", publicKey));
+  }
+  async function signNonce(privateKey, nonce) {
+    const data = new TextEncoder().encode(nonce);
+    const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privateKey, data);
+    return bytesToBase64(sig); // raw r‖s (64 bytes); the server converts to DER
+  }
+  async function refreshDeviceKeyFlag() {
+    hasDeviceKey = !!(await loadDeviceKey());
+    return hasDeviceKey;
+  }
+
   let uiScale = loadNumericSetting(STORAGE_UI_SCALE_KEY, DEFAULT_UI_SCALE, 0.5, 1.4);
   let effectiveUiScale = uiScale;
   let terminalFontSize = loadNumericSetting(STORAGE_TERMINAL_FONT_KEY, DEFAULT_TERMINAL_FONT, 5, 24);
@@ -4885,6 +4974,81 @@
     window.__mtBoot = null;
   }
 
+  // Reply to the server's auth challenge: sign the nonce with the device key
+  // (silent), and also carry token/username as a fallback the server uses only
+  // if the signature is absent/invalid.
+  async function sendAuthResponse(nonce) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const token = localStorage.getItem(STORAGE_TOKEN_KEY) || "";
+    const msg = { type: "auth", user: currentUser, deviceId: getDeviceId() };
+    if (token) msg.token = token;
+    try {
+      const rec = await loadDeviceKey();
+      if (rec && rec.privateKey && nonce) {
+        msg.signature = await signNonce(rec.privateKey, nonce);
+      }
+    } catch (e) {
+      /* fall back to token/identity */
+    }
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(msg));
+    }
+  }
+
+  // Silent enrollment (on the tailnet): generate the key, register its public
+  // half so future connections sign in with no prompt from anywhere.
+  async function enrollDeviceKey() {
+    try {
+      const rec = await ensureDeviceKey();
+      sendMessage({ type: "register-key", deviceId: getDeviceId(), publicKey: await exportPublicSpki(rec.publicKey) });
+      hasDeviceKey = true;
+    } catch (e) {
+      /* enrollment is best-effort */
+    }
+  }
+
+  function decodeCreationOptions(o) {
+    const pk = Object.assign({}, o);
+    pk.challenge = base64ToBytes(o.challenge);
+    pk.user = Object.assign({}, o.user, { id: base64ToBytes(o.user.id) });
+    if (Array.isArray(o.excludeCredentials)) {
+      pk.excludeCredentials = o.excludeCredentials.map((c) => Object.assign({}, c, { id: base64ToBytes(c.id) }));
+    }
+    return pk;
+  }
+  function credentialToJSON(cred) {
+    return {
+      id: cred.id,
+      rawId: base64urlOf(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: base64urlOf(cred.response.clientDataJSON),
+        attestationObject: base64urlOf(cred.response.attestationObject),
+      },
+      clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+      authenticatorAttachment: cred.authenticatorAttachment || null,
+    };
+  }
+  // Off-tailnet bootstrap: one biometric (WebAuthn) gates minting the durable
+  // silent key for a brand-new device. On success we register both.
+  async function enrollDeviceKeyWithBiometric(options) {
+    try {
+      if (!window.PublicKeyCredential) throw new Error("webauthn unavailable");
+      const cred = await navigator.credentials.create({ publicKey: decodeCreationOptions(options) });
+      if (!cred) throw new Error("no credential");
+      const rec = await ensureDeviceKey();
+      sendMessage({
+        type: "webauthn-register",
+        attestation: credentialToJSON(cred),
+        deviceId: getDeviceId(),
+        publicKey: await exportPublicSpki(rec.publicKey),
+      });
+      hasDeviceKey = true;
+    } catch (e) {
+      /* biometric declined/unavailable: stays on token auth for this session */
+    }
+  }
+
   function connect() {
     const token = localStorage.getItem(STORAGE_TOKEN_KEY);
     currentUser = localStorage.getItem(STORAGE_USER_KEY) || "";
@@ -4893,8 +5057,10 @@
     if (serverConfig.autoUser) {
       currentUser = serverConfig.autoUser;
     }
-    const needsToken = serverConfig.requireToken && !token;
-    const needsUser = serverConfig.multiTenant && !currentUser;
+    // An enrolled device signs the server's nonce, so it needs neither a token
+    // nor a username prompt — it authenticates silently from anywhere.
+    const needsToken = serverConfig.requireToken && !token && !hasDeviceKey;
+    const needsUser = serverConfig.multiTenant && !currentUser && !hasDeviceKey;
     if (needsToken || needsUser) {
       closeBootSocket(); // can't use the pre-opened socket if we must prompt first
       syncLoginFields();
@@ -4923,21 +5089,10 @@
     }
     socket.binaryType = "arraybuffer";
 
-    const sendAuth = () => {
-      socket.send(
-        JSON.stringify({
-          type: "auth",
-          user: currentUser,
-          token: token || "",
-          deviceId: getDeviceId(),
-        }),
-      );
-    };
-    if (socket.readyState === WebSocket.OPEN) {
-      sendAuth();
-    } else {
-      socket.addEventListener("open", sendAuth, { once: true });
-    }
+    // Auth is challenge-driven now: the server sends {type:"auth-challenge",
+    // nonce} and we reply via sendAuthResponse() (signing the nonce with the
+    // device key when enrolled, else falling back to token/username). The early
+    // boot socket buffers that challenge; it's replayed below.
 
     const onSocketMessage = async (event) => {
       if (typeof event.data === "string") {
@@ -4994,6 +5149,18 @@
   function handleServerMessage(payload) {
     if (String(payload.type || "").startsWith("fs-")) {
       handleFileServerMessage(payload);
+      return;
+    }
+    if (payload.type === "auth-challenge") {
+      sendAuthResponse(payload.nonce);
+      return;
+    }
+    if (payload.type === "enroll-key") {
+      enrollDeviceKey();
+      return;
+    }
+    if (payload.type === "webauthn-register-options") {
+      enrollDeviceKeyWithBiometric(payload.options);
       return;
     }
     if (payload.type === "ready") {
@@ -6493,6 +6660,15 @@
       localStorage.removeItem(STORAGE_USER_KEY);
       currentUser = "";
     }
+    // Revoke this device's silent key so it can't auto-reconnect, and ask the
+    // server to drop the stored public key.
+    try {
+      sendMessage({ type: "forget-key", deviceId: getDeviceId() });
+    } catch (_error) {
+      // ignore
+    }
+    hasDeviceKey = false;
+    forgetDeviceKey();
     if (socket) {
       reconnectForSessionSwitch = false;
       try {
@@ -7061,12 +7237,16 @@
   document.fonts?.ready?.then(() => {
     scheduleLayoutRefresh();
   });
-  loadServerConfig().finally(() => {
-    if (!serverConfig.requireToken) {
-      loginOverlay.classList.add("hidden");
-    }
-    connect();
-  });
+  loadServerConfig()
+    // Learn whether this device already holds a silent key before deciding
+    // whether to prompt for a token, so enrolled devices never see the overlay.
+    .then(refreshDeviceKeyFlag, refreshDeviceKeyFlag)
+    .finally(() => {
+      if (!serverConfig.requireToken) {
+        loginOverlay.classList.add("hidden");
+      }
+      connect();
+    });
 
   // Cache the UI shell for instant, round-trip-free loads. Only registers in a
   // secure context (HTTPS/localhost); over plain HTTP `navigator.serviceWorker`

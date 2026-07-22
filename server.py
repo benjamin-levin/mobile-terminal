@@ -27,6 +27,11 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
 
 ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / "static"
@@ -989,6 +994,86 @@ def save_user_state(user: str, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, indent=2) + "\n")
 
 
+# --- device-bound key auth ------------------------------------------------
+# Each enrolled browser holds a non-extractable ECDSA P-256 private key (in
+# IndexedDB) and registers only its PUBLIC key here. To connect it signs a fresh
+# server nonce; we verify with the stored public key. Unlike the old deviceId
+# "remember-me" string this is not a transferable secret: the private key can't
+# be exported by JS and a captured signature is bound to a spent one-time nonce.
+DEVICE_KEYS_PATH = ROOT / "state" / "device-keys.json"
+DEVICE_NONCE_TTL = 120  # seconds a signing challenge stays valid
+
+
+def load_device_keys() -> dict[str, Any]:
+    """{user: {deviceId: {pubKey(spki b64), label, created, lastSeen, webauthn?}}}.
+    Single-tenant uses the "" user key."""
+    if DEVICE_KEYS_PATH.is_file():
+        try:
+            raw = json.loads(DEVICE_KEYS_PATH.read_text())
+            if isinstance(raw, dict):
+                return raw
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {}
+
+
+def save_device_keys(store: dict[str, Any]) -> None:
+    DEVICE_KEYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DEVICE_KEYS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(store, indent=2) + "\n")
+    tmp.replace(DEVICE_KEYS_PATH)
+
+
+def device_pubkey(user: str, device_id: str) -> str | None:
+    if not device_id:
+        return None
+    rec = load_device_keys().get(user or "", {}).get(device_id)
+    return rec.get("pubKey") if isinstance(rec, dict) else None
+
+
+def register_device_key(
+    user: str, device_id: str, pub_key_spki_b64: str, label: str, webauthn: bool = False
+) -> None:
+    store = load_device_keys()
+    bucket = store.setdefault(user or "", {})
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    existing = bucket.get(device_id) if isinstance(bucket.get(device_id), dict) else {}
+    bucket[device_id] = {
+        "pubKey": pub_key_spki_b64,
+        "label": label or existing.get("label", "device"),
+        "created": existing.get("created", now),
+        "lastSeen": now,
+        "webauthn": bool(webauthn or existing.get("webauthn")),
+    }
+    save_device_keys(store)
+
+
+def forget_device_key(user: str, device_id: str) -> None:
+    store = load_device_keys()
+    bucket = store.get(user or "")
+    if isinstance(bucket, dict) and device_id in bucket:
+        del bucket[device_id]
+        save_device_keys(store)
+
+
+def verify_device_signature(pub_key_spki_b64: str, message: bytes, signature_b64: str) -> bool:
+    """Verify a WebCrypto ECDSA-P256/SHA-256 signature. WebCrypto emits a raw
+    r‖s (64-byte) signature; cryptography wants DER, so convert first."""
+    try:
+        pub = serialization.load_der_public_key(base64.b64decode(pub_key_spki_b64))
+        if not isinstance(pub, ec.EllipticCurvePublicKey):
+            return False
+        raw = base64.b64decode(signature_b64)
+        if len(raw) != 64:
+            return False
+        r = int.from_bytes(raw[:32], "big")
+        s = int.from_bytes(raw[32:], "big")
+        pub.verify(encode_dss_signature(r, s), message, ec.ECDSA(hashes.SHA256()))
+        return True
+    except (InvalidSignature, ValueError, TypeError, Exception):
+        return False
+
+
 def migrate_to_multitenant(owner: str) -> None:
     """One-time seeding: owner inherits the global settings file and every
     tmux session currently running, so the machine owner keeps their setup."""
@@ -1682,29 +1767,64 @@ class AppServer:
             return False
         return host in self.allowed_clients
 
+    def request_is_public(self, connection: ServerConnection) -> bool:
+        """True when the request arrived over Tailscale Funnel (public internet)
+        rather than tailnet serve. Tailscale marks Funnel requests with a
+        Tailscale-Funnel-Request header and never injects identity headers for
+        them; we additionally refuse to trust identity on such requests."""
+        return connection.request.headers.get("Tailscale-Funnel-Request") is not None
+
     def proxy_login(self, connection: ServerConnection) -> str | None:
         """The Tailscale identity that `tailscale serve` injected, but only when
-        the request actually came through the local proxy (loopback source). A
-        direct connection could forge the header, so it's ignored there."""
+        the request actually came through the local proxy (loopback source) on a
+        *tailnet* (non-Funnel) request. A direct or public-Funnel connection
+        could carry a forged header, so it's ignored there. Tailscale also strips
+        client-supplied Tailscale-* headers, so this is defense in depth."""
         host = remote_ip(connection.remote_address)
         if host not in ("127.0.0.1", "::1"):
             return None
+        if self.request_is_public(connection):
+            return None  # public Funnel: never trust an identity header
         login = connection.request.headers.get("Tailscale-User-Login")
         return login.strip().lower() if login else None
 
     def auto_auth_user(self, connection: ServerConnection) -> str | None:
         """Map the proxy-provided Tailscale identity to a user for token-less
-        login. Returns the username (multi-tenant), "" for the single implicit
-        user (single-tenant), or None when no auto-login applies."""
-        login = self.proxy_login(connection)
+        login — but ONLY when MOBILE_TERMINAL_TRUST_IDENTITY is set.
+
+        Identity-header trust is off by default because Tailscale Funnel was
+        observed to inject the node owner's `Tailscale-User-Login` into public
+        internet requests (with no Funnel marker), which would auto-authenticate
+        anyone as the owner. Enable it only on a machine that is NOT publicly
+        funnel-exposed — e.g. a brief tailnet-only enrollment window — so a
+        device can enroll its key with no token, then it's disabled again."""
+        if os.environ.get("MOBILE_TERMINAL_TRUST_IDENTITY", "").strip().lower() not in ("1", "true", "yes"):
+            return None
+        login = self.proxy_login(connection)  # loopback + non-Funnel + identity header
         if not login:
             return None
         if not self.multi_tenant:
-            return ""  # single-tenant: any tailnet identity via serve skips the token
+            return ""
         for name, meta in self.users.items():
             if meta.get("tailscaleLogin") and meta["tailscaleLogin"] == login:
                 return name
         return None
+
+    def rp_id(self, connection: ServerConnection) -> str:
+        """WebAuthn RP ID = the public hostname (no port). Env override wins."""
+        override = os.environ.get("MOBILE_TERMINAL_RP_ID")
+        if override:
+            return override
+        host = connection.request.headers.get("Host", "") or self.host
+        return host.split(":", 1)[0]
+
+    def expected_origin(self, connection: ServerConnection) -> str:
+        """WebAuthn origin = scheme + host(+port). Env override wins."""
+        override = os.environ.get("MOBILE_TERMINAL_ORIGIN")
+        if override:
+            return override
+        host = connection.request.headers.get("Host", "") or self.host
+        return "https://" + host
 
     def token_required_for(self, trusted_client: bool) -> bool:
         """Whether the client must supply a token. In single-tenant mode an
@@ -1902,6 +2022,11 @@ class AppServer:
                 "label": self.label,
                 "host": self.host,
                 "port": self.port,
+                # Silent device-key auth: the client enrolls a non-extractable
+                # key when trusted (tailnet) and signs a nonce to reconnect from
+                # anywhere. rpId scopes any WebAuthn bootstrap to this host.
+                "deviceKeyAuth": True,
+                "rpId": self.rp_id(connection),
             }
             body = json.dumps(payload).encode("utf-8")
             return http_response(200, body, "application/json; charset=utf-8")
@@ -2472,6 +2597,20 @@ class AppServer:
             self.save_open_tabs(user, payload.get("tabs"))
             return
 
+        if message_type == "register-key":
+            self.handle_register_key(connection, state, payload)
+            return
+
+        if message_type == "forget-key":
+            # Revoke this device's silent key (sign-out). Only ever the caller's
+            # own device, scoped to the authenticated user.
+            forget_device_key(user, str(payload.get("deviceId", ""))[:64])
+            return
+
+        if message_type == "webauthn-register":
+            await self.handle_webauthn_register(connection, state, payload)
+            return
+
         if message_type == "request-settings":
             await self.send_settings(connection, user)
             return
@@ -2824,6 +2963,93 @@ class AppServer:
             await self.send_sessions(connection, user, session_name)
             return
 
+    @staticmethod
+    def _valid_spki(pub_key_spki_b64: str) -> bool:
+        """A client-supplied public key must be a real P-256 SPKI before we store it."""
+        try:
+            key = serialization.load_der_public_key(base64.b64decode(pub_key_spki_b64))
+            return isinstance(key, ec.EllipticCurvePublicKey) and key.curve.name == "secp256r1"
+        except (ValueError, TypeError, Exception):
+            return False
+
+    def build_webauthn_options(self, connection: ServerConnection, state: dict[str, Any]) -> dict | None:
+        """Registration options for the off-tailnet biometric gate. Stashes the
+        challenge on the connection state for verification. None if unavailable."""
+        try:
+            from webauthn import generate_registration_options, options_to_json
+            from webauthn.helpers.structs import (
+                AuthenticatorSelectionCriteria,
+                ResidentKeyRequirement,
+                UserVerificationRequirement,
+            )
+        except Exception:
+            return None
+        try:
+            opts = generate_registration_options(
+                rp_id=self.rp_id(connection),
+                rp_name=f"{self.label} terminal",
+                user_id=(state.get("deviceId") or "device").encode("utf-8")[:64],
+                user_name=state.get("user") or "device",
+                authenticator_selection=AuthenticatorSelectionCriteria(
+                    authenticator_attachment="platform",
+                    resident_key=ResidentKeyRequirement.PREFERRED,
+                    user_verification=UserVerificationRequirement.PREFERRED,
+                ),
+            )
+            state["webauthnChallenge"] = bytes(opts.challenge)
+            return json.loads(options_to_json(opts))
+        except Exception:
+            return None
+
+    async def maybe_enroll_device(self, connection: ServerConnection, state: dict[str, Any]) -> None:
+        """After a device authenticates (identity or token), ask it to enroll a
+        silent key if it lacks one, so every later connection signs in with no
+        prompt. Enrollment is authenticated (this runs post-auth); the token the
+        device just used is the enrollment anchor."""
+        if not state.get("needsEnroll") or not state.get("deviceId"):
+            return
+        await self.send_json(connection, {"type": "enroll-key"})
+
+    def handle_register_key(self, connection: ServerConnection, state: dict[str, Any], payload: dict[str, Any]) -> None:
+        """Store a device's silent public key. Only ever reached post-auth, so the
+        caller already proved itself (identity or token) for `state["user"]`."""
+        device_id = state.get("deviceId") or ""
+        pub = str(payload.get("publicKey", ""))
+        if device_id and pub and self._valid_spki(pub):
+            register_device_key(
+                state.get("user", ""), device_id, pub,
+                device_label(connection.request.headers.get("User-Agent", "")),
+            )
+            state["needsEnroll"] = False
+
+    async def handle_webauthn_register(self, connection: ServerConnection, state: dict[str, Any], payload: dict[str, Any]) -> None:
+        """Verify the one-time biometric attestation, then store the silent key
+        (marked webauthn-backed). Gates off-tailnet enrollment of a new device."""
+        challenge = state.get("webauthnChallenge")
+        pub = str(payload.get("publicKey", ""))
+        device_id = state.get("deviceId") or ""
+        if not challenge or not device_id or not self._valid_spki(pub):
+            await self.send_json(connection, {"type": "notice", "message": "Device enrollment failed."})
+            return
+        try:
+            from webauthn import verify_registration_response
+            verify_registration_response(
+                credential=json.dumps(payload.get("attestation")),
+                expected_challenge=challenge,
+                expected_rp_id=self.rp_id(connection),
+                expected_origin=self.expected_origin(connection),
+            )
+        except Exception:
+            await self.send_json(connection, {"type": "notice", "message": "Device verification failed."})
+            return
+        register_device_key(
+            state.get("user", ""), device_id, pub,
+            device_label(connection.request.headers.get("User-Agent", "")), webauthn=True,
+        )
+        state["needsEnroll"] = False
+        state["webauthnChallenge"] = None
+        await self.send_json(connection, {"type": "notice", "message": "This device is now enrolled for silent sign-in."})
+
     async def websocket_handler(self, connection: ServerConnection) -> None:
         request_url = urlsplit(connection.request.path)
         if request_url.path != WS_PATH:
@@ -2839,13 +3065,24 @@ class AppServer:
         user = self.owner if self.multi_tenant else ""
         device_id = ""
         require_token_here = self.token_required_for(trusted_client) and auto_user is None
+        # auth_method records how we authenticated so we can decide enrollment
+        # (silent on the tailnet, biometric-gated off it). needs_enroll/enroll_public
+        # drive the post-ready device-key enrollment exchange.
+        auth_method = "trusted"
+        needs_enroll = False
+        is_public = self.request_is_public(connection)
         # Read the client's auth frame when auth is needed, or (when the proxy
-        # identity already authed us) just to capture the deviceId.
+        # identity already authed us) just to capture the deviceId. We first hand
+        # the client a one-time nonce it can sign with its enrolled device key.
         if self.multi_tenant or require_token_here or auto_user is not None:
+            nonce = secrets.token_urlsafe(32)
             try:
+                await self.send_json(connection, {"type": "auth-challenge", "nonce": nonce})
                 raw_auth = await asyncio.wait_for(connection.recv(), timeout=20)
             except TimeoutError:
                 await connection.close(code=4001, reason="auth timeout")
+                return
+            except ConnectionClosed:
                 return
             if not isinstance(raw_auth, str):
                 await connection.close(code=4001, reason="auth required")
@@ -2860,38 +3097,48 @@ class AppServer:
                 await connection.close(code=4001, reason="auth failed")
                 return
             device_id = str(auth_payload.get("deviceId", ""))[:64]
+            signature = str(auth_payload.get("signature", ""))
+            claimed_user = sanitize_user(auth_payload.get("user", "")) if self.multi_tenant else ""
+
             if auto_user is not None:
-                # Authenticated by the Tailscale identity the serve proxy injected;
-                # the token is not consulted, and the identity is authoritative for
-                # the user (overrides any client-claimed username).
+                # Authenticated by the Tailscale identity the serve proxy injected
+                # (tailnet only — never a public Funnel request); the token is not
+                # consulted and the identity is authoritative for the user.
                 user = auto_user if self.multi_tenant else ""
-            elif self.multi_tenant:
-                user = sanitize_user(auth_payload.get("user", ""))
-                user_meta = self.users.get(user)
-                # A device that has authenticated with the token once is
-                # remembered (its deviceId is in the user's registry), so it can
-                # reconnect without the token. The deviceId is a 122-bit random
-                # secret held only by that browser, so it acts as a persistent
-                # per-device credential (like a "remember this device" session).
-                remembered = user_meta is not None and self.device_remembered(user, device_id)
-                token_ok = user_meta is not None and (
-                    not require_token_here
-                    or remembered
-                    or hmac.compare_digest(str(auth_payload.get("token", "")), user_meta["token"])
-                )
-                if not token_ok:
-                    await self.send_json(connection, {"type": "auth-error", "message": "Invalid user or access token."})
-                    await connection.close(code=4001, reason="auth failed")
-                    return
+                auth_method = "identity"
             else:
-                token_ok = not require_token_here or (
-                    self.token is not None
-                    and hmac.compare_digest(str(auth_payload.get("token", "")), self.token)
-                )
-                if not token_ok:
-                    await self.send_json(connection, {"type": "auth-error", "message": "Invalid access token."})
-                    await connection.close(code=4001, reason="auth failed")
-                    return
+                # Silent device-bound key: verify the signature over our nonce
+                # against the enrolled public key. Works from anywhere, no prompt.
+                spki = device_pubkey(claimed_user, device_id)
+                if signature and spki and verify_device_signature(spki, nonce.encode("ascii"), signature):
+                    user = claimed_user
+                    auth_method = "device-key"
+                else:
+                    # Fall back to the shared token (bootstrap / legacy remember-me).
+                    if self.multi_tenant:
+                        user = claimed_user
+                        user_meta = self.users.get(user)
+                        remembered = user_meta is not None and self.device_remembered(user, device_id)
+                        token_ok = user_meta is not None and (
+                            not require_token_here
+                            or remembered
+                            or hmac.compare_digest(str(auth_payload.get("token", "")), user_meta["token"])
+                        )
+                        err = "Invalid user or access token."
+                    else:
+                        user = ""
+                        token_ok = not require_token_here or (
+                            self.token is not None
+                            and hmac.compare_digest(str(auth_payload.get("token", "")), self.token)
+                        )
+                        err = "Invalid access token."
+                    if not token_ok:
+                        await self.send_json(connection, {"type": "auth-error", "message": err})
+                        await connection.close(code=4001, reason="auth failed")
+                        return
+                    auth_method = "token"
+            # Offer to enroll a silent key for any authed device that lacks one.
+            needs_enroll = bool(device_id) and device_pubkey(user, device_id) is None
 
         if self.multi_tenant:
             self.register_device(user, device_id, device_label(connection.request.headers.get("User-Agent", "")))
@@ -2906,7 +3153,16 @@ class AppServer:
         create_if_missing = created
         requested_session_missing = bool(requested_session) and requested_session != session_name
 
-        state = {"session": session_name, "user": user}
+        state = {
+            "session": session_name,
+            "user": user,
+            "deviceId": device_id,
+            # Enrollment context for the post-ready device-key exchange.
+            "authMethod": auth_method,
+            "needsEnroll": needs_enroll,
+            "enrollPublic": is_public,
+            "webauthnChallenge": None,
+        }
         bridge = TmuxBridge(
             session_name,
             self.shell,
@@ -3049,6 +3305,7 @@ class AppServer:
             await self.send_sessions(connection, state["user"], state["session"])
             await self.send_settings(connection, state["user"])
             await self.send_composer_state(connection, state["session"])
+            await self.maybe_enroll_device(connection, state)
 
             async for raw_message in connection:
                 if not isinstance(raw_message, str):
