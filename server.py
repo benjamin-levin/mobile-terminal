@@ -964,8 +964,9 @@ def user_state_path(user: str) -> Path:
 
 
 def load_user_state(user: str) -> dict[str, Any]:
-    """Per-user owned-session map + device registry: {owned:{name:{label}}, devices:{id:{...}}}."""
-    state: dict[str, Any] = {"owned": {}, "devices": {}}
+    """Per-user owned-session map, device registry and open-tab set:
+    {owned:{name:{label}}, devices:{id:{...}}, openTabs:[name]}."""
+    state: dict[str, Any] = {"owned": {}, "devices": {}, "openTabs": []}
     path = user_state_path(user)
     if path.is_file():
         try:
@@ -975,6 +976,8 @@ def load_user_state(user: str) -> dict[str, Any]:
                     state["owned"] = raw["owned"]
                 if isinstance(raw.get("devices"), dict):
                     state["devices"] = raw["devices"]
+                if isinstance(raw.get("openTabs"), list):
+                    state["openTabs"] = [name for name in raw["openTabs"] if isinstance(name, str) and name]
         except (OSError, json.JSONDecodeError):
             pass
     return state
@@ -1790,6 +1793,30 @@ class AppServer:
             del state["owned"][name]
             save_user_state(user, state)
 
+    def open_tabs_for(self, user: str) -> list[str]:
+        """The user's persisted open-tab set, pruned to sessions that still
+        exist and that the user may see, so every entry can be reopened."""
+        if not self.multi_tenant:
+            return []
+        visible = self.visible_session_names(user)
+        return [name for name in load_user_state(user)["openTabs"] if name in visible]
+
+    def save_open_tabs(self, user: str, names: Any) -> None:
+        """Persist the client-reported open-tab set (the user's tabs follow
+        them across devices). Entries are deduped and restricted to the user's
+        visible sessions so one tenant can never pin another's sessions."""
+        if not self.multi_tenant or not isinstance(names, list):
+            return
+        visible = self.visible_session_names(user)
+        cleaned: list[str] = []
+        for name in names:
+            if isinstance(name, str) and name in visible and name not in cleaned:
+                cleaned.append(name)
+        state = load_user_state(user)
+        if state["openTabs"] != cleaned:
+            state["openTabs"] = cleaned
+            save_user_state(user, state)
+
     def create_user_session(self, user: str, cwd: str | None = None) -> str:
         existing = {session["name"] for session in list_sessions()}
         if self.multi_tenant:
@@ -2441,6 +2468,10 @@ class AppServer:
             await self.send_sessions(connection, user, session_name)
             return
 
+        if message_type == "open-tabs":
+            self.save_open_tabs(user, payload.get("tabs"))
+            return
+
         if message_type == "request-settings":
             await self.send_settings(connection, user)
             return
@@ -2999,6 +3030,9 @@ class AppServer:
                     "multiTenant": self.multi_tenant,
                     "user": user if self.multi_tenant else None,
                     "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
+                    # Only the first ready of a connection carries the persisted
+                    # open-tab set; the client adopts it, then owns the state.
+                    "openTabs": self.open_tabs_for(user) if self.multi_tenant else None,
                 },
             )
             if history:

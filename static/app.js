@@ -1542,6 +1542,17 @@
     localStorage.setItem(STORAGE_ACTIVE_SESSION_KEY, sessionName);
   }
 
+  // True once the server has sent its per-user open-tab set on this
+  // connection; from then on every local change is pushed back so the user's
+  // tabs follow them across devices.
+  let openTabsServerSync = false;
+
+  function pushOpenTabsToServer() {
+    if (openTabsServerSync) {
+      sendMessage({ type: "open-tabs", tabs: openTabNames });
+    }
+  }
+
   function persistOpenTabs() {
     if (!openTabNames.length) {
       localStorage.removeItem(STORAGE_OPEN_TABS_KEY);
@@ -1559,6 +1570,7 @@
       ),
     );
     persistOpenTabs();
+    pushOpenTabsToServer();
   }
 
   function addOpenTab(sessionName) {
@@ -3958,7 +3970,7 @@
       const button = document.createElement("button");
       button.className = `tab-menu-button${session.name === activeSessionName ? " is-active" : ""}`;
       button.type = "button";
-      button.textContent = session.name;
+      button.textContent = session.label || session.name;
       button.addEventListener("click", () => {
         switchSession(session.name);
       });
@@ -5012,6 +5024,9 @@
               STORAGE_OPEN_TABS_KEY,
               STORAGE_EDITOR_TABS_KEY,
             ].forEach((key) => localStorage.removeItem(key));
+            // Drop the previous user's in-memory tab set too, so it can't
+            // leak into the new user's server-synced open-tab list below.
+            openTabNames = [];
             localStorage.setItem(STORAGE_SETTINGS_OWNER_KEY, currentUser);
           }
         }
@@ -5024,7 +5039,18 @@
         activeTabKey = terminalTabKey(activeSessionName);
       }
       persistActiveSession(activeSessionName);
+      // Adopt the server's per-user open-tab set (sent only on the first
+      // ready of a connection) so signing in anywhere reopens every tab the
+      // user had open. An empty server list (first run after upgrade) is
+      // seeded from this device's tabs by the push below.
+      if (Array.isArray(payload.openTabs)) {
+        if (payload.openTabs.length) {
+          setOpenTabs(payload.openTabs);
+        }
+        openTabsServerSync = true;
+      }
       addOpenTab(activeSessionName);
+      pushOpenTabsToServer();
       followOutput = true;
       // Each connection gets a fresh bridge PTY on the server; the resize
       // gate below is page-lifetime, so without resetting it an unchanged
