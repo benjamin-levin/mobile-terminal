@@ -8,7 +8,9 @@
 - Mobile-friendly tmux window tabs with create, rename, close, and polling-based sync.
 - Shortcut bar for touch devices with editable macros such as `{CTRL+C}`, `{CTRL+X}{TAB}`, arrows, and pasted text.
 - Shared-secret login gate so the terminal is not exposed anonymously on your LAN.
-- Optional Tailscale-only binding, with optional remote IP allowlisting so only a chosen Tailscale device can connect.
+- Device-bound silent auth: a browser enrolls a non-extractable key once, then reconnects with no prompt (see [Authentication](#authentication)).
+- Optional Tailscale-only binding, with optional remote IP allowlisting so only a chosen Tailscale device can connect, or public access via Tailscale Funnel.
+- Optional multi-tenancy: several users on one machine, each with their own token, tabs, and devices.
 - Follow-output mode that keeps the viewport pinned to the bottom while streaming.
 - Separate display controls for overall UI scale and terminal text size.
 
@@ -50,6 +52,86 @@ Bind only to Tailscale and allow only your phone's Tailscale IP:
 ```
 
 You can find the phone's Tailscale IP in the Tailscale app or the Tailscale admin console. With `--allow-client`, any other device is rejected before the terminal UI loads.
+
+## Authentication
+
+Each WebSocket connection is authenticated by the first of these that succeeds:
+
+1. **Device-bound key (silent).** The browser generates a non-extractable ECDSA
+   P-256 key pair (WebCrypto), keeps the private key in IndexedDB, and registers
+   only the public key with the server (`state/device-keys.json`). To connect it
+   signs a one-time server nonce; the server verifies against the stored public
+   key. Unlike a token this credential cannot be exported by JavaScript or
+   replayed (each nonce is single-use), so an enrolled device reconnects with no
+   prompt from anywhere.
+2. **Shared token (bootstrap / fallback).** The per-user (multi-tenant) or global
+   (`MOBILE_TERMINAL_TOKEN`) secret. Entering it once enrolls this device's key;
+   thereafter the device is silent.
+3. **Tailscale identity (opt-in, off by default).** Token-less auto-login from the
+   `Tailscale-User-Login` header injected by `tailscale serve`. Gated behind
+   `MOBILE_TERMINAL_TRUST_IDENTITY` — see the caveat below.
+
+### Enrolling a device
+
+- **Token-free (tailnet identity):** with `MOBILE_TERMINAL_TRUST_IDENTITY=1` on a
+  machine reachable on the tailnet *with identity*, opening the terminal enrolls
+  the device's key automatically — no token. Safe **only** where identity is
+  genuine (see caveat).
+- **One-time token:** otherwise, enter the token once. The device enrolls its key
+  and every later connection is silent.
+
+Enrollment persists server-side indefinitely (until sign-out, token rotation, or
+deleting the entry). On the phone the private key lives in browser storage; on
+**iOS Safari, add the site to the Home Screen** so the key is exempt from
+Safari's ~7-day eviction of unused-site storage and survives permanently.
+Signing out sends `forget-key`, which revokes the server-side public key.
+
+### Public (off-tailnet) access — Tailscale Funnel
+
+`tailscale serve` is tailnet-only. To reach the terminal from the public internet,
+enable Funnel on the served port (Funnel must be enabled for the tailnet first, via
+the admin console `nodeAttrs`/consent flow):
+
+```bash
+sudo tailscale funnel --bg --https=<public-port> http://127.0.0.1:<local-port>
+```
+
+The device key (or token) is then the sole gate, so keep it enabled.
+
+### ⚠️ Identity trust vs Funnel — NAT box vs public VPS
+
+`MOBILE_TERMINAL_TRUST_IDENTITY` is **off by default** because Tailscale Funnel was
+observed injecting the node owner's `Tailscale-User-Login` into public requests on
+some setups, which would auto-authenticate anyone as the owner. Behavior differs by
+how the machine reaches the internet:
+
+- **NAT'd machine (no public IP):** the `*.ts.net` name resolves to the *tailnet*
+  IP for tailnet members, so tailnet requests carry genuine identity while Funnel
+  serves the public path separately. Token-free auto-enroll works on the same URL.
+  Safe to set `MOBILE_TERMINAL_TRUST_IDENTITY=1` here.
+- **Public-IP VPS:** enabling Funnel makes the `*.ts.net` name resolve to the
+  machine's *public* IP for everyone (even on the tailnet), so every request
+  arrives via the public path with **no identity** — and non-Funnel ports become
+  unreachable by that name. There is no identity-bearing address, so token-free
+  auto-enroll is not possible; use the one-time token. Keep identity trust **off**.
+
+Optional: `MOBILE_TERMINAL_RP_ID` / `MOBILE_TERMINAL_ORIGIN` override the WebAuthn
+RP id / origin (otherwise derived from the request `Host`).
+
+### Multi-tenancy
+
+Copy `mobile-terminal-users.example.json` to `mobile-terminal-users.json` to host
+several users on one machine, each with their own token, tabs, devices, and per-user
+settings. See that file's comments for the format. It is an organizational boundary,
+not a security one — every tab is a real shell as the one OS user.
+
+### Dependencies
+
+Device-key verification uses `cryptography`; the optional WebAuthn enrollment path
+uses `webauthn` + `cbor2`. Install them into the virtualenv the service runs from
+(`.venv/bin/pip install cryptography cbor2 webauthn`) and point the service's
+`ExecStart` at that interpreter. `state/`, `*.env`, and `mobile-terminal-users.json`
+hold secrets/keys and are gitignored.
 
 ## tmux scrolling
 
