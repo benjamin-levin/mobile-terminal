@@ -48,7 +48,13 @@ body {
   background:
     radial-gradient(circle at top, rgba(255, 183, 3, 0.12), transparent 28%),
     radial-gradient(circle at right 20%, rgba(103, 232, 249, 0.08), transparent 25%),
-    linear-gradient(180deg, #0a1720 0%, #071118 52%, #050b10 100%);
+    linear-gradient(180deg, #0a1720 0%, #071118 52%, #071118 100%);
+  /* iOS standalone (viewport-fit=cover) fills the home-indicator safe-area strip
+     with the ROOT element's solid background-color only — it ignores background
+     images/gradients there. The `background:` shorthand above resets the color to
+     transparent, so without this line that strip falls back to white (the "chin").
+     Declaring it AFTER the shorthand paints the whole safe area one dark surface. */
+  background-color: var(--bg-main);
   color: var(--text-main);
   font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
   font-size: var(--body-font);
@@ -824,6 +830,11 @@ button:disabled {
   bottom: 0;
   z-index: 20;
   padding: 0;
+  /* Solid opaque dock: paints as one clean bar down through the home-indicator
+     safe-area strip. Without this the panel is transparent, so the bar's
+     safe-area bottom padding shows the body gradient (a "colored gap") and the
+     bottom strip falls back to white (the "chin") on iOS standalone. */
+  background: var(--bg-main);
 }
 
 .composer-panel {
@@ -899,6 +910,15 @@ body[data-composer-active="true"] .composer-panel {
   overscroll-behavior-x: contain;
   padding: 0 var(--page-pad-x) env(safe-area-inset-bottom);
   align-items: stretch;
+}
+
+/* iOS standalone PWA keeps env(safe-area-inset-bottom) at its static ~34px even
+   with the keyboard open (Safari tabs zero it out; standalone does not). With the
+   keyboard up, the home indicator is covered by the keyboard, so that padding is
+   dead space that lifts the button row off the accessory bar — the "gap between
+   the shortcut bar and the chevron/checkmark bubble". Drop it while typing. */
+body[data-keyboard-open="true"] .shortcut-bar {
+  padding-bottom: 0;
 }
 
 .tab-menu {
