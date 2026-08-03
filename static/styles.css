@@ -6,6 +6,12 @@
   --editor-ui-font-size: max(calc(11px * var(--ui-scale)), calc(var(--terminal-font-size) * 0.9));
   --editor-code-font-size: var(--terminal-font-size);
   --keyboard-inset: 0px;
+  /* Standalone-PWA quirk: visualViewport.height stops ~22 CSS px short of iOS's
+     floating keyboard accessory pill, leaving a constant gap under the shortcut
+     dock. Grow the app-shell by this constant only while the keyboard is open so
+     the dock meets the pill. Tune if it overshoots (buttons under pill) or
+     undershoots (gap remains). */
+  --kb-accessory-gap: 12px;
   --shortcut-height: 74px;
   --shortcut-reserve: 74px;
   --bg-main: #071118;
@@ -94,6 +100,14 @@ button {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
+}
+
+/* Keyboard open: extend the shell downward by the accessory-pill gap. The
+   shortcuts panel is absolute bottom:0 inside the shell, so it rides down and
+   the dock meets the iOS pill. Growing height (not translateY) avoids the
+   overflow:hidden clip a downward transform would cause. */
+body[data-keyboard-open="true"] .app-shell {
+  height: calc(var(--app-height) + var(--kb-accessory-gap));
 }
 
 .topbar {
