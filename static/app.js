@@ -391,6 +391,12 @@
   let selectedSessionName = localStorage.getItem(STORAGE_ACTIVE_SESSION_KEY) || "";
   let activeTabKey = selectedSessionName ? terminalTabKey(selectedSessionName) : "";
   let activeSessionName = "";
+  // The tab the user was on before the current one — used by the selection's
+  // "To tab" chip to send a command to the most recent *other* tab.
+  let previousSessionName = "";
+  // When the "To tab" chip switches sessions, the paste is deferred until that
+  // session's `ready` arrives: { session, text }.
+  let pendingPasteAfterSwitch = null;
   let fileRequestCounter = 0;
   let pendingFileRequests = new Map();
   let lastDefaultFileRoot = "";
@@ -1166,22 +1172,79 @@
     return copied;
   }
 
+  // Flatten a multi-line selection into a single line so pasting it into a shell
+  // or REPL doesn't fire an Enter per line (each newline would submit early).
+  // xterm joins soft-wrapped rows seamlessly and only emits "\n" at real line
+  // breaks, so those breaks become spaces (never gluing two tokens together).
+  // Runs of blank lines collapse to one space; leading/trailing space is trimmed.
+  function flattenCopyText(text) {
+    return text.replace(/[ \t]*\r?\n[ \t]*/g, " ").replace(/ {2,}/g, " ").trim();
+  }
+
   async function copyTerminalSelection() {
-    const text = terminalSelectionText();
-    if (!text) {
+    const raw = terminalSelectionText();
+    if (!raw) {
       showToast("Select terminal text first.");
       return;
     }
+    const text = flattenCopyText(raw);
+    const flattened = /\r?\n/.test(raw);
+    const okMessage = flattened ? "Copied — line breaks removed." : "Copied terminal selection.";
     try {
       await navigator.clipboard.writeText(text);
-      showToast("Copied terminal selection.");
+      showToast(okMessage);
     } catch (_error) {
       if (copyTextWithFallback(text)) {
-        showToast("Copied terminal selection.");
+        showToast(okMessage);
         return;
       }
       showToast("Clipboard copy is blocked by this browser.");
     }
+  }
+
+  // The most recent tab other than the current one. Prefers the tab the user
+  // last came from (previousSessionName); falls back to the nearest other open
+  // tab so the "To tab" chip always has a target when >1 tab is open.
+  function recentOtherSession() {
+    const current = selectedSessionName || activeSessionName;
+    if (
+      previousSessionName &&
+      previousSessionName !== current &&
+      openTabNames.includes(previousSessionName)
+    ) {
+      return previousSessionName;
+    }
+    const idx = openTabNames.indexOf(current);
+    for (let i = idx - 1; i >= 0; i -= 1) {
+      if (openTabNames[i] && openTabNames[i] !== current) {
+        return openTabNames[i];
+      }
+    }
+    for (let i = openTabNames.length - 1; i >= 0; i -= 1) {
+      if (openTabNames[i] && openTabNames[i] !== current) {
+        return openTabNames[i];
+      }
+    }
+    return "";
+  }
+
+  // Send the current selection (flattened to one line) to the most recent other
+  // tab: switch to it, then drop the text into its composer once it's ready. The
+  // paste lands in the prompt for review — it is not auto-executed.
+  async function pasteSelectionToRecentTab() {
+    const raw = terminalSelectionText();
+    if (!raw) {
+      showToast("Select terminal text first.");
+      return;
+    }
+    const target = recentOtherSession();
+    if (!target) {
+      showToast("No other tab to send to.");
+      return;
+    }
+    pendingPasteAfterSwitch = { session: target, text: flattenCopyText(raw) };
+    dismissTerminalSelection();
+    switchSession(target);
   }
 
   // --- Touch text selection (press-and-hold, then drag the handles) ---------
@@ -1193,41 +1256,14 @@
   const TERM_LONGPRESS_SLOP = 12; // px the finger may drift before it's a scroll
   const TERM_DOUBLETAP_MS = 120; // max gap between the two taps of a double-tap
   const TERM_DOUBLETAP_DIST = 28; // px the two taps may be apart
-  // A lone tap opens the keyboard, but only after this delay so a second tap
-  // (double-tap → select a word) can cancel it first. Kept just above the
-  // double-tap window: long enough to catch a fast double-tap, short enough that
-  // the keyboard still feels like it opens promptly on a deliberate single tap.
-  const TERM_TAP_KEYBOARD_DELAY_MS = 160;
   let termSel = null; // in-flight press/drag session, or null
   let termSelHandles = null; // lazily-created { layer, start, end, copy } DOM
   let suppressNextTerminalClick = false;
   let suppressComposerOpenThisTouch = false; // set when a tap only dismisses a selection
-  let terminalComposerOpenTimer = null; // pending delayed keyboard open, or null
+  let selectionTapCopy = null; // {x,y} when a touch landed inside the live selection
   let lastTermTapAt = 0; // for double-tap-to-select-word recognition
   let lastTermTapX = 0;
   let lastTermTapY = 0;
-
-  // The keyboard opens on a plain tap, but only after the double-tap window has
-  // passed with no second tap — a quick double-press selects a word instead and
-  // cancels this pending open.
-  function cancelPendingComposerOpen() {
-    if (terminalComposerOpenTimer) {
-      window.clearTimeout(terminalComposerOpenTimer);
-      terminalComposerOpenTimer = null;
-    }
-  }
-
-  function scheduleComposerOpen() {
-    cancelPendingComposerOpen();
-    // btop tabs have no prompt — never raise the keyboard there.
-    if (btopMode) {
-      return;
-    }
-    terminalComposerOpenTimer = window.setTimeout(() => {
-      terminalComposerOpenTimer = null;
-      openComposer(true);
-    }, TERM_TAP_KEYBOARD_DELAY_MS);
-  }
 
   function hapticPulse(ms) {
     try {
@@ -1365,24 +1401,56 @@
     };
     const start = makeHandle("start");
     const end = makeHandle("end");
-    const copy = document.createElement("button");
-    copy.type = "button";
-    copy.className = "term-select-copy";
-    copy.textContent = "Copy";
-    // Stop the tap from bubbling to #terminal, whose touchstart would otherwise
-    // dismiss the very selection we're about to copy.
-    copy.addEventListener("touchstart", (event) => event.stopPropagation(), {
-      passive: true,
-    });
-    copy.addEventListener("click", async (event) => {
-      event.preventDefault();
-      event.stopPropagation();
+    // A chip is a tap target that floats over the selection. It must fully own
+    // its tap: if touchstart/touchend bubble to #terminal, finishTouchScroll
+    // raises the keyboard, which resizes the viewport and repositions the chip
+    // mid-tap — iOS then CANCELS the synthetic click, so a `click`-only handler
+    // silently never fires. So we fire on touchend directly (preventDefault to
+    // kill the trailing synthetic click + stop the scroll/keyboard cascade) and
+    // keep `click` only as the desktop/mouse path, deduped against the touch.
+    const makeChip = (label, onActivate) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "term-select-chip";
+      btn.textContent = label;
+      let touchHandledAt = 0;
+      btn.addEventListener("touchstart", (event) => event.stopPropagation(), {
+        passive: true,
+      });
+      btn.addEventListener(
+        "touchend",
+        async (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          touchHandledAt = performance.now();
+          await onActivate();
+        },
+        { passive: false },
+      );
+      btn.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        // Ignore the click that some browsers still synthesize after touchend.
+        if (performance.now() - touchHandledAt < 700) {
+          return;
+        }
+        await onActivate();
+      });
+      return btn;
+    };
+    const copy = makeChip("Copy", async () => {
       await copyTerminalSelection();
       dismissTerminalSelection();
     });
-    layer.append(start, end, copy);
+    const paste = makeChip("To tab", async () => {
+      await pasteSelectionToRecentTab();
+    });
+    const chips = document.createElement("div");
+    chips.className = "term-select-chips";
+    chips.append(copy, paste);
+    layer.append(start, end, chips);
     terminalElement.appendChild(layer);
-    termSelHandles = { layer, start, end, copy };
+    termSelHandles = { layer, start, end, copy, paste, chips };
     return termSelHandles;
   }
 
@@ -1432,16 +1500,42 @@
     if (topBox) {
       const aboveTop = topBox.top - KNOB_CLEARANCE;
       const below = aboveTop < 8;
-      handles.copy.classList.toggle("is-below", below);
-      handles.copy.style.left = `${topBox.left}px`;
-      handles.copy.style.top = below
+      handles.chips.classList.toggle("is-below", below);
+      handles.chips.style.left = `${topBox.left}px`;
+      handles.chips.style.top = below
         ? `${bottomBox.bottom + KNOB_CLEARANCE}px`
         : `${aboveTop}px`;
-      handles.copy.style.display = "block";
+      handles.chips.style.display = "flex";
     } else {
-      handles.copy.style.display = "none";
+      handles.chips.style.display = "none";
     }
     handles.layer.style.display = "block";
+  }
+
+  // True when a screen point falls within the current text selection's range.
+  // Lets a tap on the highlighted text itself trigger a copy (see touchstart).
+  function pointInSelection(clientX, clientY) {
+    const pos =
+      typeof term.getSelectionPosition === "function" ? term.getSelectionPosition() : null;
+    if (!pos) {
+      return false;
+    }
+    const screen = terminalScreenEl();
+    if (!screen) {
+      return false;
+    }
+    const cell = terminalCellSize();
+    const rect = screen.getBoundingClientRect();
+    const col = Math.floor((clientX - rect.left) / cell.width);
+    const vrow = Math.floor((clientY - rect.top) / cell.height);
+    if (vrow < 0 || vrow >= term.rows) {
+      return false;
+    }
+    const absRow = vrow + term.buffer.active.viewportY;
+    const afterStart = absRow > pos.start.y || (absRow === pos.start.y && col >= pos.start.x);
+    // pos.end.x is one past the last selected cell; <= adds a cell of tap slop.
+    const beforeEnd = absRow < pos.end.y || (absRow === pos.end.y && col <= pos.end.x);
+    return afterStart && beforeEnd;
   }
 
   // Drag a handle to move one end of the selection. We re-drive xterm from the
@@ -3524,9 +3618,6 @@
       "touchstart",
       (event) => {
         cancelTouchInertia();
-        // Any new contact pre-empts a pending keyboard open (a scroll, long-press
-        // or the second tap of a double-tap should all cancel it).
-        cancelPendingComposerOpen();
         if (event.touches.length >= 2) {
           // Second finger down: switch from scrolling to the gesture recognizer.
           touchScrollState = null;
@@ -3547,6 +3638,14 @@
         // handles) before it can start scrolling or a new long-press. Handle
         // drags stopPropagation before reaching here, so they're unaffected.
         if (isSelectionUIVisible()) {
+          if (pointInSelection(touch.clientX, touch.clientY)) {
+            // Tapping the highlighted text itself copies it — no need to hit the
+            // Copy chip. Defer the copy to touchend so a drag can still scroll.
+            selectionTapCopy = { x: touch.clientX, y: touch.clientY };
+            suppressComposerOpenThisTouch = true;
+            touchScrollState = null;
+            return;
+          }
           dismissTerminalSelection();
           suppressNextTerminalClick = true;
           // This tap only dismissed the selection; it shouldn't also raise the
@@ -3564,6 +3663,12 @@
           lastTermTapAt = 0;
           termSel = { doubleTap: true };
           touchScrollState = null;
+          // Tap 1's touchend already raised the keyboard synchronously (that's
+          // what makes single-tap-to-type work on iOS). This second tap is a
+          // word-select gesture, so drop the keyboard back down.
+          if (document.activeElement === composerInput) {
+            composerInput.blur();
+          }
           // selectWordAt() uses term.select() (no synthetic mouse event), so it
           // never focuses xterm's textarea and can run synchronously without
           // popping the keyboard.
@@ -3587,6 +3692,20 @@
         if (gestureState) {
           gestureTouchMove(event);
           return;
+        }
+        if (selectionTapCopy) {
+          const t = event.touches[0];
+          if (
+            t &&
+            Math.hypot(t.clientX - selectionTapCopy.x, t.clientY - selectionTapCopy.y) >
+              TERM_LONGPRESS_SLOP
+          ) {
+            // Finger dragged off the tap — cancel the copy and drop the selection.
+            selectionTapCopy = null;
+            dismissTerminalSelection();
+            suppressNextTerminalClick = true;
+          }
+          return; // don't scroll or select while a copy-tap is pending
         }
         if (
           event.touches.length === 1 &&
@@ -3642,6 +3761,15 @@
         gestureTouchEnd(event);
         touchScrollState = null;
         cancelTerminalSelectionPress();
+        selectionTapCopy = null;
+        return;
+      }
+      // A clean tap inside the selection copies it.
+      if (selectionTapCopy) {
+        selectionTapCopy = null;
+        touchScrollState = null;
+        suppressNextTerminalClick = true;
+        copyTerminalSelection().then(dismissTerminalSelection);
         return;
       }
       // A completed double-tap selection needs no scroll/inertia handling.
@@ -3662,18 +3790,20 @@
         lastTermTapY = tapTouch.clientY;
       }
       const scrolled = !!(touchScrollState && touchScrollState.lastMoveAt);
-      // A plain tap (no scroll, no long-press selection) opens the keyboard — but
-      // only after the double-tap window, so a following second tap (which
-      // selects a word) can cancel it via cancelPendingComposerOpen() on its
-      // touchstart. Driving this from touchend (not click) keeps the ordering
-      // reliable: touchend of tap 1 always precedes touchstart of tap 2.
+      // A plain tap (no scroll, no long-press selection) opens the keyboard.
+      // iOS raises the soft keyboard ONLY when focus() runs synchronously inside
+      // the touch gesture — a deferred focus (setTimeout/rAF) is silently
+      // refused, which is what forced a second tap before. So focus now, in this
+      // handler. A genuine double-tap (word select) blurs it back down on its
+      // touchstart. btop tabs have no prompt — never raise the keyboard there.
       if (
         mobileComposerMode &&
+        !btopMode &&
         !wasLongPressSelection &&
         !scrolled &&
         !suppressComposerOpenThisTouch
       ) {
-        scheduleComposerOpen();
+        openComposer(true);
       }
       if (scrolled && performance.now() - touchScrollState.lastMoveAt < 80) {
         startTouchInertia(touchScrollState.velocity);
@@ -3682,6 +3812,7 @@
     };
     const cancelTouchScroll = () => {
       touchScrollState = null;
+      selectionTapCopy = null;
       cancelTerminalSelectionPress();
       gestureState = null;
       if (gestureTap && gestureTap.timer) {
@@ -5252,6 +5383,21 @@
         focusTerminal();
         performLayoutNow();
       }
+      // A "To tab" send switched us here; drop the command into this tab's
+      // prompt now that it's ready (not executed — the user reviews and sends).
+      if (pendingPasteAfterSwitch && pendingPasteAfterSwitch.session === activeSessionName) {
+        const { text } = pendingPasteAfterSwitch;
+        pendingPasteAfterSwitch = null;
+        if (mobileComposerMode) {
+          insertComposerText(text, true);
+        } else {
+          resetSpeechInputState();
+          sendMessage({ type: "input", data: text });
+        }
+        showToast("Pasted into this tab.");
+      } else {
+        pendingPasteAfterSwitch = null;
+      }
       return;
     }
     if (payload.type === "tabs") {
@@ -5267,6 +5413,23 @@
     }
     if (payload.type === "notice") {
       showToast(payload.message);
+      return;
+    }
+    if (payload.type === "image-uploaded") {
+      const path = payload.path || "";
+      if (path) {
+        // Server saved the pasted screenshot and handed back its absolute path.
+        // Drop the path into the prompt so the claude CLI reads the file; the
+        // user adds any words and sends.
+        if (mobileComposerMode) {
+          insertComposerText(path + " ");
+        } else {
+          sendMessage({ type: "input", data: path + " " });
+        }
+        showToast("Screenshot added — type a message and send.");
+      } else if (payload.error) {
+        showToast(payload.error);
+      }
       return;
     }
     if (payload.type === "composer-state") {
@@ -5656,6 +5819,9 @@
       focusTerminal();
       return;
     }
+    // Remember the tab we're leaving so the selection "To tab" chip can target
+    // the most recent *other* tab.
+    previousSessionName = selectedSessionName || activeSessionName;
     addOpenTab(sessionName);
     activeTabKey = terminalTabKey(sessionName);
     selectedSessionName = sessionName;
@@ -6592,11 +6758,67 @@
     if (!text || !event.clipboardData) {
       return;
     }
-    event.clipboardData.setData("text/plain", text);
+    // Match copyTerminalSelection(): flatten multi-line selections so a native
+    // copy (Cmd/Ctrl+C) doesn't carry Enter characters into a paste either.
+    event.clipboardData.setData("text/plain", flattenCopyText(text));
     event.preventDefault();
   });
 
+  function handleImagePaste(file) {
+    if (!file) {
+      return;
+    }
+    const MAX_IMAGE_BYTES = 16 * 1024 * 1024;
+    if (file.size > MAX_IMAGE_BYTES) {
+      showToast("Image too large (max 16MB).");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      const base64 = comma >= 0 ? result.slice(comma + 1) : result;
+      if (!base64) {
+        showToast("Couldn't read the image.");
+        return;
+      }
+      sendMessage({
+        type: "upload-image",
+        data: base64,
+        mime: file.type || "image/png",
+      });
+      showToast("Uploading screenshot…");
+    };
+    reader.onerror = () => showToast("Couldn't read the image.");
+    reader.readAsDataURL(file);
+  }
+
+  // Pull an image out of a paste. iOS Safari surfaces a pasted screenshot as a
+  // file item on clipboardData; there is no text/plain, so this must run before
+  // the text-only early return below or the image is silently dropped.
+  function imageFileFromClipboard(clipboardData) {
+    const items = clipboardData?.items;
+    if (!items) {
+      return null;
+    }
+    for (const item of items) {
+      if (item.kind === "file" && item.type && item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) {
+          return file;
+        }
+      }
+    }
+    return null;
+  }
+
   document.addEventListener("paste", (event) => {
+    const imageFile = imageFileFromClipboard(event.clipboardData);
+    if (imageFile) {
+      event.preventDefault();
+      handleImagePaste(imageFile);
+      return;
+    }
     const text = event.clipboardData?.getData("text/plain") || "";
     if (!text) {
       return;

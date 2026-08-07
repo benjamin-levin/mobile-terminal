@@ -2467,6 +2467,48 @@ class AppServer:
             revision=revision,
         )
 
+    async def handle_image_upload(
+        self,
+        connection: ServerConnection,
+        user: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Save a screenshot pasted into the composer, then hand the client back
+        the file's absolute path. The client drops that path into the prompt so
+        the claude CLI (or any tool at the prompt) reads the image by path —
+        reusing the already-authenticated WebSocket instead of a new HTTP route."""
+        data_b64 = payload.get("data", "")
+        if not isinstance(data_b64, str) or not data_b64:
+            await self.send_json(connection, {"type": "image-uploaded", "error": "Empty image."})
+            return
+        mime = str(payload.get("mime", "image/png") or "image/png")
+        ext = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/jpg": "jpg",
+            "image/gif": "gif",
+            "image/webp": "webp",
+        }.get(mime.lower(), "png")
+        try:
+            # binascii.Error (raised on malformed base64) subclasses ValueError.
+            raw = base64.b64decode(data_b64, validate=True)
+        except ValueError:
+            await self.send_json(connection, {"type": "image-uploaded", "error": "Bad image data."})
+            return
+        MAX_IMAGE_BYTES = 16 * 1024 * 1024
+        if not raw or len(raw) > MAX_IMAGE_BYTES:
+            await self.send_json(connection, {"type": "image-uploaded", "error": "Image too large."})
+            return
+        uploads = user_dir(user) / "uploads"
+        try:
+            uploads.mkdir(parents=True, exist_ok=True)
+            dest = uploads / f"paste-{time.time_ns()}.{ext}"
+            dest.write_bytes(raw)
+        except OSError:
+            await self.send_json(connection, {"type": "image-uploaded", "error": "Couldn't save image."})
+            return
+        await self.send_json(connection, {"type": "image-uploaded", "path": str(dest)})
+
     async def handle_command(
         self,
         connection: ServerConnection,
@@ -2556,6 +2598,10 @@ class AppServer:
             composer_state["revision"] = max(composer_state["revision"], revision)
             self.reset_mobile_composer_tracking(session_name)
             await self.send_composer_state(connection, session_name)
+            return
+
+        if message_type == "upload-image":
+            await self.handle_image_upload(connection, user, payload)
             return
 
         if message_type == "composer-force-clear":
