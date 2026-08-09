@@ -224,6 +224,25 @@ ensure_node_modules() {
   (cd "$ROOT_DIR" && npm ci)
 }
 
+# Create a self-contained Python venv and install server.py's runtime deps
+# (websockets, cryptography, pillow) from requirements.txt. This makes every
+# machine's install self-contained — no per-machine manual pip installs.
+ensure_python_env() {
+  local venv="${ROOT_DIR}/.venv"
+  local reqs="${ROOT_DIR}/requirements.txt"
+  if [[ ! -x "${venv}/bin/python" ]]; then
+    log "Creating Python venv at ${venv}"
+    python3 -m venv "$venv"
+  fi
+  if [[ -f "$reqs" ]]; then
+    log "Installing Python dependencies from requirements.txt"
+    "${venv}/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+    "${venv}/bin/pip" install --quiet -r "$reqs"
+  else
+    log "No requirements.txt found; skipping Python dependency install"
+  fi
+}
+
 write_env_file() {
   if [[ -f "$ENV_FILE" ]]; then
     log "Keeping existing $ENV_FILE"
@@ -260,7 +279,11 @@ install_systemd_service() {
   local user_dir service_path python_path workdir env_path
   user_dir="${HOME}/.config/systemd/user"
   service_path="${user_dir}/mobile-terminal.service"
-  python_path="$(command -v python3)"
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+    python_path="${ROOT_DIR}/.venv/bin/python"
+  else
+    python_path="$(command -v python3)"
+  fi
   workdir="$ROOT_DIR"
   env_path="$ENV_FILE"
 
@@ -283,7 +306,11 @@ install_launchd_service() {
   plist_path="${launch_agents_dir}/com.mobile-terminal.server.plist"
   wrapper_path="${ROOT_DIR}/mobile-terminal-launchd.sh"
   log_dir="${HOME}/Library/Logs/mobile-terminal"
-  python_path="$(command -v python3)"
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+    python_path="${ROOT_DIR}/.venv/bin/python"
+  else
+    python_path="$(command -v python3)"
+  fi
   uid_value="$(id -u)"
   root_quoted="$(shell_quote "$ROOT_DIR")"
   env_quoted="$(shell_quote "$ENV_FILE")"
@@ -359,6 +386,7 @@ install_service() {
 main() {
   ensure_runtime_dependencies
   ensure_node_modules
+  ensure_python_env
   write_env_file
   install_service
   log "Install complete"

@@ -1,0 +1,5 @@
+# Python runtime dependencies for mobile-terminal server.py
+# Installed by install.sh into the service's Python environment.
+websockets>=12.0
+cryptography>=42.0
+pillow>=10.0
