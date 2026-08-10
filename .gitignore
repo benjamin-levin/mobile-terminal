@@ -5,6 +5,7 @@ node_modules/
 *.env
 !example.env
 mobile-terminal-settings.json
+mobile-terminal-open-tabs.json
 mobile-terminal-usage.json
 mobile-terminal-users.json
 state/

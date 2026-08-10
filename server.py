@@ -38,6 +38,7 @@ STATIC_ROOT = ROOT / "static"
 NODE_MODULES_ROOT = ROOT / "node_modules"
 WS_PATH = "/_ws"
 SETTINGS_PATH = ROOT / "mobile-terminal-settings.json"
+OPEN_TABS_PATH = ROOT / "mobile-terminal-open-tabs.json"
 USAGE_PATH = ROOT / "mobile-terminal-usage.json"
 USAGE_RETENTION_DAYS = 365
 USAGE_VERSION = 2
@@ -508,6 +509,30 @@ def next_session_name(existing: set[str] | None = None) -> str:
         counter += 1
 
 
+def sessions_by_recent_activity() -> list[str]:
+    """Existing tmux session names ordered most-recently-active first."""
+    output = tmux_capture(
+        "list-sessions",
+        "-F",
+        "#{session_activity}\t#{session_name}",
+        check=False,
+    )
+    if output.returncode != 0:
+        return []
+    rows: list[tuple[int, str]] = []
+    for line in output.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        activity, name = parts
+        try:
+            rows.append((int(activity), name))
+        except ValueError:
+            continue
+    rows.sort(reverse=True)
+    return [name for _, name in rows]
+
+
 BTOP_SESSION_PREFIX = "btop-"
 # Only simple, tmux-safe target ids are allowed so the target round-trips
 # through the session name (btop-<target>) and survives a server restart.
@@ -847,6 +872,23 @@ def save_settings(settings: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_settings(settings)
     SETTINGS_PATH.write_text(json.dumps(normalized, indent=2) + "\n")
     return normalized
+
+
+def load_open_tabs_global() -> list[str]:
+    """Single-tenant persisted open-tab set (shared across all devices)."""
+    if not OPEN_TABS_PATH.is_file():
+        return []
+    try:
+        raw = json.loads(OPEN_TABS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [name for name in raw if isinstance(name, str) and name]
+
+
+def save_open_tabs_global(names: list[str]) -> None:
+    OPEN_TABS_PATH.write_text(json.dumps(names, indent=2) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1916,22 +1958,25 @@ class AppServer:
     def open_tabs_for(self, user: str) -> list[str]:
         """The user's persisted open-tab set, pruned to sessions that still
         exist and that the user may see, so every entry can be reopened."""
-        if not self.multi_tenant:
-            return []
         visible = self.visible_session_names(user)
-        return [name for name in load_user_state(user)["openTabs"] if name in visible]
+        stored = load_open_tabs_global() if not self.multi_tenant else load_user_state(user)["openTabs"]
+        return [name for name in stored if name in visible]
 
     def save_open_tabs(self, user: str, names: Any) -> None:
         """Persist the client-reported open-tab set (the user's tabs follow
         them across devices). Entries are deduped and restricted to the user's
         visible sessions so one tenant can never pin another's sessions."""
-        if not self.multi_tenant or not isinstance(names, list):
+        if not isinstance(names, list):
             return
         visible = self.visible_session_names(user)
         cleaned: list[str] = []
         for name in names:
             if isinstance(name, str) and name in visible and name not in cleaned:
                 cleaned.append(name)
+        if not self.multi_tenant:
+            if load_open_tabs_global() != cleaned:
+                save_open_tabs_global(cleaned)
+            return
         state = load_user_state(user)
         if state["openTabs"] != cleaned:
             state["openTabs"] = cleaned
@@ -1972,6 +2017,12 @@ class AppServer:
         # Legacy single-tenant behaviour.
         if session_exists(self.session_name):
             return self.session_name, False
+        # No requested/default session exists: resume the most-recently-active
+        # real session instead of force-creating a new tab. Only fall through to
+        # creating one when there is genuinely nothing to attach to.
+        for name in sessions_by_recent_activity():
+            if not name.startswith(BTOP_SESSION_PREFIX):
+                return name, False
         return next_session_name(), True
 
     def settings_for(self, user: str) -> dict[str, Any]:
@@ -3334,7 +3385,7 @@ class AppServer:
                     "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
                     # Only the first ready of a connection carries the persisted
                     # open-tab set; the client adopts it, then owns the state.
-                    "openTabs": self.open_tabs_for(user) if self.multi_tenant else None,
+                    "openTabs": self.open_tabs_for(user),
                 },
             )
             if history:
