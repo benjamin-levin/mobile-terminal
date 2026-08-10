@@ -5,6 +5,7 @@ import base64
 import datetime
 import fcntl
 import gzip
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -2155,6 +2156,11 @@ class AppServer:
         return result
 
     def manifest(self) -> dict[str, Any]:
+        # The rendered icon depends only on the label (render_app_icon draws the
+        # label text), so key the cache-busting query on the label. Re-labeling a
+        # host via MOBILE_TERMINAL_LABEL then auto-busts every device's cached
+        # icon with zero code edits — branding is env-config, not a source patch.
+        iconver = hashlib.md5(self.label.encode("utf-8")).hexdigest()[:8]
         return {
             "name": f"{self.label} terminal",
             "short_name": self.label,
@@ -2162,9 +2168,9 @@ class AppServer:
             "background_color": "#0b121b",
             "theme_color": "#0b121b",
             "icons": [
-                {"src": "/app-icon-192.png?v=2", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-                {"src": "/app-icon-512.png?v=2", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-                {"src": "/app-icon-512.png?v=2", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+                {"src": f"/app-icon-192.png?v={iconver}", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+                {"src": f"/app-icon-512.png?v={iconver}", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+                {"src": f"/app-icon-512.png?v={iconver}", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
             ],
         }
 
@@ -3173,29 +3179,43 @@ class AppServer:
         # the client a one-time nonce it can sign with its enrolled device key.
         if self.multi_tenant or require_token_here or auto_user is not None:
             nonce = secrets.token_urlsafe(32)
+            # When the serve proxy already authenticated us by Tailscale identity
+            # (loopback + injected Tailscale-User-Login, tailnet-only), that
+            # identity is authoritative and the client's auth frame is OPTIONAL:
+            # we still send the challenge so a cooperating client can enroll a
+            # device key, but a missing / late / malformed frame must NOT close
+            # the socket. Blocking on recv and hard-closing 4001 here was the
+            # silent "UI loads but you can't control the session" failure.
+            frame_optional = auto_user is not None
+            auth_payload = None
             try:
                 await self.send_json(connection, {"type": "auth-challenge", "nonce": nonce})
-                raw_auth = await asyncio.wait_for(connection.recv(), timeout=20)
-            except TimeoutError:
-                await connection.close(code=4001, reason="auth timeout")
-                return
+                raw_auth = await asyncio.wait_for(
+                    connection.recv(), timeout=5 if frame_optional else 20
+                )
+                if not isinstance(raw_auth, str):
+                    raise ValueError("non-string auth frame")
+                auth_payload = json.loads(raw_auth)  # JSONDecodeError subclasses ValueError
+                if auth_payload.get("type") != "auth":
+                    raise ValueError("wrong auth frame type")
             except ConnectionClosed:
                 return
-            if not isinstance(raw_auth, str):
-                await connection.close(code=4001, reason="auth required")
-                return
-            try:
-                auth_payload = json.loads(raw_auth)
-            except json.JSONDecodeError:
-                await connection.close(code=4001, reason="auth required")
-                return
-            if auth_payload.get("type") != "auth":
-                await self.send_json(connection, {"type": "auth-error", "message": "Authentication required."})
-                await connection.close(code=4001, reason="auth failed")
-                return
-            device_id = str(auth_payload.get("deviceId", ""))[:64]
-            signature = str(auth_payload.get("signature", ""))
-            claimed_user = sanitize_user(auth_payload.get("user", "")) if self.multi_tenant else ""
+            except (TimeoutError, ValueError) as exc:
+                if not frame_optional:
+                    if isinstance(exc, TimeoutError):
+                        await connection.close(code=4001, reason="auth timeout")
+                    else:
+                        await self.send_json(connection, {"type": "auth-error", "message": "Authentication required."})
+                        await connection.close(code=4001, reason="auth failed")
+                    return
+                # Identity mode: the injected header already authed us. Ignore the
+                # absent or malformed frame and drop straight into the session.
+                auth_payload = None
+
+            payload_obj = auth_payload if isinstance(auth_payload, dict) else {}
+            device_id = str(payload_obj.get("deviceId", ""))[:64]
+            signature = str(payload_obj.get("signature", ""))
+            claimed_user = sanitize_user(payload_obj.get("user", "")) if self.multi_tenant else ""
 
             if auto_user is not None:
                 # Authenticated by the Tailscale identity the serve proxy injected
@@ -3219,14 +3239,14 @@ class AppServer:
                         token_ok = user_meta is not None and (
                             not require_token_here
                             or remembered
-                            or hmac.compare_digest(str(auth_payload.get("token", "")), user_meta["token"])
+                            or hmac.compare_digest(str(payload_obj.get("token", "")), user_meta["token"])
                         )
                         err = "Invalid user or access token."
                     else:
                         user = ""
                         token_ok = not require_token_here or (
                             self.token is not None
-                            and hmac.compare_digest(str(auth_payload.get("token", "")), self.token)
+                            and hmac.compare_digest(str(payload_obj.get("token", "")), self.token)
                         )
                         err = "Invalid access token."
                     if not token_ok:
