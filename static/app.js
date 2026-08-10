@@ -4187,6 +4187,9 @@
     }
 
     currentSessions.forEach((session) => {
+      const row = document.createElement("div");
+      row.className = "tab-menu-row";
+
       const button = document.createElement("button");
       button.className = `tab-menu-button${session.name === activeSessionName ? " is-active" : ""}`;
       button.type = "button";
@@ -4194,7 +4197,24 @@
       button.addEventListener("click", () => {
         switchSession(session.name);
       });
-      sessionMenu.appendChild(button);
+
+      const kill = document.createElement("button");
+      kill.className = "session-kill-button";
+      kill.type = "button";
+      kill.textContent = "×";
+      kill.title = "Kill session";
+      kill.setAttribute("aria-label", `Kill session ${session.label || session.name}`);
+      kill.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (!window.confirm(`Kill tmux session "${session.name}"?`)) {
+          return;
+        }
+        sendMessage({ type: "kill-session", session: session.name });
+      });
+
+      row.appendChild(button);
+      row.appendChild(kill);
+      sessionMenu.appendChild(row);
     });
   }
 

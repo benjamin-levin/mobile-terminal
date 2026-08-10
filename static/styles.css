@@ -971,6 +971,45 @@ body[data-keyboard-open="true"] .shortcut-bar {
   border-color: rgba(255, 209, 102, 0.46);
 }
 
+.tab-menu-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.tab-menu-row .tab-menu-button {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.session-kill-button {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--button-min-height);
+  min-height: var(--button-min-height);
+  padding: 0;
+  font-size: 1.15em;
+  line-height: 1;
+  color: var(--text-muted);
+  border-radius: var(--surface-radius);
+  border: 1px solid var(--border);
+  background: #163240;
+  cursor: pointer;
+  transition: transform 120ms ease, border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+.session-kill-button:hover {
+  color: #ff6b6b;
+  border-color: rgba(255, 107, 107, 0.6);
+  background: rgba(255, 107, 107, 0.12);
+}
+
+.session-kill-button:active {
+  transform: translateY(1px);
+}
+
 .menu-empty {
   padding: calc(10px * var(--ui-scale)) calc(12px * var(--ui-scale));
   color: var(--text-muted);
