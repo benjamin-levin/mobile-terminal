@@ -42,6 +42,14 @@
     <div class="app-shell">
       <header class="topbar">
         <div class="topbar-row">
+          <div id="profileBanner" class="profile-banner hidden">
+            <button id="profileButton" class="profile-button is-offline" type="button" aria-haspopup="menu" aria-expanded="false">
+              <span id="profileDot" class="profile-dot"></span>
+              <span id="profileLabel">Profile</span>
+              <span class="profile-chevron">⌄</span>
+            </button>
+            <span id="profileStatus" class="profile-status hidden"></span>
+          </div>
           <div id="tabsScroller" class="top-tabs-shell">
             <div id="tabsStrip" class="tabs-strip top-tabs"></div>
           </div>
@@ -150,6 +158,8 @@
     <div id="btopTargetMenu" class="tab-menu hidden"></div>
 
     <div id="sessionMenu" class="tab-menu hidden"></div>
+
+    <div id="profileMenu" class="tab-menu profile-menu hidden"></div>
 
     <div id="settingsMenu" class="tab-menu hidden">
       <button id="displayButton" class="tab-menu-button" type="button">Display</button>

@@ -33,6 +33,13 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
+from webauthn_auth import (
+    PasskeyAuth,
+    PasskeyChallengeError,
+    PasskeyStoreError,
+    PasskeyVerificationError,
+)
+
 
 ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / "static"
@@ -171,6 +178,27 @@ except Exception as exc:
 '''
 
 
+INTERNAL_TOKEN_ENV_NAME = "MOBILE_TERMINAL_INTERNAL_TOKEN"
+
+
+def internal_token_environment_names() -> tuple[str, ...]:
+    names = {INTERNAL_TOKEN_ENV_NAME}
+    names.update(name for name in os.environ if name.startswith(f"{INTERNAL_TOKEN_ENV_NAME}_"))
+    return tuple(sorted(names))
+
+
+def terminal_child_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in internal_token_environment_names():
+        env.pop(name, None)
+    return env
+
+
+def terminal_command(command: str) -> str:
+    unset = " ".join(f"-u {shlex.quote(name)}" for name in internal_token_environment_names())
+    return f"env {unset} {command}"
+
+
 def tmux_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["tmux", *args],
@@ -178,6 +206,7 @@ def tmux_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[
         capture_output=True,
         check=check,
         text=True,
+        env=terminal_child_environment(),
     )
 
 
@@ -232,13 +261,41 @@ def remote_ip(remote_address: Any) -> str | None:
     return host
 
 
+def request_origin_matches_host(connection: ServerConnection) -> bool:
+    origin = connection.request.headers.get("Origin")
+    host = connection.request.headers.get("Host")
+    if not origin or not host:
+        return False
+    try:
+        parsed_origin = urlsplit(origin)
+        parsed_host = urlsplit(f"//{host}")
+        origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+        host_port = parsed_host.port or (443 if parsed_origin.scheme == "https" else 80)
+    except ValueError:
+        return False
+    return bool(
+        parsed_origin.scheme in ("http", "https")
+        and parsed_origin.hostname
+        and parsed_origin.hostname.lower() == (parsed_host.hostname or "").lower()
+        and origin_port == host_port
+        and not parsed_origin.username
+        and not parsed_origin.password
+        and parsed_origin.path in ("", "/")
+        and not parsed_origin.query
+        and not parsed_origin.fragment
+    )
+
+
 def ensure_session(session_name: str, shell: str, cwd: str) -> None:
+    for name in internal_token_environment_names():
+        tmux_capture("set-environment", "-g", "-u", name, check=False)
     has_session = subprocess.run(
         ["tmux", "has-session", "-t", session_name],
         cwd=ROOT,
         capture_output=True,
         text=True,
         check=False,
+        env=terminal_child_environment(),
     )
     if has_session.returncode != 0:
         tmux_capture(
@@ -250,7 +307,7 @@ def ensure_session(session_name: str, shell: str, cwd: str) -> None:
             "shell",
             "-c",
             cwd,
-            f"{shell} -l",
+            terminal_command(f"{shell} -l"),
         )
     tmux_capture("set-option", "-g", "-p", "allow-passthrough", "on", check=False)
     for option, value in (("status", "off"), ("mouse", "on")):
@@ -264,6 +321,7 @@ def session_exists(session_name: str) -> bool:
         capture_output=True,
         text=True,
         check=False,
+        env=terminal_child_environment(),
     )
     return result.returncode == 0
 
@@ -937,6 +995,10 @@ def load_users_config() -> dict[str, Any] | None:
     if not USERS_PATH.is_file():
         return None
     try:
+        USERS_PATH.chmod(0o600)
+    except OSError:
+        pass
+    try:
         raw = json.loads(USERS_PATH.read_text())
     except (OSError, json.JSONDecodeError):
         return None
@@ -978,7 +1040,10 @@ def persist_users_config(users: dict[str, dict[str, Any]], owner: str) -> None:
             for name, meta in users.items()
         },
     }
-    USERS_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+    temporary = USERS_PATH.with_name(f".{USERS_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n")
+    temporary.chmod(0o600)
+    temporary.replace(USERS_PATH)
 
 
 def user_dir(user: str) -> Path:
@@ -1044,11 +1109,12 @@ def save_user_state(user: str, state: dict[str, Any]) -> None:
 # "remember-me" string this is not a transferable secret: the private key can't
 # be exported by JS and a captured signature is bound to a spent one-time nonce.
 DEVICE_KEYS_PATH = ROOT / "state" / "device-keys.json"
+PASSKEY_STATE_DIR = ROOT / "state" / "passkeys"
 DEVICE_NONCE_TTL = 120  # seconds a signing challenge stays valid
 
 
 def load_device_keys() -> dict[str, Any]:
-    """{user: {deviceId: {pubKey(spki b64), label, created, lastSeen, webauthn?}}}.
+    """{user: {deviceId: {pubKey(spki b64), label, created, lastSeen}}}.
     Single-tenant uses the "" user key."""
     if DEVICE_KEYS_PATH.is_file():
         try:
@@ -1075,7 +1141,7 @@ def device_pubkey(user: str, device_id: str) -> str | None:
 
 
 def register_device_key(
-    user: str, device_id: str, pub_key_spki_b64: str, label: str, webauthn: bool = False
+    user: str, device_id: str, pub_key_spki_b64: str, label: str
 ) -> None:
     store = load_device_keys()
     bucket = store.setdefault(user or "", {})
@@ -1086,7 +1152,6 @@ def register_device_key(
         "label": label or existing.get("label", "device"),
         "created": existing.get("created", now),
         "lastSeen": now,
-        "webauthn": bool(webauthn or existing.get("webauthn")),
     }
     save_device_keys(store)
 
@@ -1631,7 +1696,7 @@ class TmuxBridge:
             ensure_session(self.session_name, self.shell, self.cwd)
         master_fd, slave_fd = os.openpty()
         self.master_fd = master_fd
-        env = os.environ.copy()
+        env = terminal_child_environment()
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         self.process = subprocess.Popen(
@@ -1705,6 +1770,8 @@ class AppServer:
         tailscale_mode: bool,
         users_config: dict[str, Any] | None = None,
         label: str = "term",
+        internal_token: str | None = None,
+        passkeys: PasskeyAuth | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -1713,6 +1780,9 @@ class AppServer:
         self.shell = shell
         self.cwd = cwd
         self.token = token
+        self.internal_token = internal_token
+        self.passkeys = passkeys
+        self._passkey_managers: dict[tuple[str, str], PasskeyAuth] = {}
         self.require_token = require_token
         self.allowed_clients = allowed_clients
         self.tailscale_mode = tailscale_mode
@@ -1810,6 +1880,18 @@ class AppServer:
             return False
         return host in self.allowed_clients
 
+    def internal_request_principal(self, connection: ServerConnection) -> str | None:
+        if not self.internal_token:
+            return None
+        host = remote_ip(connection.remote_address)
+        if host not in ("127.0.0.1", "::1"):
+            return None
+        candidate = connection.request.headers.get("X-Mobile-Terminal-Internal-Token", "")
+        if not hmac.compare_digest(candidate, self.internal_token):
+            return None
+        principal = connection.request.headers.get("X-Mobile-Terminal-Principal", "").strip()
+        return principal or "proxy"
+
     def request_is_public(self, connection: ServerConnection) -> bool:
         """True when the request arrived over Tailscale Funnel (public internet)
         rather than tailnet serve. Tailscale marks Funnel requests with a
@@ -1828,6 +1910,8 @@ class AppServer:
             return None
         if self.request_is_public(connection):
             return None  # public Funnel: never trust an identity header
+        if not request_origin_matches_host(connection):
+            return None  # cross-origin browser WebSockets must not inherit proxy identity
         login = connection.request.headers.get("Tailscale-User-Login")
         return login.strip().lower() if login else None
 
@@ -1854,20 +1938,132 @@ class AppServer:
         return None
 
     def rp_id(self, connection: ServerConnection) -> str:
-        """WebAuthn RP ID = the public hostname (no port). Env override wins."""
-        override = os.environ.get("MOBILE_TERMINAL_RP_ID")
+        override = os.environ.get("MOBILE_TERMINAL_RP_ID", "").strip()
         if override:
             return override
         host = connection.request.headers.get("Host", "") or self.host
-        return host.split(":", 1)[0]
+        try:
+            return urlsplit(f"//{host}").hostname or self.host
+        except ValueError:
+            return self.host
 
     def expected_origin(self, connection: ServerConnection) -> str:
-        """WebAuthn origin = scheme + host(+port). Env override wins."""
-        override = os.environ.get("MOBILE_TERMINAL_ORIGIN")
+        override = os.environ.get("MOBILE_TERMINAL_ORIGIN", "").strip()
         if override:
             return override
         host = connection.request.headers.get("Host", "") or self.host
-        return "https://" + host
+        return f"https://{host}"
+
+    def passkey_auth(self, connection: ServerConnection) -> PasskeyAuth:
+        if self.passkeys is not None:
+            return self.passkeys
+        rp_id = self.rp_id(connection)
+        origin = self.expected_origin(connection)
+        key = (rp_id, origin)
+        manager = self._passkey_managers.get(key)
+        if manager is None:
+            manager = PasskeyAuth(
+                PASSKEY_STATE_DIR / hashlib.sha256(rp_id.encode("utf-8")).hexdigest()[:16],
+                rp_id=rp_id,
+                rp_name=f"{self.label} terminal",
+                expected_origin=origin,
+            )
+            self._passkey_managers[key] = manager
+        return manager
+
+    def passkey_realm(self, user: str) -> str:
+        if not self.multi_tenant:
+            return "standalone"
+        digest = hashlib.sha256(user.encode("utf-8")).hexdigest()[:32]
+        return f"user-{digest}"
+
+    def passkey_principal(self, user: str) -> str:
+        return user if self.multi_tenant else "standalone"
+
+    async def receive_auth_message(
+        self,
+        connection: ServerConnection,
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        try:
+            raw = await asyncio.wait_for(connection.recv(), timeout=timeout)
+            if not isinstance(raw, str):
+                return None
+            payload = json.loads(raw)
+        except (ConnectionClosed, TimeoutError, ValueError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    async def authenticate_passkey(
+        self,
+        connection: ServerConnection,
+        user: str,
+        *,
+        binding: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        manager = self.passkey_auth(connection)
+        realm = self.passkey_realm(user)
+        principal = self.passkey_principal(user)
+        credentials = manager.list_credentials(realm)
+        if not credentials:
+            return None, None
+        message = manager.begin_authentication(
+            realm,
+            principal=principal,
+            binding=binding,
+        )
+        await self.send_json(connection, message)
+        payload = await self.receive_auth_message(connection, timeout=120)
+        if payload is None:
+            raise PasskeyChallengeError("Passkey response was not received.")
+        if payload.get("type") == "auth":
+            return None, payload
+        if payload.get("type") != "webauthn-auth":
+            raise PasskeyChallengeError("Unexpected passkey response.")
+        record = manager.finish_authentication(
+            realm,
+            payload.get("challengeId", ""),
+            payload.get("assertion"),
+            binding=binding,
+        )
+        if record.get("principal") != principal:
+            raise PasskeyVerificationError("Passkey principal is invalid.")
+        return record, None
+
+    async def register_passkey(
+        self,
+        connection: ServerConnection,
+        user: str,
+        *,
+        binding: str,
+    ) -> dict[str, Any]:
+        manager = self.passkey_auth(connection)
+        realm = self.passkey_realm(user)
+        principal = self.passkey_principal(user)
+        message = manager.begin_registration(
+            realm,
+            principal=principal,
+            user_name=user or self.label,
+            user_display_name=self.users.get(user, {}).get("label")
+            if self.multi_tenant
+            else self.label,
+            label=device_label(connection.request.headers.get("User-Agent", "")),
+            binding=binding,
+        )
+        await self.send_json(connection, message)
+        payload = await self.receive_auth_message(connection, timeout=120)
+        if payload is None or payload.get("type") != "webauthn-register":
+            raise PasskeyChallengeError("Passkey registration response was not received.")
+        record = manager.finish_registration(
+            realm,
+            payload.get("challengeId", ""),
+            payload.get("attestation"),
+            binding=binding,
+        )
+        if record.get("principal") != principal:
+            raise PasskeyVerificationError("Passkey principal is invalid.")
+        return record
 
     def token_required_for(self, trusted_client: bool) -> bool:
         """Whether the client must supply a token. In single-tenant mode an
@@ -1997,7 +2193,16 @@ class AppServer:
             label = name
         path = cwd or self.cwd
         tmux_capture(
-            "new-session", "-d", "-s", name, "-n", "shell", "-c", path, f"{self.shell} -l", check=False
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-n",
+            "shell",
+            "-c",
+            path,
+            terminal_command(f"{self.shell} -l"),
+            check=False,
         )
         for option, value in (("status", "off"), ("mouse", "on")):
             tmux_capture("set-option", "-t", name, option, value, check=False)
@@ -2076,8 +2281,9 @@ class AppServer:
                 "port": self.port,
                 # Silent device-key auth: the client enrolls a non-extractable
                 # key when trusted (tailnet) and signs a nonce to reconnect from
-                # anywhere. rpId scopes any WebAuthn bootstrap to this host.
+                # anywhere.
                 "deviceKeyAuth": True,
+                "passkeyAuth": True,
                 "rpId": self.rp_id(connection),
             }
             body = json.dumps(payload).encode("utf-8")
@@ -2710,10 +2916,6 @@ class AppServer:
             forget_device_key(user, str(payload.get("deviceId", ""))[:64])
             return
 
-        if message_type == "webauthn-register":
-            await self.handle_webauthn_register(connection, state, payload)
-            return
-
         if message_type == "request-settings":
             await self.send_settings(connection, user)
             return
@@ -2915,7 +3117,7 @@ class AppServer:
                     "btop",
                     "-c",
                     path,
-                    command,
+                    terminal_command(command),
                     check=False,
                 )
                 for option, value in (("status", "off"), ("mouse", "on")):
@@ -3075,40 +3277,9 @@ class AppServer:
         except (ValueError, TypeError, Exception):
             return False
 
-    def build_webauthn_options(self, connection: ServerConnection, state: dict[str, Any]) -> dict | None:
-        """Registration options for the off-tailnet biometric gate. Stashes the
-        challenge on the connection state for verification. None if unavailable."""
-        try:
-            from webauthn import generate_registration_options, options_to_json
-            from webauthn.helpers.structs import (
-                AuthenticatorSelectionCriteria,
-                ResidentKeyRequirement,
-                UserVerificationRequirement,
-            )
-        except Exception:
-            return None
-        try:
-            opts = generate_registration_options(
-                rp_id=self.rp_id(connection),
-                rp_name=f"{self.label} terminal",
-                user_id=(state.get("deviceId") or "device").encode("utf-8")[:64],
-                user_name=state.get("user") or "device",
-                authenticator_selection=AuthenticatorSelectionCriteria(
-                    authenticator_attachment="platform",
-                    resident_key=ResidentKeyRequirement.PREFERRED,
-                    user_verification=UserVerificationRequirement.PREFERRED,
-                ),
-            )
-            state["webauthnChallenge"] = bytes(opts.challenge)
-            return json.loads(options_to_json(opts))
-        except Exception:
-            return None
-
     async def maybe_enroll_device(self, connection: ServerConnection, state: dict[str, Any]) -> None:
-        """After a device authenticates (identity or token), ask it to enroll a
-        silent key if it lacks one, so every later connection signs in with no
-        prompt. Enrollment is authenticated (this runs post-auth); the token the
-        device just used is the enrollment anchor."""
+        """After an authenticated connection passes any required public passkey
+        gate, ask it to enroll the silent key used for later reconnects."""
         if not state.get("needsEnroll") or not state.get("deviceId"):
             return
         await self.send_json(connection, {"type": "enroll-key"})
@@ -3125,34 +3296,6 @@ class AppServer:
             )
             state["needsEnroll"] = False
 
-    async def handle_webauthn_register(self, connection: ServerConnection, state: dict[str, Any], payload: dict[str, Any]) -> None:
-        """Verify the one-time biometric attestation, then store the silent key
-        (marked webauthn-backed). Gates off-tailnet enrollment of a new device."""
-        challenge = state.get("webauthnChallenge")
-        pub = str(payload.get("publicKey", ""))
-        device_id = state.get("deviceId") or ""
-        if not challenge or not device_id or not self._valid_spki(pub):
-            await self.send_json(connection, {"type": "notice", "message": "Device enrollment failed."})
-            return
-        try:
-            from webauthn import verify_registration_response
-            verify_registration_response(
-                credential=json.dumps(payload.get("attestation")),
-                expected_challenge=challenge,
-                expected_rp_id=self.rp_id(connection),
-                expected_origin=self.expected_origin(connection),
-            )
-        except Exception:
-            await self.send_json(connection, {"type": "notice", "message": "Device verification failed."})
-            return
-        register_device_key(
-            state.get("user", ""), device_id, pub,
-            device_label(connection.request.headers.get("User-Agent", "")), webauthn=True,
-        )
-        state["needsEnroll"] = False
-        state["webauthnChallenge"] = None
-        await self.send_json(connection, {"type": "notice", "message": "This device is now enrolled for silent sign-in."})
-
     async def websocket_handler(self, connection: ServerConnection) -> None:
         request_url = urlsplit(connection.request.path)
         if request_url.path != WS_PATH:
@@ -3163,21 +3306,30 @@ class AppServer:
             return
 
         trusted_client = self.client_is_trusted(connection.remote_address)
+        forwarded_principal = self.internal_request_principal(connection)
+        if self.internal_token and forwarded_principal is None:
+            await connection.close(code=4003, reason="invalid internal credentials")
+            return
         # Token-less auto-login by Tailscale identity behind `tailscale serve`.
         auto_user = self.auto_auth_user(connection)
         user = self.owner if self.multi_tenant else ""
         device_id = ""
-        require_token_here = self.token_required_for(trusted_client) and auto_user is None
+        passkey_binding = secrets.token_urlsafe(24)
+        require_token_here = (
+            self.token_required_for(trusted_client)
+            and auto_user is None
+            and forwarded_principal is None
+        )
         # auth_method records how we authenticated so we can decide enrollment
         # (silent on the tailnet, biometric-gated off it). needs_enroll/enroll_public
         # drive the post-ready device-key enrollment exchange.
-        auth_method = "trusted"
+        auth_method = "internal" if forwarded_principal is not None else "trusted"
         needs_enroll = False
         is_public = self.request_is_public(connection)
         # Read the client's auth frame when auth is needed, or (when the proxy
         # identity already authed us) just to capture the deviceId. We first hand
         # the client a one-time nonce it can sign with its enrolled device key.
-        if self.multi_tenant or require_token_here or auto_user is not None:
+        if forwarded_principal is None and (self.multi_tenant or require_token_here or auto_user is not None):
             nonce = secrets.token_urlsafe(32)
             # When the serve proxy already authenticated us by Tailscale identity
             # (loopback + injected Tailscale-User-Login, tailnet-only), that
@@ -3231,31 +3383,83 @@ class AppServer:
                     user = claimed_user
                     auth_method = "device-key"
                 else:
-                    # Fall back to the shared token (bootstrap / legacy remember-me).
-                    if self.multi_tenant:
-                        user = claimed_user
-                        user_meta = self.users.get(user)
-                        remembered = user_meta is not None and self.device_remembered(user, device_id)
-                        token_ok = user_meta is not None and (
-                            not require_token_here
-                            or remembered
-                            or hmac.compare_digest(str(payload_obj.get("token", "")), user_meta["token"])
+                    # A verified passkey takes precedence over the token fallback.
+                    # The token remains a valid legacy/bootstrap path if the user
+                    # dismisses the passkey prompt and submits the auth form again.
+                    try:
+                        passkey_record, fallback_payload = await self.authenticate_passkey(
+                            connection,
+                            claimed_user,
+                            binding=passkey_binding,
                         )
-                        err = "Invalid user or access token."
-                    else:
-                        user = ""
-                        token_ok = not require_token_here or (
-                            self.token is not None
-                            and hmac.compare_digest(str(payload_obj.get("token", "")), self.token)
+                    except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
+                        print(f"passkey authentication failed: {type(exc).__name__}")
+                        await self.send_json(
+                            connection,
+                            {"type": "auth-error", "message": "Passkey verification failed."},
                         )
-                        err = "Invalid access token."
-                    if not token_ok:
-                        await self.send_json(connection, {"type": "auth-error", "message": err})
                         await connection.close(code=4001, reason="auth failed")
                         return
-                    auth_method = "token"
+                    if passkey_record is not None:
+                        user = claimed_user
+                        auth_method = "passkey"
+                    else:
+                        if fallback_payload is not None:
+                            fallback_user = (
+                                sanitize_user(fallback_payload.get("user", ""))
+                                if self.multi_tenant
+                                else ""
+                            )
+                            if fallback_user != claimed_user:
+                                await self.send_json(
+                                    connection,
+                                    {"type": "auth-error", "message": "Authentication required."},
+                                )
+                                await connection.close(code=4001, reason="auth failed")
+                                return
+                            payload_obj = fallback_payload
+                            device_id = str(payload_obj.get("deviceId", device_id))[:64]
+                        # Fall back to the shared token (bootstrap / legacy remember-me).
+                        if self.multi_tenant:
+                            user = claimed_user
+                            user_meta = self.users.get(user)
+                            remembered = user_meta is not None and self.device_remembered(user, device_id)
+                            token_ok = user_meta is not None and (
+                                not require_token_here
+                                or remembered
+                                or hmac.compare_digest(str(payload_obj.get("token", "")), user_meta["token"])
+                            )
+                            err = "Invalid user or access token."
+                        else:
+                            user = ""
+                            token_ok = not require_token_here or (
+                                self.token is not None
+                                and hmac.compare_digest(str(payload_obj.get("token", "")), self.token)
+                            )
+                            err = "Invalid access token."
+                        if not token_ok:
+                            await self.send_json(connection, {"type": "auth-error", "message": err})
+                            await connection.close(code=4001, reason="auth failed")
+                            return
+                        auth_method = "token"
             # Offer to enroll a silent key for any authed device that lacks one.
             needs_enroll = bool(device_id) and device_pubkey(user, device_id) is None
+            if auth_method == "token" and is_public:
+                try:
+                    await self.register_passkey(
+                        connection,
+                        user,
+                        binding=passkey_binding,
+                    )
+                except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
+                    print(f"passkey registration failed: {type(exc).__name__}")
+                    await self.send_json(
+                        connection,
+                        {"type": "auth-error", "message": "Passkey verification failed."},
+                    )
+                    await connection.close(code=4001, reason="auth failed")
+                    return
+                auth_method = "passkey-bootstrap"
 
         if self.multi_tenant:
             self.register_device(user, device_id, device_label(connection.request.headers.get("User-Agent", "")))
@@ -3273,12 +3477,12 @@ class AppServer:
         state = {
             "session": session_name,
             "user": user,
+            "principal": forwarded_principal,
             "deviceId": device_id,
             # Enrollment context for the post-ready device-key exchange.
             "authMethod": auth_method,
             "needsEnroll": needs_enroll,
             "enrollPublic": is_public,
-            "webauthnChallenge": None,
         }
         bridge = TmuxBridge(
             session_name,
@@ -3373,6 +3577,7 @@ class AppServer:
                     "multiTenant": self.multi_tenant,
                     "user": user if self.multi_tenant else None,
                     "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
+                    "principal": forwarded_principal,
                 },
             )
             # No scrollback push on switch: the client instantly shows its cached
@@ -3403,6 +3608,7 @@ class AppServer:
                     "multiTenant": self.multi_tenant,
                     "user": user if self.multi_tenant else None,
                     "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
+                    "principal": forwarded_principal,
                     # Only the first ready of a connection carries the persisted
                     # open-tab set; the client adopts it, then owns the state.
                     "openTabs": self.open_tabs_for(user),
@@ -3533,6 +3739,27 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from mobile_terminal_config import ConfigError, load_runtime_config
+
+    try:
+        runtime_config = load_runtime_config()
+    except ConfigError as exc:
+        raise SystemExit(f"Invalid MOBILE_TERMINAL_CONFIG: {exc}") from exc
+    if runtime_config is not None:
+        from proxy import ProxyServer
+
+        proxy = ProxyServer(
+            runtime_config,
+            static_root=STATIC_ROOT,
+            node_modules_root=NODE_MODULES_ROOT,
+            render_icon=render_app_icon,
+        )
+        try:
+            asyncio.run(proxy.run())
+        except KeyboardInterrupt:
+            pass
+        return
+
     args = parse_args()
     if args.tailscale:
         args.host = resolve_tailscale_host()
@@ -3544,6 +3771,16 @@ def main() -> None:
         raise SystemExit("--no-token requires --tailscale, --allow-client, or a loopback-only host")
     require_token = not args.no_token
     token = (args.token or secrets.token_urlsafe(16)) if require_token else None
+    internal_token = os.environ.get("MOBILE_TERMINAL_INTERNAL_TOKEN", "").strip() or None
+    require_internal_token = os.environ.get("MOBILE_TERMINAL_REQUIRE_INTERNAL_TOKEN", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if require_internal_token and not internal_token:
+        raise SystemExit("MOBILE_TERMINAL_INTERNAL_TOKEN is required for this backend")
+    if internal_token and args.host not in ("127.0.0.1", "::1", "localhost"):
+        raise SystemExit("MOBILE_TERMINAL_INTERNAL_TOKEN requires a loopback-only host")
     users_config = load_users_config()
     import socket
 
@@ -3560,6 +3797,7 @@ def main() -> None:
         tailscale_mode=args.tailscale,
         users_config=users_config,
         label=label,
+        internal_token=internal_token,
     )
     try:
         asyncio.run(server.run())

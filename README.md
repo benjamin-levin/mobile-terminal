@@ -102,18 +102,25 @@ The device key (or token) is then the sole gate, so keep it enabled.
 
 `MOBILE_TERMINAL_TRUST_IDENTITY` is **off by default** because Tailscale Funnel was
 observed injecting the node owner's `Tailscale-User-Login` into public requests on
-some setups, which would auto-authenticate anyone as the owner. Behavior differs by
-how the machine reaches the internet:
+some setups, which would auto-authenticate anyone as the owner. Identity login now
+also requires a same-origin browser WebSocket (`Origin` must match `Host`), which
+blocks cross-site browser use but cannot authenticate the local reverse proxy itself.
+Behavior differs by how the machine reaches the internet:
 
 - **NAT'd machine (no public IP):** the `*.ts.net` name resolves to the *tailnet*
   IP for tailnet members, so tailnet requests carry genuine identity while Funnel
-  serves the public path separately. Token-free auto-enroll works on the same URL.
-  Safe to set `MOBILE_TERMINAL_TRUST_IDENTITY=1` here.
+  serves the public path separately. Token-free auto-enroll works on the same URL,
+  provided all local processes and users are also inside the trust boundary.
 - **Public-IP VPS:** enabling Funnel makes the `*.ts.net` name resolve to the
   machine's *public* IP for everyone (even on the tailnet), so every request
   arrives via the public path with **no identity** — and non-Funnel ports become
   unreachable by that name. There is no identity-bearing address, so token-free
   auto-enroll is not possible; use the one-time token. Keep identity trust **off**.
+
+A local process can forge loopback, `Host`, `Origin`, and `Tailscale-*` headers over
+the current TCP reverse-proxy hop. Keep identity trust off if local processes or users
+are outside the trust boundary. See [`INTEGRATION-proxy-auth.md`](INTEGRATION-proxy-auth.md)
+for the profile-proxy authenticator contract and the exact limitation.
 
 Optional: `MOBILE_TERMINAL_RP_ID` / `MOBILE_TERMINAL_ORIGIN` override the WebAuthn
 RP id / origin (otherwise derived from the request `Host`).
@@ -131,7 +138,14 @@ Device-key verification uses `cryptography`; the optional WebAuthn enrollment pa
 uses `webauthn` + `cbor2`. Install them into the virtualenv the service runs from
 (`.venv/bin/pip install cryptography cbor2 webauthn`) and point the service's
 `ExecStart` at that interpreter. `state/`, `*.env`, and `mobile-terminal-users.json`
-hold secrets/keys and are gitignored.
+hold secrets/keys and are gitignored. Keep secret-bearing files owner-only:
+
+```bash
+chmod 600 mobile-terminal.env mobile-terminal-users.json /path/to/proxy-config.json
+```
+
+`install.sh` enforces mode `0600` on `mobile-terminal.env`; token persistence uses
+owner-only replacement files, and the service templates use `UMask=0077`.
 
 ## tmux scrolling
 
@@ -172,7 +186,7 @@ What it does:
 
 - Installs `python3`, `tmux`, `node`, and `npm` if they are missing.
 - Runs `npm ci` to populate `node_modules`.
-- Creates `mobile-terminal.env` if you do not already have one.
+- Creates `mobile-terminal.env` if you do not already have one and enforces mode `0600`.
 - Installs and starts a user service:
   - Linux: `systemd --user`
   - macOS: `launchd`

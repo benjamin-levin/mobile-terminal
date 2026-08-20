@@ -12,6 +12,8 @@
   const STORAGE_TERMINAL_FONT_KEY = "mobile-terminal.terminal-font";
   const STORAGE_ACTIVE_SESSION_KEY = "mobile-terminal.active-session";
   const STORAGE_OPEN_TABS_KEY = "mobile-terminal.open-tabs";
+  const STORAGE_ACTIVE_PROFILE_KEY = "mobile-terminal.active-profile";
+  const STORAGE_PROFILE_PREFIX = "mobile-terminal.profile.";
   const STORAGE_EDITOR_TABS_KEY = "mobile-terminal.editor-tabs";
   const STORAGE_BTOP_ZOOM_KEY = "mobile-terminal.btop-zoom";
   const BTOP_SESSION_PREFIX = "btop-";
@@ -106,6 +108,7 @@
   const accountButton = document.getElementById("accountButton");
   const accountOverlay = document.getElementById("accountOverlay");
   const accountUserLabel = document.getElementById("accountUserLabel");
+  const accountHelperText = accountOverlay?.querySelector(".helper-text");
   const deviceList = document.getElementById("deviceList");
   const rotateTokenButton = document.getElementById("rotateTokenButton");
   const signOutButton = document.getElementById("signOutButton");
@@ -122,6 +125,12 @@
   const btopZoom = document.getElementById("btopZoom");
   const btopZoomInput = document.getElementById("btopZoomInput");
   const sessionMenu = document.getElementById("sessionMenu");
+  const profileBanner = document.getElementById("profileBanner");
+  const profileButton = document.getElementById("profileButton");
+  const profileDot = document.getElementById("profileDot");
+  const profileLabel = document.getElementById("profileLabel");
+  const profileStatus = document.getElementById("profileStatus");
+  const profileMenu = document.getElementById("profileMenu");
   const settingsButton = document.getElementById("settingsButton");
   const settingsMenu = document.getElementById("settingsMenu");
   const editorOverlay = document.getElementById("editorOverlay");
@@ -184,7 +193,17 @@
     tailscaleMode: false,
     allowedClients: [],
     multiTenant: false,
+    profileMode: false,
+    profiles: [],
+    deviceKeyAuth: false,
+    passkeyAuth: false,
   };
+  let profiles = [];
+  let activeProfileId = localStorage.getItem(STORAGE_ACTIVE_PROFILE_KEY) || "";
+  let pendingProfileId = "";
+  let waitingForProxyAuth = false;
+  let loginRealm = "";
+  let profileMenuOpen = false;
   let currentUser = localStorage.getItem(STORAGE_USER_KEY) || "";
   let currentUserLabel = "";
 
@@ -268,15 +287,6 @@
     for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
     return btoa(s);
   }
-  function base64ToBytes(b64) {
-    const bin = atob(b64.replace(/-/g, "+").replace(/_/g, "/"));
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  }
-  function base64urlOf(buf) {
-    return bytesToBase64(buf).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  }
   async function exportPublicSpki(publicKey) {
     return bytesToBase64(await crypto.subtle.exportKey("spki", publicKey));
   }
@@ -344,6 +354,10 @@
   const SESSION_SNAPSHOT_MAX = 12;
   const SESSION_SNAPSHOT_SCROLLBACK = 1000;
 
+  function sessionSnapshotKey(sessionName, profileId = activeProfileId) {
+    return `${profileId || "single"}:${sessionName}`;
+  }
+
   function snapshotActiveSession() {
     // Only snapshot normal-buffer panes (shell/codex). Alt-screen TUIs (claude,
     // pagers) keep their view in the alternate buffer, which the serializer
@@ -354,8 +368,9 @@
     }
     try {
       const data = serializeAddon.serialize({ scrollback: SESSION_SNAPSHOT_SCROLLBACK });
-      sessionSnapshots.delete(activeSessionName);
-      sessionSnapshots.set(activeSessionName, data);
+      const snapshotKey = sessionSnapshotKey(activeSessionName);
+      sessionSnapshots.delete(snapshotKey);
+      sessionSnapshots.set(snapshotKey, data);
       while (sessionSnapshots.size > SESSION_SNAPSHOT_MAX) {
         sessionSnapshots.delete(sessionSnapshots.keys().next().value);
       }
@@ -369,6 +384,9 @@
 
   let socket = null;
   let reconnectTimer = null;
+  let resumeProbeTimer = null;
+  let socketConnectStartedAt = 0;
+  let lastServerMessageAt = 0;
   let fitTimer = null;
   let terminalFitScheduled = false;
   let pendingFitPreserveCols = false;
@@ -387,8 +405,10 @@
   let currentSessions = [];
   let openTabNames = loadOpenTabs();
   let editorTabs = loadEditorTabs();
+  const editorTabsByProfile = new Map([[activeProfileId || "single", editorTabs]]);
   let fileBookmarks = [];
-  let selectedSessionName = localStorage.getItem(STORAGE_ACTIVE_SESSION_KEY) || "";
+  let fileBookmarksByProfile = {};
+  let selectedSessionName = loadActiveSession();
   let activeTabKey = selectedSessionName ? terminalTabKey(selectedSessionName) : "";
   let activeSessionName = "";
   // The tab the user was on before the current one — used by the selection's
@@ -667,9 +687,23 @@
     }
   }
 
-  function loadOpenTabs() {
+  function profileStateKey(name, profileId = activeProfileId) {
+    return profileId ? `${STORAGE_PROFILE_PREFIX}${profileId}.${name}` : "";
+  }
+
+  function tokenStorageKey(realm = loginRealm) {
+    return realm ? `${STORAGE_TOKEN_KEY}.${realm}` : STORAGE_TOKEN_KEY;
+  }
+
+  function loadActiveSession(profileId = activeProfileId) {
+    const key = profileStateKey("active-session", profileId);
+    return localStorage.getItem(key || STORAGE_ACTIVE_SESSION_KEY) || "";
+  }
+
+  function loadOpenTabs(profileId = activeProfileId) {
     try {
-      const parsed = JSON.parse(localStorage.getItem(STORAGE_OPEN_TABS_KEY) || "null");
+      const key = profileStateKey("open-tabs", profileId) || STORAGE_OPEN_TABS_KEY;
+      const parsed = JSON.parse(localStorage.getItem(key) || "null");
       if (Array.isArray(parsed)) {
         return Array.from(
           new Set(
@@ -764,9 +798,10 @@
     };
   }
 
-  function loadEditorTabs() {
+  function loadEditorTabs(profileId = activeProfileId) {
     try {
-      const parsed = JSON.parse(localStorage.getItem(STORAGE_EDITOR_TABS_KEY) || "null");
+      const key = profileStateKey("editor-tabs", profileId) || STORAGE_EDITOR_TABS_KEY;
+      const parsed = JSON.parse(localStorage.getItem(key) || "null");
       if (Array.isArray(parsed)) {
         return parsed.map(normalizeEditorTab).filter(Boolean);
       }
@@ -777,12 +812,13 @@
   }
 
   function persistEditorTabs() {
+    const key = profileStateKey("editor-tabs") || STORAGE_EDITOR_TABS_KEY;
     if (!editorTabs.length) {
-      localStorage.removeItem(STORAGE_EDITOR_TABS_KEY);
+      localStorage.removeItem(key);
       return;
     }
     localStorage.setItem(
-      STORAGE_EDITOR_TABS_KEY,
+      key,
       JSON.stringify(
         editorTabs.map((tab) => ({
           id: tab.id,
@@ -866,6 +902,29 @@
       normalized.push(nextBookmark);
     });
     return normalized.slice(0, FILE_BOOKMARK_LIMIT);
+  }
+
+  function normalizeFileBookmarksByProfile(bookmarksByProfile) {
+    if (!bookmarksByProfile || typeof bookmarksByProfile !== "object" || Array.isArray(bookmarksByProfile)) {
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(bookmarksByProfile).map(([profileId, bookmarks]) => [
+        profileId,
+        normalizeFileBookmarks(bookmarks),
+      ]),
+    );
+  }
+
+  function activeFileBookmarkSettings() {
+    if (!serverConfig.profileMode || !activeProfileId) {
+      return { fileBookmarks };
+    }
+    fileBookmarksByProfile = {
+      ...fileBookmarksByProfile,
+      [activeProfileId]: normalizeFileBookmarks(fileBookmarks),
+    };
+    return { fileBookmarksByProfile };
   }
 
   function escapeHtml(value) {
@@ -1059,7 +1118,7 @@
         gestures: gestureBindings,
         uiScale,
         terminalFontSize,
-        fileBookmarks,
+        ...activeFileBookmarkSettings(),
       },
     });
   }
@@ -1718,11 +1777,12 @@
   }
 
   function persistActiveSession(sessionName) {
+    const key = profileStateKey("active-session") || STORAGE_ACTIVE_SESSION_KEY;
     if (!sessionName) {
-      localStorage.removeItem(STORAGE_ACTIVE_SESSION_KEY);
+      localStorage.removeItem(key);
       return;
     }
-    localStorage.setItem(STORAGE_ACTIVE_SESSION_KEY, sessionName);
+    localStorage.setItem(key, sessionName);
   }
 
   // True once the server has sent its per-user open-tab set on this
@@ -1737,11 +1797,12 @@
   }
 
   function persistOpenTabs() {
+    const key = profileStateKey("open-tabs") || STORAGE_OPEN_TABS_KEY;
     if (!openTabNames.length) {
-      localStorage.removeItem(STORAGE_OPEN_TABS_KEY);
+      localStorage.removeItem(key);
       return;
     }
-    localStorage.setItem(STORAGE_OPEN_TABS_KEY, JSON.stringify(openTabNames));
+    localStorage.setItem(key, JSON.stringify(openTabNames));
   }
 
   function setOpenTabs(nextNames) {
@@ -1987,6 +2048,9 @@
 
   function wsUrl() {
     const url = new URL("/_ws", window.location.href);
+    if (activeProfileId) {
+      url.searchParams.set("profile", activeProfileId);
+    }
     if (selectedSessionName) {
       url.searchParams.set("session", selectedSessionName);
     }
@@ -2011,7 +2075,7 @@
     }
     authConfigPollTimer = window.setTimeout(async () => {
       authConfigPollTimer = 0;
-      const savedToken = localStorage.getItem(STORAGE_TOKEN_KEY);
+      const savedToken = localStorage.getItem(tokenStorageKey());
       if (!loginOverlay || loginOverlay.classList.contains("hidden") || savedToken) {
         return;
       }
@@ -2968,6 +3032,107 @@
   }
 
 
+  function activeProfile() {
+    return profiles.find((profile) => profile.id === activeProfileId) || null;
+  }
+
+  function updateProfileConnectionState() {
+    profileButton.classList.toggle("is-offline", !socket || socket.readyState !== WebSocket.OPEN);
+  }
+
+  function loginRequiresToken() {
+    const profileId = pendingProfileId || activeProfileId;
+    const profile = profiles.find((item) => item.id === profileId);
+    return profile?.requireToken ?? serverConfig.requireToken;
+  }
+
+  function loginSupportsPasskey() {
+    const profileId = pendingProfileId || activeProfileId;
+    const profile = profiles.find((item) => item.id === profileId);
+    return Boolean(profile ? profile.deviceKeyAuth : serverConfig.passkeyAuth);
+  }
+
+  function applyActiveProfile() {
+    const profile = activeProfile();
+    updateProfileConnectionState();
+    profileBanner.classList.toggle("hidden", !serverConfig.profileMode || !profile);
+    if (!profile) {
+      return;
+    }
+    const accent = profile.accent || "#ffd166";
+    document.documentElement.style.setProperty("--profile-accent", accent);
+    document.documentElement.style.setProperty("--accent", accent);
+    profileDot.style.background = accent;
+    profileLabel.textContent = profile.label || profile.id;
+    const down = profile.available === false || profile.status === "down";
+    profileStatus.classList.toggle("is-down", down);
+    profileStatus.textContent = down ? profile.statusMessage || "Unavailable" : "Connected";
+    profileButton.setAttribute("aria-expanded", profileMenuOpen ? "true" : "false");
+  }
+
+  function updateProfileInventory(nextProfiles, nextActiveProfile = activeProfileId) {
+    if (Array.isArray(nextProfiles)) {
+      profiles = nextProfiles;
+    }
+    if (nextActiveProfile && nextActiveProfile !== activeProfileId) {
+      const previousProfileId = activeProfileId;
+      activeProfileId = nextActiveProfile;
+      localStorage.setItem(STORAGE_ACTIVE_PROFILE_KEY, activeProfileId);
+      if (!pendingProfileId) {
+        loginRealm = activeProfile()?.authRealm || "";
+      }
+      loadActiveProfileState(previousProfileId);
+    }
+    applyActiveProfile();
+    if (profileMenuOpen) {
+      renderProfileMenu();
+      positionProfileMenu();
+    }
+  }
+
+  function migrateLegacyProfileState(profileId) {
+    const activeKey = profileStateKey("active-session", profileId);
+    const openTabsKey = profileStateKey("open-tabs", profileId);
+    const editorTabsKey = profileStateKey("editor-tabs", profileId);
+    if (activeKey && localStorage.getItem(activeKey) === null) {
+      const legacyActive = localStorage.getItem(STORAGE_ACTIVE_SESSION_KEY);
+      if (legacyActive) localStorage.setItem(activeKey, legacyActive);
+    }
+    if (openTabsKey && localStorage.getItem(openTabsKey) === null) {
+      const legacyTabs = localStorage.getItem(STORAGE_OPEN_TABS_KEY);
+      if (legacyTabs) localStorage.setItem(openTabsKey, legacyTabs);
+    }
+    if (editorTabsKey && localStorage.getItem(editorTabsKey) === null) {
+      const legacyEditorTabs = localStorage.getItem(STORAGE_EDITOR_TABS_KEY);
+      if (legacyEditorTabs) {
+        localStorage.setItem(editorTabsKey, legacyEditorTabs);
+        editorTabsByProfile.delete(profileId || "single");
+      }
+    }
+  }
+
+  function loadActiveProfileState(previousProfileId = activeProfileId) {
+    if (previousProfileId !== activeProfileId) {
+      editorTabsByProfile.set(previousProfileId || "single", editorTabs);
+    }
+    cancelPendingFileRequests();
+    closeFileRootPicker();
+    selectedSessionName = loadActiveSession();
+    activeSessionName = "";
+    activeTabKey = selectedSessionName ? terminalTabKey(selectedSessionName) : "";
+    openTabNames = loadOpenTabs();
+    const editorProfileId = activeProfileId || "single";
+    editorTabs = editorTabsByProfile.get(editorProfileId) || loadEditorTabs();
+    editorTabsByProfile.set(editorProfileId, editorTabs);
+    fileBookmarks = activeProfileId
+      ? normalizeFileBookmarks(fileBookmarksByProfile[activeProfileId])
+      : fileBookmarks;
+    lastDefaultFileRoot = "";
+    openTabsServerSync = false;
+    currentSessions = [];
+    currentTabs = [];
+  }
+
   async function loadServerConfig() {
     try {
       const response = await fetch("/config", { cache: "no-store" });
@@ -2981,9 +3146,72 @@
         tailscaleMode: false,
         allowedClients: [],
         multiTenant: false,
+        profileMode: false,
+        profiles: [],
+        deviceKeyAuth: false,
+        passkeyAuth: false,
       };
     }
+    profiles = Array.isArray(serverConfig.profiles) ? serverConfig.profiles : [];
+    if (serverConfig.profileMode && profiles.length) {
+      const saved = localStorage.getItem(STORAGE_ACTIVE_PROFILE_KEY) || "";
+      const nextProfile = profiles.some((profile) => profile.id === saved)
+        ? saved
+        : serverConfig.activeProfile || profiles[0].id;
+      const changed = nextProfile !== activeProfileId;
+      const previousProfileId = activeProfileId;
+      activeProfileId = nextProfile;
+      localStorage.setItem(STORAGE_ACTIVE_PROFILE_KEY, activeProfileId);
+      if (activeProfileId === serverConfig.activeProfile) {
+        migrateLegacyProfileState(activeProfileId);
+      }
+      loginRealm = activeProfile()?.authRealm || "";
+      if (changed || !activeSessionName) {
+        loadActiveProfileState(previousProfileId);
+      }
+    } else {
+      const previousProfileId = activeProfileId;
+      const hadActiveProfile = Boolean(activeProfileId);
+      profiles = [];
+      activeProfileId = "";
+      loginRealm = "";
+      localStorage.removeItem(STORAGE_ACTIVE_PROFILE_KEY);
+      if (hadActiveProfile) {
+        loadActiveProfileState(previousProfileId);
+      }
+    }
+    applyActiveProfile();
     syncLoginFields();
+  }
+
+  function ensurePasskeyHelper() {
+    if (window.MobileTerminalPasskeys) {
+      return Promise.resolve(true);
+    }
+    const passkeysEnabled =
+      Boolean(serverConfig.passkeyAuth) || profiles.some((profile) => profile.deviceKeyAuth);
+    if (!passkeysEnabled) {
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      const script = document.createElement("script");
+      script.src = "/static/passkey.js";
+      script.onload = () => resolve(Boolean(window.MobileTerminalPasskeys));
+      script.onerror = () => resolve(false);
+      document.head.appendChild(script);
+    });
+  }
+
+  async function prepareAuthenticationClient() {
+    const passkeyReady = await ensurePasskeyHelper();
+    await refreshDeviceKeyFlag();
+    if (passkeyReady) {
+      return true;
+    }
+    closeBootSocket();
+    loginOverlay.classList.remove("hidden");
+    loginMessage.textContent = "Passkey support could not be loaded. Refresh and try again.";
+    return false;
   }
 
   function activeTab() {
@@ -3025,6 +3253,7 @@
       }
       positionTabMenu();
       positionSessionMenu();
+      positionProfileMenu();
       positionSettingsMenu();
       positionAuxMenu();
       positionBtopTargetMenu();
@@ -4176,6 +4405,65 @@
     }
   }
 
+  function renderProfileMenu() {
+    profileMenu.innerHTML = "";
+    profiles.forEach((profile) => {
+      const row = document.createElement("div");
+      row.className = "profile-menu-row";
+      const button = document.createElement("button");
+      button.className = `tab-menu-button${profile.id === activeProfileId ? " is-active" : ""}`;
+      button.type = "button";
+
+      const dot = document.createElement("span");
+      dot.className = "profile-menu-dot";
+      dot.style.background = profile.accent || "#ffd166";
+      const label = document.createElement("span");
+      label.textContent = profile.label || profile.id;
+      const state = document.createElement("span");
+      const down = profile.available === false || profile.status === "down";
+      state.className = `profile-menu-state${down ? " is-down" : ""}`;
+      state.textContent = down ? "Down" : profile.id === activeProfileId ? "Active" : "";
+      button.appendChild(dot);
+      button.appendChild(label);
+      button.appendChild(state);
+      button.addEventListener("click", () => switchProfile(profile.id));
+      row.appendChild(button);
+      profileMenu.appendChild(row);
+    });
+  }
+
+  function switchProfile(profileId) {
+    const profile = profiles.find((candidate) => candidate.id === profileId);
+    if (!profile) {
+      closeProfileMenu();
+      return;
+    }
+    if (profileId === activeProfileId) {
+      closeProfileMenu();
+      if (profile.available === false || profile.status === "down") {
+        sendMessage({ type: "retry-profile", profile: profileId, session: selectedSessionName });
+      }
+      return;
+    }
+
+    snapshotActiveSession();
+    const previousProfileId = activeProfileId;
+    activeProfileId = profileId;
+    loginRealm = profile.authRealm || "";
+    pendingProfileId = profileId;
+    localStorage.setItem(STORAGE_ACTIVE_PROFILE_KEY, activeProfileId);
+    loadActiveProfileState(previousProfileId);
+    closeProfileMenu();
+    closeSessionMenu();
+    closeTabMenu();
+    resetComposerTracking(true);
+    term.reset();
+    applyActiveProfile();
+    renderProfileMenu();
+    syncOpenTabsToSessions();
+    sendMessage({ type: "switch-profile", profile: profileId, session: selectedSessionName });
+  }
+
   function renderSessionMenu() {
     sessionMenu.innerHTML = "";
     if (!currentSessions.length) {
@@ -4393,6 +4681,15 @@
     return `fs-${Date.now().toString(36)}-${fileRequestCounter}`;
   }
 
+  function cancelPendingFileRequests() {
+    pendingFileRequests.forEach((pending) => {
+      if (pending.timeoutId) {
+        window.clearTimeout(pending.timeoutId);
+      }
+    });
+    pendingFileRequests.clear();
+  }
+
   function sendFileCommand(type, payload = {}, context = {}) {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       showToast("Connect before opening files.");
@@ -4407,7 +4704,7 @@
       pendingFileRequests.delete(requestId);
       handleFileRequestTimeout(pending);
     }, FILE_REQUEST_TIMEOUT_MS);
-    pendingFileRequests.set(requestId, { ...context, timeoutId });
+    pendingFileRequests.set(requestId, { ...context, profileId: activeProfileId, timeoutId });
     sendMessage({ type, requestId, ...payload });
     return requestId;
   }
@@ -4978,10 +5275,11 @@
 
   function handleFileServerMessage(payload) {
     const requestId = String(payload.requestId || "");
-    const context = pendingFileRequests.get(requestId) || {};
-    if (requestId) {
-      pendingFileRequests.delete(requestId);
+    const context = pendingFileRequests.get(requestId);
+    if (!context || context.profileId !== activeProfileId) {
+      return;
     }
+    pendingFileRequests.delete(requestId);
     if (context.timeoutId) {
       window.clearTimeout(context.timeoutId);
     }
@@ -5128,9 +5426,10 @@
   // Reply to the server's auth challenge: sign the nonce with the device key
   // (silent), and also carry token/username as a fallback the server uses only
   // if the signature is absent/invalid.
-  async function sendAuthResponse(nonce) {
+  async function sendAuthResponse(nonce, realm = loginRealm) {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    const token = localStorage.getItem(STORAGE_TOKEN_KEY) || "";
+    if (realm) loginRealm = realm;
+    const token = localStorage.getItem(tokenStorageKey(realm)) || "";
     const msg = { type: "auth", user: currentUser, deviceId: getDeviceId() };
     if (token) msg.token = token;
     try {
@@ -5158,50 +5457,61 @@
     }
   }
 
-  function decodeCreationOptions(o) {
-    const pk = Object.assign({}, o);
-    pk.challenge = base64ToBytes(o.challenge);
-    pk.user = Object.assign({}, o.user, { id: base64ToBytes(o.user.id) });
-    if (Array.isArray(o.excludeCredentials)) {
-      pk.excludeCredentials = o.excludeCredentials.map((c) => Object.assign({}, c, { id: base64ToBytes(c.id) }));
+  function reconnectSocket() {
+    window.clearTimeout(reconnectTimer);
+    window.clearTimeout(resumeProbeTimer);
+    reconnectTimer = null;
+    resumeProbeTimer = null;
+    const previousSocket = socket;
+    socket = null;
+    updateProfileConnectionState();
+    if (
+      previousSocket &&
+      (previousSocket.readyState === WebSocket.CONNECTING || previousSocket.readyState === WebSocket.OPEN)
+    ) {
+      try {
+        previousSocket.close();
+      } catch (_error) {
+        // A dead iOS socket may already be detached from its network process.
+      }
     }
-    return pk;
+    connect();
   }
-  function credentialToJSON(cred) {
-    return {
-      id: cred.id,
-      rawId: base64urlOf(cred.rawId),
-      type: cred.type,
-      response: {
-        clientDataJSON: base64urlOf(cred.response.clientDataJSON),
-        attestationObject: base64urlOf(cred.response.attestationObject),
-      },
-      clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
-      authenticatorAttachment: cred.authenticatorAttachment || null,
-    };
-  }
-  // Off-tailnet bootstrap: one biometric (WebAuthn) gates minting the durable
-  // silent key for a brand-new device. On success we register both.
-  async function enrollDeviceKeyWithBiometric(options) {
-    try {
-      if (!window.PublicKeyCredential) throw new Error("webauthn unavailable");
-      const cred = await navigator.credentials.create({ publicKey: decodeCreationOptions(options) });
-      if (!cred) throw new Error("no credential");
-      const rec = await ensureDeviceKey();
-      sendMessage({
-        type: "webauthn-register",
-        attestation: credentialToJSON(cred),
-        deviceId: getDeviceId(),
-        publicKey: await exportPublicSpki(rec.publicKey),
-      });
-      hasDeviceKey = true;
-    } catch (e) {
-      /* biometric declined/unavailable: stays on token auth for this session */
+
+  function refreshConnection() {
+    window.clearTimeout(resumeProbeTimer);
+    resumeProbeTimer = null;
+    if (!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+      reconnectSocket();
+      return;
     }
+    if (socket.readyState === WebSocket.CONNECTING) {
+      if (performance.now() - socketConnectStartedAt > 10000) {
+        reconnectSocket();
+      }
+      return;
+    }
+
+    const observedSocket = socket;
+    const observedMessageAt = lastServerMessageAt;
+    sendMessage({ type: "request-tabs" });
+    sendMessage({ type: "request-sessions" });
+    sendMessage({ type: "request-settings" });
+    if (serverConfig.profileMode) sendMessage({ type: "request-profiles" });
+    resumeProbeTimer = window.setTimeout(() => {
+      resumeProbeTimer = null;
+      if (
+        socket === observedSocket &&
+        observedSocket.readyState === WebSocket.OPEN &&
+        lastServerMessageAt <= observedMessageAt
+      ) {
+        reconnectSocket();
+      }
+    }, 4000);
   }
 
   function connect() {
-    const token = localStorage.getItem(STORAGE_TOKEN_KEY);
+    const token = localStorage.getItem(tokenStorageKey());
     currentUser = localStorage.getItem(STORAGE_USER_KEY) || "";
     // Auto-login by Tailscale identity (behind `tailscale serve`): the server
     // already knows who this is, so no token/username prompt is needed.
@@ -5210,7 +5520,9 @@
     }
     // An enrolled device signs the server's nonce, so it needs neither a token
     // nor a username prompt — it authenticates silently from anywhere.
-    const needsToken = serverConfig.requireToken && !token && !hasDeviceKey;
+    const profileRequiresToken = loginRequiresToken();
+    const passkeyAvailable = loginSupportsPasskey();
+    const needsToken = profileRequiresToken && !token && !hasDeviceKey && !passkeyAvailable;
     const needsUser = serverConfig.multiTenant && !currentUser && !hasDeviceKey;
     if (needsToken || needsUser) {
       closeBootSocket(); // can't use the pre-opened socket if we must prompt first
@@ -5222,6 +5534,9 @@
     }
 
     window.clearTimeout(reconnectTimer);
+    window.clearTimeout(resumeProbeTimer);
+    reconnectTimer = null;
+    resumeProbeTimer = null;
     stopAuthConfigPolling();
     loginOverlay.classList.add("hidden");
 
@@ -5238,17 +5553,33 @@
       closeBootSocket();
       socket = new WebSocket(wsUrl());
     }
+    socketConnectStartedAt = performance.now();
+    const thisSocket = socket;
     socket.binaryType = "arraybuffer";
+    updateProfileConnectionState();
 
     // Auth is challenge-driven now: the server sends {type:"auth-challenge",
     // nonce} and we reply via sendAuthResponse() (signing the nonce with the
     // device key when enrolled, else falling back to token/username). The early
     // boot socket buffers that challenge; it's replayed below.
 
+    socket.addEventListener("open", () => {
+      if (socket !== thisSocket) {
+        return;
+      }
+      updateProfileConnectionState();
+    });
+
     const onSocketMessage = async (event) => {
+      if (socket !== thisSocket) {
+        return;
+      }
+      lastServerMessageAt = performance.now();
+      window.clearTimeout(resumeProbeTimer);
+      resumeProbeTimer = null;
       if (typeof event.data === "string") {
         const payload = JSON.parse(event.data);
-        handleServerMessage(payload);
+        await handleServerMessage(payload);
         return;
       }
       let chunk = event.data;
@@ -5277,15 +5608,22 @@
     }
 
     socket.addEventListener("close", (event) => {
+      if (socket !== thisSocket) {
+        return;
+      }
+      updateProfileConnectionState();
+      window.clearTimeout(resumeProbeTimer);
+      resumeProbeTimer = null;
       if (reconnectForSessionSwitch) {
         reconnectForSessionSwitch = false;
         window.setTimeout(connect, 80);
         return;
       }
       if (event.code === 4001) {
+        waitingForProxyAuth = false;
         loginOverlay.classList.remove("hidden");
         loginMessage.textContent = "Authentication failed. Check the token and try again.";
-        localStorage.removeItem(STORAGE_TOKEN_KEY);
+        localStorage.removeItem(tokenStorageKey());
         scheduleAuthConfigPolling();
         return;
       }
@@ -5297,24 +5635,90 @@
     });
   }
 
-  function handleServerMessage(payload) {
+  function showProxySignIn(payload, message) {
+    waitingForProxyAuth = true;
+    pendingProfileId = payload.profile || pendingProfileId || activeProfileId;
+    loginRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
+    loginOverlay.classList.remove("hidden");
+    loginMessage.textContent = message;
+    tokenInput.value = "";
+    tokenInput.focus();
+  }
+
+  async function handleServerMessage(payload) {
+    if (
+      window.MobileTerminalPasskeys &&
+      (payload.type === "webauthn-auth-options" || payload.type === "webauthn-register-options")
+    ) {
+      waitingForProxyAuth = true;
+      pendingProfileId = payload.profile || pendingProfileId || activeProfileId;
+      loginRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
+      try {
+        if (await window.MobileTerminalPasskeys.handleMessage(payload, sendMessage)) {
+          return;
+        }
+      } catch (_error) {
+        showProxySignIn(payload, "Passkey was not completed. Sign in with the access token to continue.");
+        return;
+      }
+    }
     if (String(payload.type || "").startsWith("fs-")) {
       handleFileServerMessage(payload);
       return;
     }
     if (payload.type === "auth-challenge") {
-      sendAuthResponse(payload.nonce);
+      if (serverConfig.profileMode) {
+        waitingForProxyAuth = true;
+        pendingProfileId = payload.profile || pendingProfileId || activeProfileId;
+        loginRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
+        if (loginSupportsPasskey() && !localStorage.getItem(tokenStorageKey(loginRealm))) {
+          showProxySignIn(payload, "Sign in with the access token to register a passkey.");
+          return;
+        }
+      }
+      sendAuthResponse(payload.nonce, payload.realm || loginRealm);
+      return;
+    }
+    if (payload.type === "profiles") {
+      updateProfileInventory(payload.profiles, payload.activeProfile);
+      return;
+    }
+    if (payload.type === "profile-status") {
+      profiles = profiles.map((profile) =>
+        profile.id === payload.profile
+          ? {
+              ...profile,
+              available: payload.available !== false,
+              status: payload.available === false ? "down" : "up",
+              statusMessage: payload.message || "",
+            }
+          : profile,
+      );
+      applyActiveProfile();
+      if (payload.message && payload.available === false) {
+        showToast(payload.message);
+      }
+      if (profileMenuOpen) renderProfileMenu();
       return;
     }
     if (payload.type === "enroll-key") {
       enrollDeviceKey();
       return;
     }
-    if (payload.type === "webauthn-register-options") {
-      enrollDeviceKeyWithBiometric(payload.options);
-      return;
-    }
     if (payload.type === "ready") {
+      if (Array.isArray(payload.profiles) || payload.activeProfile) {
+        updateProfileInventory(payload.profiles, payload.activeProfile);
+      }
+      if (!pendingProfileId || payload.activeProfile === pendingProfileId) {
+        pendingProfileId = "";
+      }
+      waitingForProxyAuth = false;
+      if (serverConfig.profileMode && loginSupportsPasskey()) {
+        localStorage.removeItem(tokenStorageKey(activeProfile()?.authRealm || loginRealm));
+      }
+      if (serverConfig.profileMode && payload.principal) {
+        currentUserLabel = payload.principal;
+      }
       resetComposerRevisionState();
       resetSemanticPromptState();
       resetTerminalBufferSyncState();
@@ -5354,7 +5758,7 @@
       selectedSessionName = activeSessionName;
       const keepEditorActive = activeEditorTab() !== null;
       if (!keepEditorActive) {
-        activeTabKey = terminalTabKey(activeSessionName);
+        activeTabKey = activeSessionName ? terminalTabKey(activeSessionName) : "";
       }
       persistActiveSession(activeSessionName);
       // Adopt the server's per-user open-tab set (sent only on the first
@@ -5384,9 +5788,11 @@
         lastTerminalRows = term.rows;
         sendMessage({ type: "resize", cols: term.cols, rows: term.rows });
       }
-      loginOverlay.classList.add("hidden");
-      loginMessage.textContent = "";
-      stopAuthConfigPolling();
+      if (!pendingProfileId) {
+        loginOverlay.classList.add("hidden");
+        loginMessage.textContent = "";
+        stopAuthConfigPolling();
+      }
       syncOpenTabsToSessions();
       // Re-assert keyboard-closed layout. The keyboard cannot be open at
       // this point (tab pills aren't keyboard inputs), but visualViewport
@@ -5529,7 +5935,19 @@
       ) {
         applyTerminalFontSize(Number(nextSettings.terminalFontSize), false);
       }
-      fileBookmarks = normalizeFileBookmarks(nextSettings.fileBookmarks);
+      if (serverConfig.profileMode && activeProfileId) {
+        fileBookmarksByProfile = normalizeFileBookmarksByProfile(nextSettings.fileBookmarksByProfile);
+        if (
+          !Object.prototype.hasOwnProperty.call(fileBookmarksByProfile, activeProfileId) &&
+          activeProfileId === serverConfig.activeProfile &&
+          Array.isArray(nextSettings.fileBookmarks)
+        ) {
+          fileBookmarksByProfile[activeProfileId] = normalizeFileBookmarks(nextSettings.fileBookmarks);
+        }
+        fileBookmarks = normalizeFileBookmarks(fileBookmarksByProfile[activeProfileId]);
+      } else {
+        fileBookmarks = normalizeFileBookmarks(nextSettings.fileBookmarks);
+      }
       if (!fileRootOverlay.classList.contains("hidden")) {
         renderFileBookmarks();
       }
@@ -5578,6 +5996,14 @@
       return;
     }
     if (payload.type === "auth-error") {
+      waitingForProxyAuth = false;
+      if (serverConfig.profileMode && payload.profile) {
+        pendingProfileId = payload.profile;
+        loginRealm = payload.realm || activeProfile()?.authRealm || "";
+        loginOverlay.classList.remove("hidden");
+        tokenInput.value = "";
+        tokenInput.focus();
+      }
       loginMessage.textContent = payload.message || "Authentication failed.";
       return;
     }
@@ -5587,7 +6013,7 @@
     }
     if (payload.type === "token-rotated") {
       if (payload.token) {
-        localStorage.setItem(STORAGE_TOKEN_KEY, payload.token);
+        localStorage.setItem(tokenStorageKey(), payload.token);
       }
       showToast("Token rotated. Other devices have been signed out.");
       sendMessage({ type: "request-devices" });
@@ -5600,6 +6026,7 @@
     closeSettingsMenu();
     closeAuxMenu();
     closeBtopTargetMenu();
+    closeProfileMenu();
     if (openTabMenuKey === tabKey) {
       closeTabMenu();
       return;
@@ -5643,6 +6070,7 @@
     closeSettingsMenu();
     closeAuxMenu();
     closeBtopTargetMenu();
+    closeProfileMenu();
     sessionMenuOpen = !sessionMenuOpen;
     sessionMenu.classList.toggle("hidden", !sessionMenuOpen);
     if (!sessionMenuOpen) {
@@ -5674,11 +6102,41 @@
     sessionMenu.classList.add("hidden");
   }
 
+  function toggleProfileMenu() {
+    closeSessionMenu();
+    closeTabMenu();
+    closeSettingsMenu();
+    closeAuxMenu();
+    closeBtopTargetMenu();
+    profileMenuOpen = !profileMenuOpen;
+    profileMenu.classList.toggle("hidden", !profileMenuOpen);
+    profileButton.setAttribute("aria-expanded", profileMenuOpen ? "true" : "false");
+    if (profileMenuOpen) {
+      renderProfileMenu();
+      positionProfileMenu();
+      sendMessage({ type: "request-profiles" });
+    }
+  }
+
+  function positionProfileMenu() {
+    if (!profileMenuOpen) {
+      return;
+    }
+    positionMenuUnder(profileMenu, profileButton, 210);
+  }
+
+  function closeProfileMenu() {
+    profileMenuOpen = false;
+    profileMenu.classList.add("hidden");
+    profileButton.setAttribute("aria-expanded", "false");
+  }
+
   function toggleSettingsMenu() {
     closeSessionMenu();
     closeTabMenu();
     closeAuxMenu();
     closeBtopTargetMenu();
+    closeProfileMenu();
     settingsMenuOpen = !settingsMenuOpen;
     settingsMenu.classList.toggle("hidden", !settingsMenuOpen);
     if (settingsMenuOpen) {
@@ -5710,6 +6168,7 @@
     closeSettingsMenu();
     closeTabMenu();
     closeBtopTargetMenu();
+    closeProfileMenu();
     auxMenuOpen = !auxMenuOpen;
     auxMenu.classList.toggle("hidden", !auxMenuOpen);
     if (auxMenuOpen) {
@@ -5747,6 +6206,7 @@
     closeSessionMenu();
     closeSettingsMenu();
     closeTabMenu();
+    closeProfileMenu();
     btopTargetMenuOpen = true;
     renderBtopTargetMenu();
     btopTargetMenu.classList.remove("hidden");
@@ -5890,7 +6350,7 @@
       // live screen over it on attach, so the switch is seamless — the snapshot IS
       // the ready state, with no reset/repaint flash. No history is requested; the
       // snapshot carries the scrollback (panes with none use the server fallback).
-      const snapshot = sessionSnapshots.get(sessionName);
+      const snapshot = sessionSnapshots.get(sessionSnapshotKey(sessionName));
       if (snapshot) {
         term.write(snapshot, () => {
           term.scrollToBottom();
@@ -6871,7 +7331,8 @@
       loginMessage.textContent = "Enter your username first.";
       return;
     }
-    if (serverConfig.requireToken && !token) {
+    const requireToken = loginRequiresToken();
+    if (requireToken && !token) {
       loginMessage.textContent = "Enter the access token first.";
       return;
     }
@@ -6880,9 +7341,21 @@
       localStorage.setItem(STORAGE_USER_KEY, userName);
     }
     if (token) {
-      localStorage.setItem(STORAGE_TOKEN_KEY, token);
+      localStorage.setItem(tokenStorageKey(), token);
     }
     loginMessage.textContent = "";
+    if (waitingForProxyAuth && socket && socket.readyState === WebSocket.OPEN) {
+      loginOverlay.classList.add("hidden");
+      sendAuthResponse("", loginRealm);
+      return;
+    }
+    if (pendingProfileId && socket && socket.readyState === WebSocket.OPEN) {
+      const profileId = pendingProfileId;
+      pendingProfileId = "";
+      loginOverlay.classList.add("hidden");
+      sendMessage({ type: "switch-profile", profile: profileId, session: loadActiveSession(profileId) });
+      return;
+    }
     connect();
   });
 
@@ -6897,7 +7370,7 @@
   }
 
   function signOut() {
-    localStorage.removeItem(STORAGE_TOKEN_KEY);
+    localStorage.removeItem(tokenStorageKey());
     if (serverConfig.multiTenant) {
       localStorage.removeItem(STORAGE_USER_KEY);
       currentUser = "";
@@ -6927,10 +7400,18 @@
 
   function updateUserBadge() {
     if (accountButton) {
-      accountButton.classList.toggle("hidden", !serverConfig.multiTenant);
+      accountButton.classList.toggle("hidden", !serverConfig.multiTenant && !serverConfig.profileMode);
     }
     if (accountUserLabel) {
       accountUserLabel.textContent = `Signed in as ${currentUserLabel || currentUser || "user"}`;
+    }
+    if (accountHelperText) {
+      accountHelperText.textContent = serverConfig.profileMode
+        ? "Passkeys registered for this auth realm."
+        : "Devices signed in to this user. Rotating the token signs out every device.";
+    }
+    if (rotateTokenButton) {
+      rotateTokenButton.textContent = serverConfig.profileMode ? "Revoke all passkeys" : "Rotate token";
     }
   }
 
@@ -6950,9 +7431,24 @@
     devices.forEach((device) => {
       const row = document.createElement("div");
       row.className = "file-bookmark-item";
-      const isThis = Boolean(device.id) && typeof thisId === "string" && thisId.startsWith(device.id);
       const seen = (device.lastSeen || "").replace("T", " ");
-      row.textContent = `${device.label || "device"}${isThis ? " (this device)" : ""} · ${seen}`;
+      if (serverConfig.profileMode && device.credentialId) {
+        row.className = "file-bookmark-row";
+        const label = document.createElement("span");
+        label.className = "file-bookmark-open passkey-credential-label";
+        label.textContent = `${device.label || "passkey"} · ${seen}`;
+        const revoke = document.createElement("button");
+        revoke.className = "file-bookmark-remove";
+        revoke.type = "button";
+        revoke.textContent = "Revoke";
+        revoke.addEventListener("click", () => {
+          sendMessage({ type: "revoke-credential", credentialId: device.credentialId });
+        });
+        row.append(label, revoke);
+      } else {
+        const isThis = Boolean(device.id) && typeof thisId === "string" && thisId.startsWith(device.id);
+        row.textContent = `${device.label || "device"}${isThis ? " (this device)" : ""} · ${seen}`;
+      }
       deviceList.appendChild(row);
     });
   }
@@ -6983,6 +7479,12 @@
   }
   if (rotateTokenButton) {
     rotateTokenButton.addEventListener("click", () => {
+      if (serverConfig.profileMode) {
+        if (window.confirm("Revoke every passkey for this auth realm?")) {
+          sendMessage({ type: "revoke-all-credentials" });
+        }
+        return;
+      }
       if (window.confirm("Rotate the token? This signs out every device for this user.")) {
         sendMessage({ type: "rotate-token" });
       }
@@ -7000,6 +7502,7 @@
   clearComposerButton.addEventListener("click", forceClearComposer);
 
   auxButton.addEventListener("click", toggleAuxMenu);
+  profileButton.addEventListener("click", toggleProfileMenu);
   auxSessionsButton.addEventListener("click", toggleSessionMenu);
   auxFilesButton.addEventListener("click", () => {
     closeAuxMenu();
@@ -7415,9 +7918,18 @@
   });
   window.addEventListener("focus", () => {
     updateViewportMetrics();
-    sendMessage({ type: "request-tabs" });
-    sendMessage({ type: "request-sessions" });
-    sendMessage({ type: "request-settings" });
+    refreshConnection();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      refreshConnection();
+    }
+  });
+  window.addEventListener("online", refreshConnection);
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) {
+      refreshConnection();
+    }
   });
   document.addEventListener("click", (event) => {
     if (
@@ -7434,6 +7946,13 @@
       !auxMenu.contains(event.target)
     ) {
       closeSessionMenu();
+    }
+    if (
+      profileMenuOpen &&
+      !profileMenu.contains(event.target) &&
+      !profileButton.contains(event.target)
+    ) {
+      closeProfileMenu();
     }
     if (
       settingsMenuOpen &&
@@ -7482,12 +8001,17 @@
   loadServerConfig()
     // Learn whether this device already holds a silent key before deciding
     // whether to prompt for a token, so enrolled devices never see the overlay.
-    .then(refreshDeviceKeyFlag, refreshDeviceKeyFlag)
-    .finally(() => {
+    .then(prepareAuthenticationClient, async () => {
+      await refreshDeviceKeyFlag();
+      return true;
+    })
+    .then((authenticationReady) => {
       if (!serverConfig.requireToken) {
         loginOverlay.classList.add("hidden");
       }
-      connect();
+      if (authenticationReady) {
+        connect();
+      }
     });
 
   // Cache the UI shell for instant, round-trip-free loads. Only registers in a

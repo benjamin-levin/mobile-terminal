@@ -29,6 +29,7 @@
   --text-main: #e6edf3;
   --text-muted: #9eb0bd;
   --accent: #ffd166;
+  --profile-accent: #ffd166;
   --shadow: 0 20px 80px rgba(0, 0, 0, 0.45);
   --page-pad-x: calc(14px * var(--ui-scale));
   --page-pad-y: calc(12px * var(--ui-scale));
@@ -143,6 +144,94 @@ body[data-keyboard-open="true"] .app-shell {
 .topbar-row {
   min-width: 0;
   overflow: hidden;
+}
+
+.profile-banner {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--ui-scale));
+  min-width: 0;
+}
+
+.profile-button {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(7px * var(--ui-scale));
+  min-width: 0;
+  min-height: calc(28px * var(--ui-scale));
+  padding: calc(4px * var(--ui-scale)) calc(9px * var(--ui-scale));
+  border: 1px solid color-mix(in srgb, var(--profile-accent) 42%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--profile-accent) 13%, rgba(9, 20, 27, 0.92));
+  cursor: pointer;
+  font-size: calc(12px * var(--ui-scale));
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+.profile-button:active {
+  transform: translateY(1px);
+}
+
+.profile-button.is-offline {
+  border-color: color-mix(in srgb, var(--text-muted) 36%, transparent);
+  background: color-mix(in srgb, var(--text-muted) 8%, rgba(9, 20, 27, 0.92));
+  color: var(--text-muted);
+}
+
+.profile-button.is-offline .profile-dot {
+  filter: grayscale(1);
+  opacity: 0.55;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-muted) 12%, transparent);
+}
+
+.profile-dot,
+.profile-menu-dot {
+  width: calc(8px * var(--ui-scale));
+  height: calc(8px * var(--ui-scale));
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--profile-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--profile-accent) 16%, transparent);
+}
+
+.profile-chevron {
+  color: var(--text-muted);
+}
+
+.profile-status {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: calc(11px * var(--ui-scale));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-status.is-down {
+  color: #ff9b8f;
+}
+
+.profile-menu-row {
+  display: flex;
+  align-items: center;
+  gap: calc(9px * var(--ui-scale));
+}
+
+.profile-menu-row .tab-menu-button {
+  display: flex;
+  align-items: center;
+  gap: calc(9px * var(--ui-scale));
+}
+
+.profile-menu-state {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: calc(11px * var(--ui-scale));
+}
+
+.profile-menu-state.is-down {
+  color: #ff9b8f;
 }
 
 .topbar-actions {
@@ -1151,6 +1240,11 @@ body[data-keyboard-open="true"] .shortcut-bar {
   gap: calc(2px * var(--ui-scale));
   padding: calc(7px * var(--ui-scale)) calc(10px * var(--ui-scale));
   text-align: left;
+}
+
+.passkey-credential-label {
+  align-items: center;
+  cursor: default;
 }
 
 .file-bookmark-open:hover,

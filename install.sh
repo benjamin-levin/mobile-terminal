@@ -245,7 +245,8 @@ ensure_python_env() {
 
 write_env_file() {
   if [[ -f "$ENV_FILE" ]]; then
-    log "Keeping existing $ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    log "Keeping existing $ENV_FILE (mode 0600)"
     return 0
   fi
 
@@ -269,6 +270,7 @@ write_env_file() {
       echo "MOBILE_TERMINAL_ALLOW_CLIENTS=$ALLOW_CLIENTS_VALUE"
     fi
   } >"$ENV_FILE"
+  chmod 600 "$ENV_FILE"
 }
 
 sed_escape() {

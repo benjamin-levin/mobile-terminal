@@ -3,3 +3,6 @@
 websockets>=12.0
 cryptography>=42.0
 pillow>=10.0
+
+# server.py imports this directly
+webauthn>=3.0

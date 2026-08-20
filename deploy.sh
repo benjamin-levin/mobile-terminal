@@ -8,15 +8,15 @@
 #   ./deploy.sh --dry-run mbp   # dry-run a single host
 #
 # Deploys by file-copy (NOT git): backs up each remote file to <file>.bak-deploy,
-# copies the local version, compile-checks server.py, restarts the service, and
-# verifies /health. Hosts that don't answer SSH are skipped, not failed.
+# copies the local version, smoke-checks the Python runtime, restarts the service,
+# and verifies /health. Hosts that don't answer SSH are skipped, not failed.
 #
 # Run it from the repo root. Branding stays env-driven (MOBILE_TERMINAL_LABEL on
 # each host) — this never touches a host's label or env.
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 
-FILES=(server.py static/app.js static/styles.css static/index.html static/sw.js)
+FILES=(server.py mobile_terminal_config.py proxy.py proxy_auth.py static/app.js static/styles.css static/index.html static/sw.js)
 SSH_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 
 # name | ssh target | repo path | restart command | health port
@@ -78,22 +78,27 @@ for entry in "${HOSTS[@]}"; do
   fi
 
   # Backup + copy each changed file.
+  copy_failed=0
   for f in "${changed[@]}"; do
     ssh "${SSH_OPTS[@]}" "$tgt" "cp '$repo/$f' '$repo/$f.bak-deploy' 2>/dev/null" || true
     if scp -q "${SSH_OPTS[@]}" "$f" "$tgt:$repo/$f"; then
       echo "  copied $f"
     else
-      echo "  ERROR copying $f"; fail=1; continue
+      echo "  ERROR copying $f"; fail=1; copy_failed=1
     fi
   done
+  if [ "$copy_failed" = "1" ]; then
+    echo "  ABORT: not all runtime files were copied on $name — NOT restarting"
+    continue
+  fi
 
-  # Compile-check server.py if it changed, using the host venv when present.
-  if printf '%s\n' "${changed[@]}" | grep -qx "server.py"; then
-    if ! ssh "${SSH_OPTS[@]}" "$tgt" "cd '$repo' && { .venv/bin/python -m py_compile server.py || python3 -m py_compile server.py; }" 2>/dev/null; then
-      echo "  ABORT: server.py failed to compile on $name — NOT restarting (backup left at server.py.bak-deploy)"
+  # Compile and import-check Python runtime files using the interpreter the service uses.
+  if printf '%s\n' "${changed[@]}" | grep -Eq '^(server|mobile_terminal_config|proxy|proxy_auth)\.py$'; then
+    if ! ssh "${SSH_OPTS[@]}" "$tgt" "cd '$repo' && if [ -x .venv/bin/python ]; then py=.venv/bin/python; else py=python3; fi && \"\$py\" -m py_compile server.py mobile_terminal_config.py proxy.py proxy_auth.py && \"\$py\" -c 'import server; from mobile_terminal_config import ConfigError, load_runtime_config; from proxy import ProxyServer; import proxy_auth'" 2>/dev/null; then
+      echo "  ABORT: Python runtime smoke check failed on $name — NOT restarting (backups left at *.bak-deploy)"
       fail=1; continue
     fi
-    echo "  server.py compiles"
+    echo "  Python runtime smoke check passed"
   fi
 
   # Restart + verify.

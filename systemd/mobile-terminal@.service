@@ -1,0 +1,22 @@
+[Unit]
+Description=Mobile Terminal backend for %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=@WORKDIR@
+Environment=MOBILE_TERMINAL_REQUIRE_INTERNAL_TOKEN=true
+EnvironmentFile=@ENV_DIR@/%i.env
+UMask=0077
+ExecStart=@PYTHON@ @WORKDIR@/server.py --host 127.0.0.1
+Restart=always
+RestartSec=3
+KillMode=process
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

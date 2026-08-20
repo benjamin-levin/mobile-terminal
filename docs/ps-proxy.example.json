@@ -1,0 +1,38 @@
+{
+  "mode": "proxy",
+  "label": "ps",
+  "listen": "127.0.0.1:8085",
+  "stateDir": "../state/proxy",
+  "internalTokenEnv": "MOBILE_TERMINAL_INTERNAL_TOKEN",
+  "activeProfile": "powerhouse",
+  "rpId": "powerhouse.tailbfd3d7.ts.net",
+  "origin": "https://powerhouse.tailbfd3d7.ts.net",
+  "authRealms": {
+    "mine": {
+      "tokenEnv": "MOBILE_TERMINAL_TOKEN",
+      "deviceKeyAuth": true,
+      "trustIdentity": false,
+      "principal": "ben"
+    }
+  },
+  "profiles": [
+    {
+      "id": "powerhouse",
+      "label": "gen",
+      "backend": "ws://127.0.0.1:8090",
+      "internalTokenEnv": "MOBILE_TERMINAL_INTERNAL_TOKEN_POWERHOUSE",
+      "osUser": "powerhouse",
+      "authRealm": "mine",
+      "accent": "#ffd166"
+    },
+    {
+      "id": "behuman",
+      "label": "bh",
+      "backend": "ws://127.0.0.1:8091",
+      "internalTokenEnv": "MOBILE_TERMINAL_INTERNAL_TOKEN_BEHUMAN",
+      "osUser": "behuman",
+      "authRealm": "mine",
+      "accent": "#7ee7b3"
+    }
+  ]
+}

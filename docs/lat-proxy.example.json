@@ -1,0 +1,44 @@
+{
+  "mode": "proxy",
+  "label": "lat",
+  "listen": "127.0.0.1:8100",
+  "stateDir": "../state/proxy",
+  "internalTokenEnv": "MOBILE_TERMINAL_INTERNAL_TOKEN",
+  "activeProfile": "ben",
+  "rpId": "lat.tailbfd3d7.ts.net",
+  "origin": "https://lat.tailbfd3d7.ts.net",
+  "authRealms": {
+    "ben": {
+      "tokenEnv": "MOBILE_TERMINAL_TOKEN_BEN",
+      "deviceKeyAuth": true,
+      "trustIdentity": false,
+      "principal": "ben"
+    },
+    "bperritt": {
+      "tokenEnv": "MOBILE_TERMINAL_TOKEN_BPERRITT",
+      "deviceKeyAuth": true,
+      "trustIdentity": false,
+      "principal": "bperritt"
+    }
+  },
+  "profiles": [
+    {
+      "id": "ben",
+      "label": "Ben",
+      "backend": "ws://127.0.0.1:8086",
+      "internalTokenEnv": "MOBILE_TERMINAL_INTERNAL_TOKEN_BEN",
+      "osUser": "ben",
+      "authRealm": "ben",
+      "accent": "#ffd166"
+    },
+    {
+      "id": "bperritt",
+      "label": "B Perritt",
+      "backend": "ws://127.0.0.1:8085",
+      "internalTokenEnv": "MOBILE_TERMINAL_INTERNAL_TOKEN_BPERRITT",
+      "osUser": "bperritt",
+      "authRealm": "bperritt",
+      "accent": "#7ee7b3"
+    }
+  ]
+}
