@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import gzip
 import hashlib
 import inspect
@@ -10,6 +11,7 @@ import os
 import re
 import secrets
 import signal
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -21,14 +23,22 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
-from mobile_terminal_config import ProfileConfig, ProxyConfig
+from mobile_terminal_config import (
+    ProfileConfig,
+    ProxyConfig,
+    normalize_authentication_fields,
+)
 from proxy_auth import AuthenticationRequest, Authenticator, load_authenticator
 from webauthn_auth import (
+    PendingDeviceEnrollment,
     PasskeyAuth,
     PasskeyChallengeError,
     PasskeyStoreError,
     PasskeyVerificationError,
+    device_authentication_transcript,
     resolve_auth_method,
+    valid_device_public_key,
+    verify_device_key_signature,
 )
 
 
@@ -43,6 +53,140 @@ class BackendAuthenticationError(Exception):
 
 class PasskeyAuthenticationError(Exception):
     pass
+
+
+def _migrate_legacy_passkey_stores(config: ProxyConfig) -> None:
+    for realm in config.auth_realms:
+        source = config.state_dir / realm / "device-keys.json"
+        destination = config.state_dir / "realms" / realm / "passkeys.json"
+        if destination.exists() or not source.is_file():
+            continue
+        temporary: Path | None = None
+        try:
+            payload = json.loads(source.read_text())
+            if (
+                not isinstance(payload, dict)
+                or payload.get("version") != 1
+                or not isinstance(payload.get("credentials"), dict)
+            ):
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(
+                f".{destination.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            temporary.write_text(json.dumps(payload, indent=2) + "\n")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, destination)
+        except (OSError, json.JSONDecodeError):
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+
+
+class RealmDeviceKeyRegistry:
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self._lock = threading.Lock()
+
+    def _path(self, realm: str) -> Path:
+        return self.state_dir / "realms" / realm / "device-keys.json"
+
+    def _load_unlocked(self, realm: str) -> dict[str, Any]:
+        path = self._path(realm)
+        if not path.is_file():
+            return {"version": 1, "devices": {}}
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {"version": 1, "devices": {}}
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != 1
+            or not isinstance(payload.get("devices"), dict)
+        ):
+            return {"version": 1, "devices": {}}
+        return payload
+
+    def _save_unlocked(self, realm: str, payload: dict[str, Any]) -> None:
+        path = self._path(realm)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            temporary.write_text(json.dumps(payload, indent=2) + "\n")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+    def authenticate(
+        self,
+        realm: str,
+        device_id: str,
+        transcript: bytes,
+        signature: str,
+    ) -> str | None:
+        if not device_id or not signature:
+            return None
+        with self._lock:
+            record = self._load_unlocked(realm)["devices"].get(device_id)
+        if not isinstance(record, dict):
+            return None
+        public_key = record.get("publicKey")
+        principal = record.get("principal")
+        if (
+            not isinstance(public_key, str)
+            or not isinstance(principal, str)
+            or not principal
+            or not verify_device_key_signature(public_key, transcript, signature)
+        ):
+            return None
+        return principal
+
+    def register(
+        self,
+        realm: str,
+        device_id: str,
+        public_key: str,
+        principal: str,
+        label: str,
+    ) -> bool:
+        if (
+            not device_id
+            or len(device_id) > 64
+            or not principal
+            or len(principal) > 128
+            or not valid_device_public_key(public_key)
+        ):
+            return False
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self._lock:
+            payload = self._load_unlocked(realm)
+            existing = payload["devices"].get(device_id)
+            created = existing.get("created", now) if isinstance(existing, dict) else now
+            payload["devices"][device_id] = {
+                "publicKey": public_key,
+                "principal": principal,
+                "label": (label or "device")[:80],
+                "created": created,
+                "lastSeen": now,
+            }
+            self._save_unlocked(realm, payload)
+        return True
+
+    def forget(self, realm: str, device_id: str) -> None:
+        if not device_id:
+            return
+        with self._lock:
+            payload = self._load_unlocked(realm)
+            if device_id not in payload["devices"]:
+                return
+            del payload["devices"][device_id]
+            self._save_unlocked(realm, payload)
 
 
 def _remote_host(remote_address: Any) -> str | None:
@@ -129,12 +273,15 @@ class ProxyServer:
         self.authenticate = authenticate or load_authenticator(config.auth_realms, configured_auth)
         self.passkeys = passkeys
         if self.passkeys is None and config.rp_id and config.expected_origin:
+            _migrate_legacy_passkey_stores(config)
             self.passkeys = PasskeyAuth(
-                config.state_dir,
+                config.state_dir / "realms",
                 rp_id=config.rp_id,
                 rp_name=f"{config.label} terminal",
                 expected_origin=config.expected_origin,
+                store_filename="passkeys.json",
             )
+        self.device_keys = RealmDeviceKeyRegistry(config.state_dir)
         self.profile_status = {profile.id: profile.status for profile in config.profiles}
         self.profile_messages = {profile.id: profile.status_message for profile in config.profiles}
         self.started_at = ""
@@ -148,10 +295,10 @@ class ProxyServer:
             payload = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             return None
-        return payload if isinstance(payload, dict) else None
+        return normalize_authentication_fields(payload) if isinstance(payload, dict) else None
 
     def save_settings(self, settings: Any) -> dict[str, Any]:
-        payload = settings if isinstance(settings, dict) else {}
+        payload = normalize_authentication_fields(settings)
         path = self.config.state_dir / "settings.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
@@ -218,6 +365,8 @@ class ProxyServer:
             "activeProfile": self.config.active_profile,
             "label": self.config.label,
             "deviceKeyAuth": bool(self.passkeys and realm and realm.device_key_auth),
+            "passkeyAuth": bool(self.passkeys and realm and realm.device_key_auth),
+            "rpId": self.config.rp_id,
         }
 
     async def send_json(self, connection: ServerConnection, payload: dict[str, Any]) -> None:
@@ -282,14 +431,14 @@ class ProxyServer:
         profile: ProfileConfig,
         *,
         binding: str = "",
+        enrollment: dict[str, str] | None = None,
     ) -> str | None:
         identity = self._identity_principal(connection, profile)
-        if identity is not None:
-            return resolve_auth_method(identity_principal=identity).require_terminal_authorization()
-
         realm = self.config.auth_realms[profile.auth_realm]
         passkey_enabled = bool(self.passkeys and realm.device_key_auth)
         if not passkey_enabled:
+            if identity is not None:
+                return resolve_auth_method(identity_principal=identity).require_terminal_authorization()
             await self.send_json(
                 connection,
                 {
@@ -297,6 +446,7 @@ class ProxyServer:
                     "nonce": "",
                     "realm": profile.auth_realm,
                     "profile": profile.id,
+                    "rpId": self.config.rp_id,
                 },
             )
             credentials = await self._receive_auth_message(connection, timeout=20)
@@ -306,6 +456,42 @@ class ProxyServer:
 
         assert self.passkeys is not None
         binding = binding or secrets.token_urlsafe(24)
+        nonce = secrets.token_urlsafe(32)
+        await self.send_json(
+            connection,
+            {
+                "type": "auth-challenge",
+                "nonce": nonce,
+                "realm": profile.auth_realm,
+                "profile": profile.id,
+                "rpId": self.config.rp_id,
+            },
+        )
+        auth_payload = await self._receive_auth_message(connection, timeout=20)
+        if (
+            auth_payload is None
+            or auth_payload.get("type") != "auth"
+            or auth_payload.get("realm") != profile.auth_realm
+            or auth_payload.get("profile") != profile.id
+        ):
+            return None
+        device_id = str(auth_payload.get("deviceId", ""))[:64]
+        require_passkey = auth_payload.get("requirePasskey") is not False
+        transcript = device_authentication_transcript(
+            self.config.rp_id,
+            profile.auth_realm,
+            profile.id,
+            nonce,
+        )
+        device_principal = self.device_keys.authenticate(
+            profile.auth_realm,
+            device_id,
+            transcript,
+            str(auth_payload.get("signature", "")),
+        )
+        if device_principal is not None and not require_passkey:
+            return device_principal
+
         try:
             credentials = self.passkeys.list_credentials(profile.auth_realm)
             if credentials:
@@ -317,77 +503,74 @@ class ProxyServer:
                     principal=passkey_principal,
                     binding=binding,
                 )
+                bootstrap_principal = None
             else:
-                message = {
-                    "type": "auth-challenge",
-                    "nonce": "",
-                }
+                bootstrap_principal = identity or await self._authenticate_credentials(
+                    connection,
+                    profile,
+                    auth_payload,
+                )
+                if bootstrap_principal is None:
+                    return None
+                message = self.passkeys.begin_registration(
+                    profile.auth_realm,
+                    principal=bootstrap_principal,
+                    user_name=self.config.label,
+                    user_display_name=self.config.label,
+                    label=connection.request.headers.get("User-Agent", "device"),
+                    binding=binding,
+                )
         except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
             raise self._passkey_failure("setup", exc) from None
         message.update({"realm": profile.auth_realm, "profile": profile.id})
         await self.send_json(connection, message)
 
-        bootstrap_principal: str | None = None
-        while True:
-            payload = await self._receive_auth_message(connection, timeout=120)
-            if payload is None:
-                return None
-            message_type = payload.get("type")
-            if message_type == "webauthn-auth":
-                try:
-                    record = self.passkeys.finish_authentication(
-                        profile.auth_realm,
-                        payload.get("challengeId", ""),
-                        payload.get("assertion"),
-                        binding=binding,
-                    )
-                    passkey_principal = record.get("principal")
-                    if not isinstance(passkey_principal, str) or not passkey_principal:
-                        raise PasskeyVerificationError("Passkey principal is invalid.")
-                except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
-                    raise self._passkey_failure("authentication", exc) from None
-                return resolve_auth_method(
-                    passkey_principal=passkey_principal
-                ).require_terminal_authorization()
-            if message_type == "auth":
-                token_principal = await self._authenticate_credentials(connection, profile, payload)
-                if token_principal is None:
-                    return None
-                if bootstrap_principal is not None and token_principal != bootstrap_principal:
-                    return None
-                resolution = resolve_auth_method(token_principal=token_principal)
-                bootstrap_principal = resolution.principal
-                try:
-                    message = self.passkeys.begin_registration(
-                        profile.auth_realm,
-                        principal=bootstrap_principal,
-                        user_name=self.config.label,
-                        user_display_name=self.config.label,
-                        label=connection.request.headers.get("User-Agent", "device"),
-                        binding=binding,
-                    )
-                except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
-                    raise self._passkey_failure("registration setup", exc) from None
-                message.update({"realm": profile.auth_realm, "profile": profile.id})
-                await self.send_json(connection, message)
-                continue
-            if message_type == "webauthn-register" and bootstrap_principal is not None:
-                try:
-                    record = self.passkeys.finish_registration(
-                        profile.auth_realm,
-                        payload.get("challengeId", ""),
-                        payload.get("attestation"),
-                        binding=binding,
-                    )
-                    passkey_principal = record.get("principal")
-                    if passkey_principal != bootstrap_principal:
-                        raise PasskeyVerificationError("Passkey principal is invalid.")
-                except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
-                    raise self._passkey_failure("registration", exc) from None
-                return resolve_auth_method(
-                    passkey_principal=passkey_principal
-                ).require_terminal_authorization()
+        payload = await self._receive_auth_message(connection, timeout=120)
+        if payload is None:
             return None
+        message_type = payload.get("type")
+        if message_type == "webauthn-auth" and credentials:
+            try:
+                record = self.passkeys.finish_authentication(
+                    profile.auth_realm,
+                    payload.get("challengeId", ""),
+                    payload.get("assertion"),
+                    binding=binding,
+                )
+                passkey_principal = record.get("principal")
+                if not isinstance(passkey_principal, str) or not passkey_principal:
+                    raise PasskeyVerificationError("Passkey principal is invalid.")
+            except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
+                raise self._passkey_failure("authentication", exc) from None
+        elif message_type == "webauthn-register" and bootstrap_principal is not None:
+            try:
+                record = self.passkeys.finish_registration(
+                    profile.auth_realm,
+                    payload.get("challengeId", ""),
+                    payload.get("attestation"),
+                    binding=binding,
+                )
+                passkey_principal = record.get("principal")
+                if passkey_principal != bootstrap_principal:
+                    raise PasskeyVerificationError("Passkey principal is invalid.")
+            except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
+                raise self._passkey_failure("registration", exc) from None
+        else:
+            return None
+
+        principal = resolve_auth_method(
+            passkey_principal=passkey_principal
+        ).require_terminal_authorization()
+        if enrollment is not None and device_id and device_principal is None:
+            enrollment.update(
+                {
+                    "realm": profile.auth_realm,
+                    "profile": profile.id,
+                    "deviceId": device_id,
+                    "principal": principal,
+                }
+            )
+        return principal
 
     def _safe_static_target(self, request_path: str) -> tuple[Path | None, str | None]:
         clean_path = urlsplit(request_path).path
@@ -504,8 +687,8 @@ class ProxyServer:
     def _proxy_service_worker_response(self, request: Request) -> Response:
         source = (self.static_root / "sw.js").read_text()
         source = source.replace(
-            'const CACHE = "mobile-terminal-v8";',
-            'const CACHE = "mobile-terminal-proxy-v2";',
+            'const CACHE = "mobile-terminal-v9";',
+            'const CACHE = "mobile-terminal-proxy-v4";',
         )
         body = source.encode("utf-8")
         etag = f'"proxy-sw-{hashlib.sha256(body).hexdigest()[:12]}"'
@@ -604,6 +787,46 @@ class ProxyServer:
             )
             return
         await self.send_json(connection, {"type": "devices", "devices": credentials})
+
+    async def _handle_device_key_message(
+        self,
+        connection: ServerConnection,
+        profile: ProfileConfig,
+        pending_enrollments: dict[str, PendingDeviceEnrollment],
+        payload: dict[str, Any],
+    ) -> bool:
+        message_type = payload.get("type")
+        now = time.monotonic()
+        for enrollment_id, enrollment in tuple(pending_enrollments.items()):
+            if now >= enrollment.expires_at:
+                del pending_enrollments[enrollment_id]
+        if message_type == "register-key":
+            enrollment_id = payload.get("enrollmentId")
+            if not isinstance(enrollment_id, str):
+                return True
+            enrollment = pending_enrollments.pop(enrollment_id, None)
+            if enrollment is None:
+                return True
+            if enrollment.verify(payload, now=now):
+                self.device_keys.register(
+                    enrollment.realm,
+                    enrollment.device_id,
+                    str(payload.get("publicKey", "")),
+                    enrollment.principal,
+                    connection.request.headers.get("User-Agent", "device"),
+                )
+            return True
+        if message_type == "forget-key":
+            if (
+                payload.get("realm") == profile.auth_realm
+                and payload.get("profile") == profile.id
+            ):
+                self.device_keys.forget(
+                    profile.auth_realm,
+                    str(payload.get("deviceId", ""))[:64],
+                )
+            return True
+        return False
 
     async def _handle_credential_message(
         self,
@@ -736,6 +959,8 @@ class ProxyServer:
         profile: ProfileConfig,
         principal: str,
         requested_session: str,
+        enrollment: dict[str, str] | None = None,
+        pending_enrollments: dict[str, PendingDeviceEnrollment] | None = None,
     ) -> tuple[str, str] | None:
         if not profile.available:
             return await self._unavailable_profile(
@@ -767,8 +992,15 @@ class ProxyServer:
         self._mark_profile(profile, "up", "")
         await self._send_profile_state(connection, profile, available=True)
 
+        enrollment = enrollment if enrollment is not None else {}
+        pending_enrollments = pending_enrollments if pending_enrollments is not None else {}
+        enrollment_sent = False
+        next_session = ""
+
         async def backend_to_client() -> None:
+            nonlocal enrollment_sent, next_session
             async for message in backend:
+                ready = False
                 if isinstance(message, str):
                     try:
                         payload = json.loads(message)
@@ -783,7 +1015,8 @@ class ProxyServer:
                             persisted=payload.get("persisted") is True,
                         )
                         continue
-                    if isinstance(payload, dict) and payload.get("type") == "ready":
+                    ready = isinstance(payload, dict) and payload.get("type") == "ready"
+                    if ready:
                         payload.update(
                             {
                                 "profiles": self.public_profiles(),
@@ -793,9 +1026,29 @@ class ProxyServer:
                             }
                         )
                         message = json.dumps(payload)
+                    if isinstance(payload, dict) and payload.get("type") == "session-closing":
+                        next_session = str(payload.get("nextSession") or "")
                 await connection.send(message)
+                if (
+                    ready
+                    and enrollment
+                    and enrollment.get("profile") == profile.id
+                    and not enrollment_sent
+                ):
+                    enrollment_sent = True
+                    ticket = PendingDeviceEnrollment.issue(
+                        rp_id=self.config.rp_id,
+                        realm=enrollment["realm"],
+                        profile=enrollment["profile"],
+                        device_id=enrollment["deviceId"],
+                        principal=enrollment["principal"],
+                    )
+                    pending_enrollments[ticket.enrollment_id] = ticket
+                    enrollment.clear()
+                    await self.send_json(connection, ticket.message())
 
         backend_task = asyncio.create_task(backend_to_client())
+        client_task: asyncio.Task[Any] | None = None
         try:
             while True:
                 client_task = asyncio.create_task(connection.recv())
@@ -803,9 +1056,16 @@ class ProxyServer:
                 if backend_task in done:
                     client_task.cancel()
                     try:
+                        await client_task
+                    except (asyncio.CancelledError, ConnectionClosed):
+                        pass
+                    client_task = None
+                    try:
                         await backend_task
                     except (ConnectionClosed, BackendAuthenticationError, Exception):
                         pass
+                    if next_session:
+                        return profile.id, next_session
                     return await self._unavailable_profile(
                         connection,
                         profile,
@@ -815,6 +1075,8 @@ class ProxyServer:
                     raw = client_task.result()
                 except ConnectionClosed:
                     return None
+                finally:
+                    client_task = None
                 if not isinstance(raw, str):
                     await backend.send(raw)
                     continue
@@ -832,6 +1094,13 @@ class ProxyServer:
                     continue
                 if message_type == "switch-profile":
                     return str(payload.get("profile", "")), str(payload.get("session", ""))
+                if await self._handle_device_key_message(
+                    connection,
+                    profile,
+                    pending_enrollments,
+                    payload,
+                ):
+                    continue
                 if await self._handle_credential_message(connection, profile, payload):
                     continue
                 if (
@@ -854,7 +1123,17 @@ class ProxyServer:
                     continue
                 await backend.send(raw)
         finally:
+            if client_task is not None:
+                client_task.cancel()
+                try:
+                    await client_task
+                except (asyncio.CancelledError, ConnectionClosed):
+                    pass
             backend_task.cancel()
+            try:
+                await backend_task
+            except (asyncio.CancelledError, ConnectionClosed, BackendAuthenticationError, Exception):
+                pass
             await backend.close()
 
     async def websocket_handler(self, connection: ServerConnection) -> None:
@@ -870,6 +1149,8 @@ class ProxyServer:
         profile_id = query.get("profile", [self.config.active_profile])[0]
         requested_sessions = {profile_id: query.get("session", [""])[0]}
         authorized_realms: dict[str, str] = {}
+        realm_enrollments: dict[str, dict[str, str]] = {}
+        pending_enrollments: dict[str, PendingDeviceEnrollment] = {}
         previous_profile_id = ""
         connection_binding = secrets.token_urlsafe(24)
 
@@ -881,11 +1162,13 @@ class ProxyServer:
             principal = authorized_realms.get(profile.auth_realm)
             if principal is None:
                 passkey_failure = False
+                enrollment: dict[str, str] = {}
                 try:
                     principal = await self.authenticate_realm(
                         connection,
                         profile,
                         binding=connection_binding,
+                        enrollment=enrollment,
                     )
                 except PasskeyAuthenticationError:
                     principal = None
@@ -910,6 +1193,8 @@ class ProxyServer:
                     profile_id = previous_profile_id
                     continue
                 authorized_realms[profile.auth_realm] = principal
+                if enrollment:
+                    realm_enrollments[profile.auth_realm] = enrollment
 
             previous_profile_id = profile.id
             next_profile = await self._relay_profile(
@@ -917,6 +1202,8 @@ class ProxyServer:
                 profile,
                 principal,
                 requested_sessions.get(profile.id, ""),
+                realm_enrollments.get(profile.auth_realm),
+                pending_enrollments,
             )
             if next_profile is None:
                 return

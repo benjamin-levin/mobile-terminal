@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -14,6 +15,71 @@ PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ACCENT_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 LOOPBACK_NAMES = {"localhost", "localhost.localdomain"}
+AUTHENTICATION_MODES = ("off", "idle", "every-open")
+DEFAULT_AUTHENTICATION_MODE = "every-open"
+DEFAULT_AUTHENTICATION_IDLE_MINUTES = 15
+MIN_AUTHENTICATION_IDLE_MINUTES = 1
+MAX_AUTHENTICATION_IDLE_MINUTES = 1440
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
+
+
+def default_authentication_settings() -> dict[str, Any]:
+    return {
+        "mode": DEFAULT_AUTHENTICATION_MODE,
+        "idleMinutes": DEFAULT_AUTHENTICATION_IDLE_MINUTES,
+    }
+
+
+def normalize_authentication_settings(raw: Any) -> dict[str, Any]:
+    defaults = default_authentication_settings()
+    if not isinstance(raw, dict):
+        return defaults
+    mode = raw.get("mode", defaults["mode"])
+    if mode not in AUTHENTICATION_MODES:
+        mode = defaults["mode"]
+    raw_idle_minutes = raw.get("idleMinutes", defaults["idleMinutes"])
+    if isinstance(raw_idle_minutes, bool):
+        idle_minutes = defaults["idleMinutes"]
+    elif isinstance(raw_idle_minutes, int):
+        idle_minutes = raw_idle_minutes
+    elif isinstance(raw_idle_minutes, float):
+        idle_minutes = (
+            int(raw_idle_minutes)
+            if math.isfinite(raw_idle_minutes) and raw_idle_minutes.is_integer()
+            else defaults["idleMinutes"]
+        )
+    elif isinstance(raw_idle_minutes, str) and re.fullmatch(r"[+-]?\d+", raw_idle_minutes.strip()):
+        idle_minutes = int(raw_idle_minutes)
+    else:
+        idle_minutes = defaults["idleMinutes"]
+    if abs(idle_minutes) > MAX_SAFE_INTEGER:
+        idle_minutes = defaults["idleMinutes"]
+    idle_minutes = min(
+        MAX_AUTHENTICATION_IDLE_MINUTES,
+        max(MIN_AUTHENTICATION_IDLE_MINUTES, idle_minutes),
+    )
+    return {"mode": mode, "idleMinutes": idle_minutes}
+
+
+def normalize_authentication_realms(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(realm)[:64]: normalize_authentication_settings(settings)
+        for realm, settings in raw.items()
+        if isinstance(realm, str) and realm
+    }
+
+
+def normalize_authentication_fields(raw: Any) -> dict[str, Any]:
+    settings = dict(raw) if isinstance(raw, dict) else {}
+    if "authentication" in settings:
+        settings["authentication"] = normalize_authentication_settings(settings["authentication"])
+    if "authenticationByRealm" in settings:
+        settings["authenticationByRealm"] = normalize_authentication_realms(
+            settings["authenticationByRealm"]
+        )
+    return settings
 
 
 class ConfigError(ValueError):

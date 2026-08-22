@@ -110,12 +110,13 @@
     );
   }
 
-  async function register(options) {
+  async function register(options, signal) {
     if (!available()) {
       throw new Error("Passkeys are unavailable in this browser or origin.");
     }
     const credential = await root.navigator.credentials.create({
       publicKey: decodeCreationOptions(options),
+      ...(signal ? { signal } : {}),
     });
     if (!credential) {
       throw new Error("Passkey registration was cancelled.");
@@ -123,12 +124,13 @@
     return registrationCredentialToJSON(credential);
   }
 
-  async function authenticate(options) {
+  async function authenticate(options, signal) {
     if (!available()) {
       throw new Error("Passkeys are unavailable in this browser or origin.");
     }
     const credential = await root.navigator.credentials.get({
       publicKey: decodeRequestOptions(options),
+      ...(signal ? { signal } : {}),
     });
     if (!credential) {
       throw new Error("Passkey authentication was cancelled.");
@@ -136,12 +138,12 @@
     return authenticationCredentialToJSON(credential);
   }
 
-  async function handleMessage(payload, send) {
+  async function handleMessage(payload, send, signal) {
     if (!payload || typeof send !== "function") {
       throw new TypeError("Passkey message handling requires a payload and send function.");
     }
     if (payload.type === REGISTER_OPTIONS_MESSAGE) {
-      const attestation = await register(payload.options);
+      const attestation = await register(payload.options, signal);
       await send({
         type: REGISTER_MESSAGE,
         challengeId: payload.challengeId,
@@ -150,7 +152,7 @@
       return true;
     }
     if (payload.type === AUTH_OPTIONS_MESSAGE) {
-      const assertion = await authenticate(payload.options);
+      const assertion = await authenticate(payload.options, signal);
       await send({
         type: AUTH_MESSAGE,
         challengeId: payload.challengeId,

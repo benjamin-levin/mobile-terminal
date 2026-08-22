@@ -28,16 +28,20 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
-
+from mobile_terminal_config import (
+    default_authentication_settings,
+    normalize_authentication_realms,
+    normalize_authentication_settings,
+)
 from webauthn_auth import (
+    PendingDeviceEnrollment,
     PasskeyAuth,
     PasskeyChallengeError,
     PasskeyStoreError,
     PasskeyVerificationError,
+    device_authentication_transcript,
+    valid_device_public_key,
+    verify_device_key_signature,
 )
 
 
@@ -717,6 +721,8 @@ def default_settings() -> dict[str, Any]:
         "terminalFontSize": 10,
         "fileBookmarks": [],
         "gestures": {},
+        "authentication": default_authentication_settings(),
+        "authenticationByRealm": {},
     }
 
 
@@ -815,6 +821,10 @@ def normalize_settings(raw_settings: Any) -> dict[str, Any]:
         "terminalFontSize": terminal_font_size,
         "fileBookmarks": normalize_file_bookmarks(raw_settings.get("fileBookmarks")),
         "gestures": normalize_gestures(raw_settings.get("gestures")),
+        "authentication": normalize_authentication_settings(raw_settings.get("authentication")),
+        "authenticationByRealm": normalize_authentication_realms(
+            raw_settings.get("authenticationByRealm")
+        ),
     }
 
 
@@ -1165,21 +1175,7 @@ def forget_device_key(user: str, device_id: str) -> None:
 
 
 def verify_device_signature(pub_key_spki_b64: str, message: bytes, signature_b64: str) -> bool:
-    """Verify a WebCrypto ECDSA-P256/SHA-256 signature. WebCrypto emits a raw
-    r‖s (64-byte) signature; cryptography wants DER, so convert first."""
-    try:
-        pub = serialization.load_der_public_key(base64.b64decode(pub_key_spki_b64))
-        if not isinstance(pub, ec.EllipticCurvePublicKey):
-            return False
-        raw = base64.b64decode(signature_b64)
-        if len(raw) != 64:
-            return False
-        r = int.from_bytes(raw[:32], "big")
-        s = int.from_bytes(raw[32:], "big")
-        pub.verify(encode_dss_signature(r, s), message, ec.ECDSA(hashes.SHA256()))
-        return True
-    except (InvalidSignature, ValueError, TypeError, Exception):
-        return False
+    return verify_device_key_signature(pub_key_spki_b64, message, signature_b64)
 
 
 def migrate_to_multitenant(owner: str) -> None:
@@ -2911,9 +2907,13 @@ class AppServer:
             return
 
         if message_type == "forget-key":
-            # Revoke this device's silent key (sign-out). Only ever the caller's
-            # own device, scoped to the authenticated user.
-            forget_device_key(user, str(payload.get("deviceId", ""))[:64])
+            # Revoke only this connection's authenticated realm and device.
+            if (
+                payload.get("realm") == self.passkey_principal(user)
+                and payload.get("profile") == ""
+                and str(payload.get("deviceId", ""))[:64] == state.get("deviceId")
+            ):
+                forget_device_key(user, state.get("deviceId", ""))
             return
 
         if message_type == "request-settings":
@@ -3270,31 +3270,45 @@ class AppServer:
 
     @staticmethod
     def _valid_spki(pub_key_spki_b64: str) -> bool:
-        """A client-supplied public key must be a real P-256 SPKI before we store it."""
-        try:
-            key = serialization.load_der_public_key(base64.b64decode(pub_key_spki_b64))
-            return isinstance(key, ec.EllipticCurvePublicKey) and key.curve.name == "secp256r1"
-        except (ValueError, TypeError, Exception):
-            return False
+        return valid_device_public_key(pub_key_spki_b64)
 
     async def maybe_enroll_device(self, connection: ServerConnection, state: dict[str, Any]) -> None:
-        """After an authenticated connection passes any required public passkey
-        gate, ask it to enroll the silent key used for later reconnects."""
+        """Issue one connection-bound proof-of-possession challenge after the
+        device has completed a WebAuthn assertion or registration."""
         if not state.get("needsEnroll") or not state.get("deviceId"):
             return
-        await self.send_json(connection, {"type": "enroll-key"})
+        enrollment = PendingDeviceEnrollment.issue(
+            rp_id=self.rp_id(connection),
+            realm=self.passkey_principal(state.get("user", "")),
+            profile="",
+            device_id=state["deviceId"],
+            principal=self.passkey_principal(state.get("user", "")),
+        )
+        state["enrollment"] = enrollment
+        await self.send_json(connection, enrollment.message())
 
-    def handle_register_key(self, connection: ServerConnection, state: dict[str, Any], payload: dict[str, Any]) -> None:
-        """Store a device's silent public key. Only ever reached post-auth, so the
-        caller already proved itself (identity or token) for `state["user"]`."""
-        device_id = state.get("deviceId") or ""
-        pub = str(payload.get("publicKey", ""))
-        if device_id and pub and self._valid_spki(pub):
-            register_device_key(
-                state.get("user", ""), device_id, pub,
-                device_label(connection.request.headers.get("User-Agent", "")),
-            )
-            state["needsEnroll"] = False
+    def handle_register_key(
+        self,
+        connection: ServerConnection,
+        state: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        enrollment = state.get("enrollment")
+        if (
+            not isinstance(enrollment, PendingDeviceEnrollment)
+            or payload.get("enrollmentId") != enrollment.enrollment_id
+        ):
+            return
+        state["enrollment"] = None
+        state["needsEnroll"] = False
+        if not enrollment.verify(payload):
+            return
+        register_device_key(
+            state.get("user", ""),
+            enrollment.device_id,
+            str(payload.get("publicKey", "")),
+            device_label(connection.request.headers.get("User-Agent", "")),
+        )
 
     async def websocket_handler(self, connection: ServerConnection) -> None:
         request_url = urlsplit(connection.request.path)
@@ -3310,156 +3324,152 @@ class AppServer:
         if self.internal_token and forwarded_principal is None:
             await connection.close(code=4003, reason="invalid internal credentials")
             return
-        # Token-less auto-login by Tailscale identity behind `tailscale serve`.
+        # Token-less bootstrap by Tailscale identity behind `tailscale serve`.
         auto_user = self.auto_auth_user(connection)
         user = self.owner if self.multi_tenant else ""
         device_id = ""
         passkey_binding = secrets.token_urlsafe(24)
-        require_token_here = (
-            self.token_required_for(trusted_client)
-            and auto_user is None
-            and forwarded_principal is None
-        )
-        # auth_method records how we authenticated so we can decide enrollment
-        # (silent on the tailnet, biometric-gated off it). needs_enroll/enroll_public
-        # drive the post-ready device-key enrollment exchange.
-        auth_method = "internal" if forwarded_principal is not None else "trusted"
+        require_token_here = self.token_required_for(trusted_client) and auto_user is None
+        auth_method = "internal" if forwarded_principal is not None else ""
         needs_enroll = False
-        is_public = self.request_is_public(connection)
-        # Read the client's auth frame when auth is needed, or (when the proxy
-        # identity already authed us) just to capture the deviceId. We first hand
-        # the client a one-time nonce it can sign with its enrolled device key.
-        if forwarded_principal is None and (self.multi_tenant or require_token_here or auto_user is not None):
+
+        # A proxy-forwarded backend connection is already authenticated by the
+        # internal hop. Every direct browser must answer a fresh device-key
+        # challenge, even when its network address or Tailscale identity is trusted.
+        if forwarded_principal is None:
             nonce = secrets.token_urlsafe(32)
-            # When the serve proxy already authenticated us by Tailscale identity
-            # (loopback + injected Tailscale-User-Login, tailnet-only), that
-            # identity is authoritative and the client's auth frame is OPTIONAL:
-            # we still send the challenge so a cooperating client can enroll a
-            # device key, but a missing / late / malformed frame must NOT close
-            # the socket. Blocking on recv and hard-closing 4001 here was the
-            # silent "UI loads but you can't control the session" failure.
-            frame_optional = auto_user is not None
-            auth_payload = None
+            realm_hint = auto_user if self.multi_tenant and auto_user is not None else (
+                "" if self.multi_tenant else "standalone"
+            )
             try:
-                await self.send_json(connection, {"type": "auth-challenge", "nonce": nonce})
-                raw_auth = await asyncio.wait_for(
-                    connection.recv(), timeout=5 if frame_optional else 20
+                await self.send_json(
+                    connection,
+                    {
+                        "type": "auth-challenge",
+                        "nonce": nonce,
+                        "realm": realm_hint,
+                        "profile": "",
+                        "rpId": self.rp_id(connection),
+                    },
                 )
-                if not isinstance(raw_auth, str):
-                    raise ValueError("non-string auth frame")
-                auth_payload = json.loads(raw_auth)  # JSONDecodeError subclasses ValueError
-                if auth_payload.get("type") != "auth":
-                    raise ValueError("wrong auth frame type")
+                auth_payload = await self.receive_auth_message(connection, timeout=20)
             except ConnectionClosed:
                 return
-            except (TimeoutError, ValueError) as exc:
-                if not frame_optional:
-                    if isinstance(exc, TimeoutError):
-                        await connection.close(code=4001, reason="auth timeout")
-                    else:
-                        await self.send_json(connection, {"type": "auth-error", "message": "Authentication required."})
-                        await connection.close(code=4001, reason="auth failed")
-                    return
-                # Identity mode: the injected header already authed us. Ignore the
-                # absent or malformed frame and drop straight into the session.
-                auth_payload = None
+            if auth_payload is None or auth_payload.get("type") != "auth":
+                await self.send_json(
+                    connection,
+                    {"type": "auth-error", "message": "Authentication required."},
+                )
+                await connection.close(code=4001, reason="auth failed")
+                return
 
-            payload_obj = auth_payload if isinstance(auth_payload, dict) else {}
-            device_id = str(payload_obj.get("deviceId", ""))[:64]
-            signature = str(payload_obj.get("signature", ""))
-            claimed_user = sanitize_user(payload_obj.get("user", "")) if self.multi_tenant else ""
+            device_id = str(auth_payload.get("deviceId", ""))[:64]
+            claimed_user = sanitize_user(auth_payload.get("user", "")) if self.multi_tenant else ""
+            user = auto_user if self.multi_tenant and auto_user is not None else claimed_user
+            protocol_realm = self.passkey_principal(user)
+            if auth_payload.get("realm") != protocol_realm or auth_payload.get("profile") != "":
+                await self.send_json(
+                    connection,
+                    {"type": "auth-error", "message": "Authentication required."},
+                )
+                await connection.close(code=4001, reason="auth failed")
+                return
 
-            if auto_user is not None:
-                # Authenticated by the Tailscale identity the serve proxy injected
-                # (tailnet only — never a public Funnel request); the token is not
-                # consulted and the identity is authoritative for the user.
-                user = auto_user if self.multi_tenant else ""
-                auth_method = "identity"
+            # Only a literal JSON false permits silent device-key authorization.
+            # Missing, null, strings, numbers, and true all require WebAuthn.
+            require_passkey = auth_payload.get("requirePasskey") is not False
+            transcript = device_authentication_transcript(
+                self.rp_id(connection),
+                protocol_realm,
+                "",
+                nonce,
+            )
+            spki = device_pubkey(user, device_id)
+            device_key_valid = bool(
+                not require_passkey
+                and spki
+                and verify_device_signature(
+                    spki,
+                    transcript,
+                    str(auth_payload.get("signature", "")),
+                )
+            )
+
+            if device_key_valid:
+                auth_method = "device-key"
             else:
-                # Silent device-bound key: verify the signature over our nonce
-                # against the enrolled public key. Works from anywhere, no prompt.
-                spki = device_pubkey(claimed_user, device_id)
-                if signature and spki and verify_device_signature(spki, nonce.encode("ascii"), signature):
-                    user = claimed_user
-                    auth_method = "device-key"
-                else:
-                    # A verified passkey takes precedence over the token fallback.
-                    # The token remains a valid legacy/bootstrap path if the user
-                    # dismisses the passkey prompt and submits the auth form again.
-                    try:
-                        passkey_record, fallback_payload = await self.authenticate_passkey(
-                            connection,
-                            claimed_user,
-                            binding=passkey_binding,
-                        )
-                    except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
-                        print(f"passkey authentication failed: {type(exc).__name__}")
-                        await self.send_json(
-                            connection,
-                            {"type": "auth-error", "message": "Passkey verification failed."},
-                        )
-                        await connection.close(code=4001, reason="auth failed")
-                        return
-                    if passkey_record is not None:
-                        user = claimed_user
-                        auth_method = "passkey"
-                    else:
-                        if fallback_payload is not None:
-                            fallback_user = (
-                                sanitize_user(fallback_payload.get("user", ""))
-                                if self.multi_tenant
-                                else ""
-                            )
-                            if fallback_user != claimed_user:
-                                await self.send_json(
-                                    connection,
-                                    {"type": "auth-error", "message": "Authentication required."},
-                                )
-                                await connection.close(code=4001, reason="auth failed")
-                                return
-                            payload_obj = fallback_payload
-                            device_id = str(payload_obj.get("deviceId", device_id))[:64]
-                        # Fall back to the shared token (bootstrap / legacy remember-me).
-                        if self.multi_tenant:
-                            user = claimed_user
-                            user_meta = self.users.get(user)
-                            remembered = user_meta is not None and self.device_remembered(user, device_id)
-                            token_ok = user_meta is not None and (
-                                not require_token_here
-                                or remembered
-                                or hmac.compare_digest(str(payload_obj.get("token", "")), user_meta["token"])
-                            )
-                            err = "Invalid user or access token."
-                        else:
-                            user = ""
-                            token_ok = not require_token_here or (
-                                self.token is not None
-                                and hmac.compare_digest(str(payload_obj.get("token", "")), self.token)
-                            )
-                            err = "Invalid access token."
-                        if not token_ok:
-                            await self.send_json(connection, {"type": "auth-error", "message": err})
-                            await connection.close(code=4001, reason="auth failed")
-                            return
-                        auth_method = "token"
-            # Offer to enroll a silent key for any authed device that lacks one.
-            needs_enroll = bool(device_id) and device_pubkey(user, device_id) is None
-            if auth_method == "token" and is_public:
                 try:
-                    await self.register_passkey(
+                    passkey_record, fallback_payload = await self.authenticate_passkey(
                         connection,
                         user,
                         binding=passkey_binding,
                     )
                 except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
-                    print(f"passkey registration failed: {type(exc).__name__}")
+                    print(f"passkey authentication failed: {type(exc).__name__}")
                     await self.send_json(
                         connection,
                         {"type": "auth-error", "message": "Passkey verification failed."},
                     )
                     await connection.close(code=4001, reason="auth failed")
                     return
-                auth_method = "passkey-bootstrap"
+
+                if passkey_record is not None:
+                    auth_method = "passkey"
+                elif fallback_payload is not None:
+                    # Existing passkeys cannot be bypassed by submitting a token
+                    # after a cancelled assertion.
+                    await self.send_json(
+                        connection,
+                        {"type": "auth-error", "message": "Passkey authentication is required."},
+                    )
+                    await connection.close(code=4001, reason="auth failed")
+                    return
+                else:
+                    # With no passkey yet, trusted identity or a valid token chooses
+                    # the bootstrap principal but does not authorize the terminal.
+                    if auto_user is not None:
+                        token_ok = True
+                        err = "Authentication required."
+                    elif self.multi_tenant:
+                        user_meta = self.users.get(user)
+                        token_ok = user_meta is not None and (
+                            not require_token_here
+                            or hmac.compare_digest(
+                                str(auth_payload.get("token", "")),
+                                user_meta["token"],
+                            )
+                        )
+                        err = "Invalid user or access token."
+                    else:
+                        token_ok = not require_token_here or (
+                            self.token is not None
+                            and hmac.compare_digest(
+                                str(auth_payload.get("token", "")),
+                                self.token,
+                            )
+                        )
+                        err = "Invalid access token."
+                    if not token_ok:
+                        await self.send_json(connection, {"type": "auth-error", "message": err})
+                        await connection.close(code=4001, reason="auth failed")
+                        return
+                    try:
+                        await self.register_passkey(
+                            connection,
+                            user,
+                            binding=passkey_binding,
+                        )
+                    except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
+                        print(f"passkey registration failed: {type(exc).__name__}")
+                        await self.send_json(
+                            connection,
+                            {"type": "auth-error", "message": "Passkey verification failed."},
+                        )
+                        await connection.close(code=4001, reason="auth failed")
+                        return
+                    auth_method = "passkey-bootstrap"
+
+                needs_enroll = bool(device_id) and device_pubkey(user, device_id) is None
 
         if self.multi_tenant:
             self.register_device(user, device_id, device_label(connection.request.headers.get("User-Agent", "")))
@@ -3482,7 +3492,7 @@ class AppServer:
             # Enrollment context for the post-ready device-key exchange.
             "authMethod": auth_method,
             "needsEnroll": needs_enroll,
-            "enrollPublic": is_public,
+            "enrollment": None,
         }
         bridge = TmuxBridge(
             session_name,

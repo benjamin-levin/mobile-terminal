@@ -20,6 +20,10 @@ from webauthn import (
     verify_authentication_response,
     verify_registration_response,
 )
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from webauthn.helpers.structs import (
     AuthenticatorAttachment,
     AuthenticatorSelectionCriteria,
@@ -36,6 +40,9 @@ AUTH_OPTIONS_MESSAGE = "webauthn-auth-options"
 AUTH_MESSAGE = "webauthn-auth"
 CREDENTIAL_STORE_VERSION = 1
 REALM_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+DEVICE_AUTH_PURPOSE = "mobile-terminal-device-auth-v1"
+DEVICE_ENROLLMENT_PURPOSE = "mobile-terminal-device-enroll-v1"
+DEVICE_ENROLLMENT_TTL = 120.0
 
 
 class PasskeyError(Exception):
@@ -83,6 +90,145 @@ class _PendingChallenge:
     binding: str = ""
 
 
+@dataclass(frozen=True)
+class PendingDeviceEnrollment:
+    enrollment_id: str
+    nonce: str
+    rp_id: str
+    realm: str
+    profile: str
+    device_id: str
+    principal: str
+    expires_at: float
+
+    @classmethod
+    def issue(
+        cls,
+        *,
+        rp_id: str,
+        realm: str,
+        profile: str,
+        device_id: str,
+        principal: str,
+        now: float | None = None,
+    ) -> "PendingDeviceEnrollment":
+        issued_at = time.monotonic() if now is None else now
+        return cls(
+            enrollment_id=secrets.token_urlsafe(24),
+            nonce=secrets.token_urlsafe(32),
+            rp_id=rp_id,
+            realm=realm,
+            profile=profile,
+            device_id=device_id,
+            principal=principal,
+            expires_at=issued_at + DEVICE_ENROLLMENT_TTL,
+        )
+
+    def message(self) -> dict[str, str]:
+        return {
+            "type": "enroll-key",
+            "enrollmentId": self.enrollment_id,
+            "nonce": self.nonce,
+            "realm": self.realm,
+            "profile": self.profile,
+            "rpId": self.rp_id,
+        }
+
+    def verify(self, payload: Any, *, now: float | None = None) -> bool:
+        checked_at = time.monotonic() if now is None else now
+        if checked_at >= self.expires_at or not isinstance(payload, dict):
+            return False
+        if any(
+            payload.get(key) != expected
+            for key, expected in (
+                ("enrollmentId", self.enrollment_id),
+                ("nonce", self.nonce),
+                ("realm", self.realm),
+                ("profile", self.profile),
+                ("deviceId", self.device_id),
+            )
+        ):
+            return False
+        public_key = payload.get("publicKey")
+        signature = payload.get("signature")
+        if not isinstance(public_key, str) or not isinstance(signature, str):
+            return False
+        transcript = device_enrollment_transcript(
+            self.rp_id,
+            self.realm,
+            self.profile,
+            self.enrollment_id,
+            self.nonce,
+            self.device_id,
+            public_key,
+        )
+        return valid_device_public_key(public_key) and verify_device_key_signature(
+            public_key,
+            transcript,
+            signature,
+        )
+
+
+def _device_transcript(purpose: str, *fields: str) -> bytes:
+    values = (purpose, *fields)
+    if any(not isinstance(value, str) or "\0" in value for value in values):
+        raise ValueError("device-key transcript fields must be NUL-free strings")
+    return "\0".join(values).encode("utf-8")
+
+
+def device_authentication_transcript(rp_id: str, realm: str, profile: str, nonce: str) -> bytes:
+    return _device_transcript(DEVICE_AUTH_PURPOSE, rp_id, realm, profile, nonce)
+
+
+def device_enrollment_transcript(
+    rp_id: str,
+    realm: str,
+    profile: str,
+    enrollment_id: str,
+    nonce: str,
+    device_id: str,
+    public_key: str,
+) -> bytes:
+    return _device_transcript(
+        DEVICE_ENROLLMENT_PURPOSE,
+        rp_id,
+        realm,
+        profile,
+        enrollment_id,
+        nonce,
+        device_id,
+        public_key,
+    )
+
+
+def valid_device_public_key(public_key: str) -> bool:
+    try:
+        key = serialization.load_der_public_key(base64.b64decode(public_key, validate=True))
+        return isinstance(key, ec.EllipticCurvePublicKey) and key.curve.name == "secp256r1"
+    except (UnsupportedAlgorithm, ValueError, TypeError):
+        return False
+
+
+def verify_device_key_signature(public_key: str, transcript: bytes, signature: str) -> bool:
+    try:
+        key = serialization.load_der_public_key(base64.b64decode(public_key, validate=True))
+        if not isinstance(key, ec.EllipticCurvePublicKey) or key.curve.name != "secp256r1":
+            return False
+        raw = base64.b64decode(signature, validate=True)
+        if len(raw) != 64:
+            return False
+        r = int.from_bytes(raw[:32], "big")
+        s = int.from_bytes(raw[32:], "big")
+        key.verify(
+            encode_dss_signature(r, s),
+            transcript,
+            ec.ECDSA(hashes.SHA256()),
+        )
+        return True
+    except (InvalidSignature, UnsupportedAlgorithm, ValueError, TypeError):
+        return False
+
+
 def _b64url_encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
@@ -128,6 +274,7 @@ class PasskeyAuth:
         challenge_ttl: float = 120,
         max_pending_challenges: int = 1024,
         clock: Callable[[], float] = time.monotonic,
+        store_filename: str = "device-keys.json",
     ) -> None:
         if not rp_id or "://" in rp_id or "/" in rp_id or ":" in rp_id:
             raise ValueError("rp_id must be a hostname without a scheme or port")
@@ -139,6 +286,8 @@ class PasskeyAuth:
             raise ValueError("challenge_ttl must be positive")
         if max_pending_challenges <= 0:
             raise ValueError("max_pending_challenges must be positive")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", store_filename):
+            raise ValueError("store_filename must be a plain file name")
 
         self.state_dir = Path(state_dir)
         self.rp_id = rp_id
@@ -147,6 +296,7 @@ class PasskeyAuth:
         self.challenge_ttl = challenge_ttl
         self.max_pending_challenges = max_pending_challenges
         self.clock = clock
+        self.store_filename = store_filename
         self._challenges: dict[str, _PendingChallenge] = {}
         self._challenge_lock = threading.Lock()
         self._store_lock = threading.Lock()
@@ -423,7 +573,7 @@ class PasskeyAuth:
         return hashlib.sha256(material).digest()
 
     def _realm_path(self, realm: str) -> Path:
-        return self.state_dir / realm / "device-keys.json"
+        return self.state_dir / realm / self.store_filename
 
     @staticmethod
     def _validate_realm(realm: str) -> str:

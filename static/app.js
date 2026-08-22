@@ -14,6 +14,9 @@
   const STORAGE_OPEN_TABS_KEY = "mobile-terminal.open-tabs";
   const STORAGE_ACTIVE_PROFILE_KEY = "mobile-terminal.active-profile";
   const STORAGE_PROFILE_PREFIX = "mobile-terminal.profile.";
+  const STORAGE_PASSKEY_AUTH_MODE_KEY = "mobile-terminal.passkey-auth-mode";
+  const STORAGE_PASSKEY_IDLE_MINUTES_KEY = "mobile-terminal.passkey-idle-minutes";
+  const STORAGE_PASSKEY_BACKGROUNDED_AT_KEY = "mobile-terminal.passkey-backgrounded-at";
   const STORAGE_EDITOR_TABS_KEY = "mobile-terminal.editor-tabs";
   const STORAGE_BTOP_ZOOM_KEY = "mobile-terminal.btop-zoom";
   const BTOP_SESSION_PREFIX = "btop-";
@@ -27,6 +30,9 @@
   const BTOP_MIN_FONT = 3;
   const DEFAULT_UI_SCALE = 0.85;
   const DEFAULT_TERMINAL_FONT = 10;
+  const DEFAULT_AUTHENTICATION_MODE = "every-open";
+  const DEFAULT_AUTHENTICATION_IDLE_MINUTES = 15;
+  const AUTHENTICATION_MODES = new Set(["off", "idle", "every-open"]);
   const KEYBOARD_THRESHOLD = 80;
   const UI_SCALE_FIT_WIDTH = 430;
   const UI_SCALE_FIT_HEIGHT = 700;
@@ -104,6 +110,8 @@
   const userInput = document.getElementById("userInput");
   const userField = document.getElementById("userField");
   const tokenInput = document.getElementById("tokenInput");
+  const tokenFieldLabel = document.getElementById("tokenFieldLabel");
+  const loginSubmitButton = document.getElementById("loginSubmitButton");
   const loginMessage = document.getElementById("loginMessage");
   const accountButton = document.getElementById("accountButton");
   const accountOverlay = document.getElementById("accountOverlay");
@@ -138,6 +146,11 @@
   const gestureOverlay = document.getElementById("gestureOverlay");
   const gestureEditorList = document.getElementById("gestureEditorList");
   const displayOverlay = document.getElementById("displayOverlay");
+  const authenticationButton = document.getElementById("authenticationButton");
+  const authenticationOverlay = document.getElementById("authenticationOverlay");
+  const authenticationModeInput = document.getElementById("authenticationModeInput");
+  const authenticationIdleControl = document.getElementById("authenticationIdleControl");
+  const authenticationIdleInput = document.getElementById("authenticationIdleInput");
   const usageOverlay = document.getElementById("usageOverlay");
   const usageMetaLabel = document.getElementById("usageMeta");
   const usageStats = document.getElementById("usageStats");
@@ -206,6 +219,116 @@
   let profileMenuOpen = false;
   let currentUser = localStorage.getItem(STORAGE_USER_KEY) || "";
   let currentUserLabel = "";
+  let authenticationByRealm = {};
+  let hostAuthenticationDefault = normalizeAuthenticationSettings(null);
+  let authenticationSettings = normalizeAuthenticationSettings(null);
+  let passkeyRequiredScope = "";
+  let passkeyRetryPending = false;
+  let passkeyCeremonyController = null;
+  let resumeDecisionPromise = null;
+  let resumeHandlingReady = false;
+  let initialResumeDecisionMade = false;
+  let handledResumeMarker = "";
+  let backgroundRecordedScope = "";
+  let terminalReadyWhileHidden = false;
+
+  function normalizeAuthenticationSettings(raw) {
+    const source = raw && typeof raw === "object" ? raw : {};
+    const mode = AUTHENTICATION_MODES.has(source.mode)
+      ? source.mode
+      : DEFAULT_AUTHENTICATION_MODE;
+    const rawIdleMinutes = source.idleMinutes;
+    let parsedIdleMinutes = DEFAULT_AUTHENTICATION_IDLE_MINUTES;
+    if (typeof rawIdleMinutes === "number" && Number.isSafeInteger(rawIdleMinutes)) {
+      parsedIdleMinutes = rawIdleMinutes;
+    } else if (
+      typeof rawIdleMinutes === "string" &&
+      /^[+-]?\d+$/.test(rawIdleMinutes.trim())
+    ) {
+      parsedIdleMinutes = Number(rawIdleMinutes);
+      if (!Number.isSafeInteger(parsedIdleMinutes)) {
+        parsedIdleMinutes = DEFAULT_AUTHENTICATION_IDLE_MINUTES;
+      }
+    }
+    const idleMinutes = Math.min(1440, Math.max(1, parsedIdleMinutes));
+    return { mode, idleMinutes };
+  }
+
+  function authenticationScope(realm = loginRealm) {
+    if (realm) {
+      return `realm:${realm}`;
+    }
+    if (serverConfig.multiTenant) {
+      return `user:${currentUser || localStorage.getItem(STORAGE_USER_KEY) || "unknown"}`;
+    }
+    return "standalone";
+  }
+
+  function authenticationStorageKey(base, realm = loginRealm) {
+    const scope = authenticationScope(realm);
+    return scope === "standalone" ? base : `${base}.${encodeURIComponent(scope)}`;
+  }
+
+  function hostAuthenticationSettings(realm = loginRealm) {
+    if (realm && authenticationByRealm[realm]) {
+      return normalizeAuthenticationSettings(authenticationByRealm[realm]);
+    }
+    return normalizeAuthenticationSettings(hostAuthenticationDefault);
+  }
+
+  function loadAuthenticationSettings(realm = loginRealm) {
+    const defaults = hostAuthenticationSettings(realm);
+    try {
+      return normalizeAuthenticationSettings({
+        mode:
+          localStorage.getItem(authenticationStorageKey(STORAGE_PASSKEY_AUTH_MODE_KEY, realm)) ??
+          defaults.mode,
+        idleMinutes:
+          localStorage.getItem(authenticationStorageKey(STORAGE_PASSKEY_IDLE_MINUTES_KEY, realm)) ??
+          defaults.idleMinutes,
+      });
+    } catch (_error) {
+      return defaults;
+    }
+  }
+
+  function applyAuthenticationScope(realm = loginRealm) {
+    authenticationSettings = loadAuthenticationSettings(realm);
+    if (authenticationModeInput) {
+      authenticationModeInput.value = authenticationSettings.mode;
+    }
+    if (authenticationIdleInput) {
+      authenticationIdleInput.value = String(authenticationSettings.idleMinutes);
+    }
+    if (authenticationIdleControl) {
+      authenticationIdleControl.classList.toggle("hidden", authenticationSettings.mode !== "idle");
+    }
+  }
+
+  function cancelPasskeyCeremony() {
+    if (passkeyCeremonyController) {
+      passkeyCeremonyController.abort();
+      passkeyCeremonyController = null;
+    }
+  }
+
+  function resetAuthenticationLifecycle({ locked = true } = {}) {
+    cancelPasskeyCeremony();
+    authenticationByRealm = {};
+    hostAuthenticationDefault = normalizeAuthenticationSettings(null);
+    authenticationSettings = normalizeAuthenticationSettings(null);
+    passkeyRequiredScope = "";
+    passkeyRetryPending = false;
+    resumeDecisionPromise = null;
+    initialResumeDecisionMade = false;
+    handledResumeMarker = "";
+    backgroundRecordedScope = "";
+    terminalReadyWhileHidden = false;
+    hasDeviceKey = false;
+    setPasskeyRetryUi(false);
+    setPasskeyLocked(locked);
+    applyAuthenticationScope();
+  }
 
   // A stable per-device id so the host can list the devices registered to a
   // user. Generated once and kept in localStorage; not a secret.
@@ -226,8 +349,14 @@
   // be copied to another device; to connect we just sign the server's nonce.
   const DEVICE_KEY_DB = "mobile-terminal-keys";
   const DEVICE_KEY_STORE = "keys";
-  const DEVICE_KEY_ID = "device-ecdsa";
-  let hasDeviceKey = false; // cached; gates whether we can skip the token prompt
+  const DEVICE_KEY_ID_PREFIX = "device-ecdsa";
+  const DEVICE_AUTH_PURPOSE = "mobile-terminal-device-auth-v1";
+  const DEVICE_ENROLLMENT_PURPOSE = "mobile-terminal-device-enroll-v1";
+  let hasDeviceKey = false; // cached for the active auth scope
+
+  function deviceKeyId(realm = loginRealm) {
+    return `${DEVICE_KEY_ID_PREFIX}:${authenticationScope(realm)}`;
+  }
 
   function deviceKeySupported() {
     return !!(window.crypto && window.crypto.subtle && window.indexedDB);
@@ -253,16 +382,17 @@
         }),
     );
   }
-  async function loadDeviceKey() {
+  async function loadDeviceKey(realm = loginRealm) {
     if (!deviceKeySupported()) return null;
     try {
-      return (await idbRun("readonly", (s) => s.get(DEVICE_KEY_ID))) || null;
+      return (await idbRun("readonly", (store) => store.get(deviceKeyId(realm)))) || null;
     } catch (e) {
       return null;
     }
   }
-  async function ensureDeviceKey() {
-    let rec = await loadDeviceKey();
+  async function ensureDeviceKey(realm = loginRealm) {
+    const scopedId = deviceKeyId(realm);
+    let rec = await loadDeviceKey(realm);
     if (rec && rec.privateKey) return rec;
     // extractable:false → private key can never leave the browser; the public
     // key stays exportable so we can register it with the server.
@@ -272,12 +402,13 @@
       ["sign", "verify"],
     );
     rec = { privateKey: pair.privateKey, publicKey: pair.publicKey };
-    await idbRun("readwrite", (s) => s.put(rec, DEVICE_KEY_ID)); // CryptoKey is structured-cloneable
+    await idbRun("readwrite", (store) => store.put(rec, scopedId)); // CryptoKey is structured-cloneable
     return rec;
   }
-  async function forgetDeviceKey() {
+  async function forgetDeviceKey(realm = loginRealm) {
+    const keyId = deviceKeyId(realm);
     try {
-      await idbRun("readwrite", (s) => s.delete(DEVICE_KEY_ID));
+      await idbRun("readwrite", (store) => store.delete(keyId));
     } catch (e) {}
     hasDeviceKey = false;
   }
@@ -290,13 +421,58 @@
   async function exportPublicSpki(publicKey) {
     return bytesToBase64(await crypto.subtle.exportKey("spki", publicKey));
   }
-  async function signNonce(privateKey, nonce) {
-    const data = new TextEncoder().encode(nonce);
-    const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privateKey, data);
-    return bytesToBase64(sig); // raw r‖s (64 bytes); the server converts to DER
+  function deviceProtocolRealm(realm = loginRealm) {
+    if (serverConfig.profileMode) {
+      return realm || loginRealm;
+    }
+    if (serverConfig.multiTenant) {
+      return realm || currentUser || localStorage.getItem(STORAGE_USER_KEY) || "";
+    }
+    return "standalone";
   }
-  async function refreshDeviceKeyFlag() {
-    hasDeviceKey = !!(await loadDeviceKey());
+
+  function deviceTranscript(purpose, fields) {
+    const values = [purpose, ...fields];
+    if (values.some((value) => typeof value !== "string" || value.includes("\0"))) {
+      throw new TypeError("device-key transcript fields must be NUL-free strings");
+    }
+    return new TextEncoder().encode(values.join("\0"));
+  }
+
+  function deviceAuthenticationTranscript(rpId, realm, profile, nonce) {
+    return deviceTranscript(DEVICE_AUTH_PURPOSE, [rpId, realm, profile, nonce]);
+  }
+
+  function deviceEnrollmentTranscript(
+    rpId,
+    realm,
+    profile,
+    enrollmentId,
+    nonce,
+    deviceId,
+    publicKey,
+  ) {
+    return deviceTranscript(DEVICE_ENROLLMENT_PURPOSE, [
+      rpId,
+      realm,
+      profile,
+      enrollmentId,
+      nonce,
+      deviceId,
+      publicKey,
+    ]);
+  }
+
+  async function signDeviceTranscript(privateKey, transcript) {
+    const signature = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      privateKey,
+      transcript,
+    );
+    return bytesToBase64(signature); // raw r‖s (64 bytes); the server converts to DER
+  }
+  async function refreshDeviceKeyFlag(realm = loginRealm) {
+    hasDeviceKey = !!(await loadDeviceKey(realm));
     return hasDeviceKey;
   }
 
@@ -916,6 +1092,18 @@
     );
   }
 
+  function activeAuthenticationSettings() {
+    const realm = activeProfile()?.authRealm || loginRealm;
+    if (!serverConfig.profileMode || !realm) {
+      return { authentication: normalizeAuthenticationSettings(authenticationSettings) };
+    }
+    authenticationByRealm = {
+      ...authenticationByRealm,
+      [realm]: normalizeAuthenticationSettings(authenticationSettings),
+    };
+    return { authenticationByRealm };
+  }
+
   function activeFileBookmarkSettings() {
     if (!serverConfig.profileMode || !activeProfileId) {
       return { fileBookmarks };
@@ -1118,6 +1306,7 @@
         gestures: gestureBindings,
         uiScale,
         terminalFontSize,
+        ...activeAuthenticationSettings(),
         ...activeFileBookmarkSettings(),
       },
     });
@@ -1128,6 +1317,8 @@
       STORAGE_SHORTCUTS_KEY,
       STORAGE_UI_SCALE_KEY,
       STORAGE_TERMINAL_FONT_KEY,
+      authenticationStorageKey(STORAGE_PASSKEY_AUTH_MODE_KEY),
+      authenticationStorageKey(STORAGE_PASSKEY_IDLE_MINUTES_KEY),
     ].some((storageKey) => localStorage.getItem(storageKey) !== null);
   }
 
@@ -3080,6 +3271,8 @@
       localStorage.setItem(STORAGE_ACTIVE_PROFILE_KEY, activeProfileId);
       if (!pendingProfileId) {
         loginRealm = activeProfile()?.authRealm || "";
+        applyAuthenticationScope(loginRealm);
+        refreshDeviceKeyFlag(loginRealm);
       }
       loadActiveProfileState(previousProfileId);
     }
@@ -3166,6 +3359,7 @@
         migrateLegacyProfileState(activeProfileId);
       }
       loginRealm = activeProfile()?.authRealm || "";
+      applyAuthenticationScope(loginRealm);
       if (changed || !activeSessionName) {
         loadActiveProfileState(previousProfileId);
       }
@@ -3175,11 +3369,16 @@
       profiles = [];
       activeProfileId = "";
       loginRealm = "";
+      applyAuthenticationScope();
       localStorage.removeItem(STORAGE_ACTIVE_PROFILE_KEY);
       if (hadActiveProfile) {
         loadActiveProfileState(previousProfileId);
       }
     }
+    authenticationButton?.classList.toggle(
+      "hidden",
+      !Boolean(serverConfig.passkeyAuth) && !profiles.some((profile) => profile.deviceKeyAuth),
+    );
     applyActiveProfile();
     syncLoginFields();
   }
@@ -3204,7 +3403,8 @@
 
   async function prepareAuthenticationClient() {
     const passkeyReady = await ensurePasskeyHelper();
-    await refreshDeviceKeyFlag();
+    resumeHandlingReady = true;
+    await resumeApplication();
     if (passkeyReady) {
       return true;
     }
@@ -5423,41 +5623,273 @@
     window.__mtBoot = null;
   }
 
-  // Reply to the server's auth challenge: sign the nonce with the device key
-  // (silent), and also carry token/username as a fallback the server uses only
-  // if the signature is absent/invalid.
-  async function sendAuthResponse(nonce, realm = loginRealm) {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    if (realm) loginRealm = realm;
-    const token = localStorage.getItem(tokenStorageKey(realm)) || "";
-    const msg = { type: "auth", user: currentUser, deviceId: getDeviceId() };
+  // Reply to the server's challenge with a realm- and RP-bound device proof.
+  async function sendAuthResponse(
+    nonce,
+    realm = loginRealm,
+    profile = "",
+    rpId = serverConfig.rpId || location.hostname,
+    authSocket = socket,
+  ) {
+    if (!authSocket || authSocket !== socket || authSocket.readyState !== WebSocket.OPEN) return;
+    const keyRealm = serverConfig.profileMode ? realm : loginRealm;
+    if (serverConfig.profileMode && realm) {
+      loginRealm = realm;
+      applyAuthenticationScope(realm);
+    }
+    const token = localStorage.getItem(tokenStorageKey(keyRealm)) || "";
+    const scope = authenticationScope(keyRealm);
+    const protocolRealm = deviceProtocolRealm(realm);
+    const protocolProfile = String(profile || "");
+    const protocolRpId = String(rpId || location.hostname);
+    const msg = {
+      type: "auth",
+      user: currentUser,
+      realm: protocolRealm,
+      profile: protocolProfile,
+      deviceId: getDeviceId(),
+      requirePasskey: passkeyRequiredScope === scope,
+    };
     if (token) msg.token = token;
     try {
-      const rec = await loadDeviceKey();
+      const rec = await loadDeviceKey(keyRealm);
       if (rec && rec.privateKey && nonce) {
-        msg.signature = await signNonce(rec.privateKey, nonce);
+        msg.signature = await signDeviceTranscript(
+          rec.privateKey,
+          deviceAuthenticationTranscript(
+            protocolRpId,
+            protocolRealm,
+            protocolProfile,
+            nonce,
+          ),
+        );
       }
     } catch (e) {
-      /* fall back to token/identity */
+      /* fall back to WebAuthn bootstrap */
     }
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify(msg));
+    if (authSocket === socket && authSocket.readyState === WebSocket.OPEN) {
+      authSocket.send(JSON.stringify(msg));
     }
   }
 
-  // Silent enrollment (on the tailnet): generate the key, register its public
-  // half so future connections sign in with no prompt from anywhere.
-  async function enrollDeviceKey() {
+  async function enrollDeviceKey(payload, enrollmentSocket = socket) {
+    const enrollmentId = payload?.enrollmentId;
+    const nonce = payload?.nonce;
+    const realm = payload?.realm;
+    const profile = payload?.profile;
+    const rpId = payload?.rpId;
+    if (
+      ![enrollmentId, nonce, realm, profile, rpId].every((value) => typeof value === "string") ||
+      !enrollmentId ||
+      !nonce ||
+      !rpId
+    ) {
+      return;
+    }
+    const keyRealm = serverConfig.profileMode ? realm : loginRealm;
     try {
-      const rec = await ensureDeviceKey();
-      sendMessage({ type: "register-key", deviceId: getDeviceId(), publicKey: await exportPublicSpki(rec.publicKey) });
-      hasDeviceKey = true;
+      const rec = await ensureDeviceKey(keyRealm);
+      const deviceId = getDeviceId();
+      const publicKey = await exportPublicSpki(rec.publicKey);
+      const signature = await signDeviceTranscript(
+        rec.privateKey,
+        deviceEnrollmentTranscript(
+          rpId,
+          realm,
+          profile,
+          enrollmentId,
+          nonce,
+          deviceId,
+          publicKey,
+        ),
+      );
+      if (
+        enrollmentSocket !== socket ||
+        enrollmentSocket?.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+      enrollmentSocket.send(
+        JSON.stringify({
+          type: "register-key",
+          enrollmentId,
+          nonce,
+          realm,
+          profile,
+          deviceId,
+          publicKey,
+          signature,
+        }),
+      );
+      if (authenticationScope(keyRealm) === authenticationScope()) {
+        hasDeviceKey = true;
+      }
     } catch (e) {
       /* enrollment is best-effort */
     }
   }
 
+  function setPasskeyLocked(locked) {
+    document.body.classList.toggle("passkey-locked", locked);
+  }
+
+  function applyTerminalReadyVisibility(readyIsHidden) {
+    terminalReadyWhileHidden = readyIsHidden;
+    setPasskeyLocked(readyIsHidden);
+  }
+
+  function revealTerminalAfterVisibleResume() {
+    const revealHiddenReady = terminalReadyWhileHidden;
+    terminalReadyWhileHidden = false;
+    setPasskeyLocked(false);
+    return revealHiddenReady;
+  }
+
+  function recordBackgrounded(event) {
+    if (event?.type !== "pagehide" && document.visibilityState !== "hidden") {
+      return;
+    }
+    const realm = loginRealm;
+    const scope = authenticationScope(realm);
+    if (backgroundRecordedScope === scope) {
+      return;
+    }
+    backgroundRecordedScope = scope;
+    if (loadAuthenticationSettings(realm).mode !== "off") {
+      // Obscure the terminal before the browser captures an app-switcher frame.
+      setPasskeyLocked(true);
+    }
+    try {
+      localStorage.setItem(
+        authenticationStorageKey(STORAGE_PASSKEY_BACKGROUNDED_AT_KEY, realm),
+        String(Date.now()),
+      );
+    } catch (_error) {
+      // A missing marker fails closed for idle and every-open policies.
+    }
+  }
+
+  function parseBackgroundedAt(raw) {
+    if (raw === null) {
+      return 0;
+    }
+    if (typeof raw !== "string" || !/^\d+$/.test(raw)) {
+      return Number.NaN;
+    }
+    const value = Number(raw);
+    return Number.isSafeInteger(value) && value > 0 ? value : Number.NaN;
+  }
+
+  function passkeyRequiredAfterBackground(settings, backgroundedAt, initial, now = Date.now()) {
+    if (settings.mode === "off") {
+      return false;
+    }
+    if (settings.mode === "every-open") {
+      return initial || backgroundedAt !== 0;
+    }
+    if (backgroundedAt === 0 || !Number.isFinite(backgroundedAt) || !Number.isFinite(now)) {
+      return true;
+    }
+    const elapsed = now - backgroundedAt;
+    return elapsed < 0 || elapsed >= settings.idleMinutes * 60 * 1000;
+  }
+
+  async function runResumeDecision() {
+    const realm = loginRealm;
+    const scope = authenticationScope(realm);
+    const backgroundKey = authenticationStorageKey(
+      STORAGE_PASSKEY_BACKGROUNDED_AT_KEY,
+      realm,
+    );
+    let rawBackgroundMarker = null;
+    try {
+      rawBackgroundMarker = localStorage.getItem(backgroundKey);
+    } catch (_error) {
+      // Treat unavailable storage as an unknown marker and fail closed.
+    }
+    const resumeMarker = `${scope}:${rawBackgroundMarker ?? "initial"}`;
+    const initial = !initialResumeDecisionMade;
+    initialResumeDecisionMade = true;
+    backgroundRecordedScope = "";
+    if (handledResumeMarker === resumeMarker) {
+      if (!passkeyRequiredScope) {
+        refreshConnection();
+      }
+      return;
+    }
+    handledResumeMarker = resumeMarker;
+    const settings = loadAuthenticationSettings(realm);
+    const requiresPasskey = passkeyRequiredAfterBackground(
+      settings,
+      parseBackgroundedAt(rawBackgroundMarker),
+      initial,
+    );
+    if (requiresPasskey) {
+      // Lock before IndexedDB access so key loss and slow storage cannot reveal
+      // a frame of terminal contents before the WebAuthn gate is established.
+      passkeyRequiredScope = scope;
+      passkeyRetryPending = false;
+      setPasskeyLocked(true);
+    }
+    await refreshDeviceKeyFlag(realm);
+    if (scope !== authenticationScope()) {
+      return;
+    }
+    if (requiresPasskey) {
+      if (!initial) {
+        reconnectSocket();
+      }
+      return;
+    }
+    if (!passkeyRequiredScope && (!initial || terminalReadyWhileHidden)) {
+      const revealHiddenReady = revealTerminalAfterVisibleResume();
+      if (revealHiddenReady && activeEditorTab() === null) {
+        focusTerminal();
+        performLayoutNow();
+      }
+      if (!initial) {
+        refreshConnection();
+      }
+    }
+  }
+
+  function waitForVisibleResume() {
+    return new Promise((resolve) => {
+      const handleResumeSignal = () => {
+        if (document.visibilityState !== "visible") {
+          return;
+        }
+        document.removeEventListener("visibilitychange", handleResumeSignal);
+        window.removeEventListener("focus", handleResumeSignal);
+        window.removeEventListener("pageshow", handleResumeSignal);
+        resolve();
+      };
+      document.addEventListener("visibilitychange", handleResumeSignal);
+      window.addEventListener("focus", handleResumeSignal);
+      window.addEventListener("pageshow", handleResumeSignal);
+    });
+  }
+
+  function resumeApplication() {
+    if (!resumeHandlingReady) {
+      return Promise.resolve();
+    }
+    if (resumeDecisionPromise) {
+      return resumeDecisionPromise;
+    }
+    resumeDecisionPromise = (async () => {
+      if (document.visibilityState === "hidden") {
+        await waitForVisibleResume();
+      }
+      return runResumeDecision();
+    })().finally(() => {
+      resumeDecisionPromise = null;
+    });
+    return resumeDecisionPromise;
+  }
+
   function reconnectSocket() {
+    cancelPasskeyCeremony();
     window.clearTimeout(reconnectTimer);
     window.clearTimeout(resumeProbeTimer);
     reconnectTimer = null;
@@ -5619,8 +6051,12 @@
         window.setTimeout(connect, 80);
         return;
       }
+      if (passkeyRetryPending && passkeyRequiredScope) {
+        return;
+      }
       if (event.code === 4001) {
         waitingForProxyAuth = false;
+        setPasskeyRetryUi(false);
         loginOverlay.classList.remove("hidden");
         loginMessage.textContent = "Authentication failed. Check the token and try again.";
         localStorage.removeItem(tokenStorageKey());
@@ -5635,7 +6071,17 @@
     });
   }
 
+  function setPasskeyRetryUi(retry) {
+    tokenFieldLabel.classList.toggle("hidden", retry);
+    tokenInput.classList.toggle("hidden", retry);
+    if (userField) {
+      userField.classList.toggle("hidden", retry || !serverConfig.multiTenant);
+    }
+    loginSubmitButton.textContent = retry ? "Retry passkey" : "Connect";
+  }
+
   function showProxySignIn(payload, message) {
+    setPasskeyRetryUi(false);
     waitingForProxyAuth = true;
     pendingProfileId = payload.profile || pendingProfileId || activeProfileId;
     loginRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
@@ -5653,13 +6099,51 @@
       waitingForProxyAuth = true;
       pendingProfileId = payload.profile || pendingProfileId || activeProfileId;
       loginRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
+      const authenticationSocket = socket;
+      cancelPasskeyCeremony();
+      const ceremonyController =
+        typeof AbortController === "function" ? new AbortController() : null;
+      passkeyCeremonyController = ceremonyController;
+      const sendAuthenticationMessage = (message) => {
+        if (
+          authenticationSocket !== socket ||
+          authenticationSocket?.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+        authenticationSocket.send(JSON.stringify(message));
+      };
       try {
-        if (await window.MobileTerminalPasskeys.handleMessage(payload, sendMessage)) {
+        if (
+          await window.MobileTerminalPasskeys.handleMessage(
+            payload,
+            sendAuthenticationMessage,
+            ceremonyController?.signal,
+          )
+        ) {
           return;
         }
       } catch (_error) {
-        showProxySignIn(payload, "Passkey was not completed. Sign in with the access token to continue.");
+        if (authenticationSocket !== socket) {
+          return;
+        }
+        passkeyRequiredScope = passkeyRequiredScope || authenticationScope(loginRealm);
+        passkeyRetryPending = true;
+        waitingForProxyAuth = false;
+        setPasskeyLocked(true);
+        setPasskeyRetryUi(true);
+        loginOverlay.classList.remove("hidden");
+        loginMessage.textContent = "A passkey is required to reveal the terminal. Tap Retry passkey to try again.";
+        try {
+          authenticationSocket?.close(4000, "passkey retry");
+        } catch (_closeError) {
+          // Ignore a socket already closed by the failed authentication.
+        }
         return;
+      } finally {
+        if (passkeyCeremonyController === ceremonyController) {
+          passkeyCeremonyController = null;
+        }
       }
     }
     if (String(payload.type || "").startsWith("fs-")) {
@@ -5671,12 +6155,14 @@
         waitingForProxyAuth = true;
         pendingProfileId = payload.profile || pendingProfileId || activeProfileId;
         loginRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
-        if (loginSupportsPasskey() && !localStorage.getItem(tokenStorageKey(loginRealm))) {
-          showProxySignIn(payload, "Sign in with the access token to register a passkey.");
-          return;
-        }
       }
-      sendAuthResponse(payload.nonce, payload.realm || loginRealm);
+      sendAuthResponse(
+        payload.nonce,
+        payload.realm || loginRealm,
+        payload.profile || "",
+        payload.rpId || serverConfig.rpId || location.hostname,
+        socket,
+      );
       return;
     }
     if (payload.type === "profiles") {
@@ -5702,10 +6188,12 @@
       return;
     }
     if (payload.type === "enroll-key") {
-      enrollDeviceKey();
+      enrollDeviceKey(payload, socket);
       return;
     }
     if (payload.type === "ready") {
+      const readyIsHidden = document.visibilityState === "hidden";
+      applyTerminalReadyVisibility(readyIsHidden);
       if (Array.isArray(payload.profiles) || payload.activeProfile) {
         updateProfileInventory(payload.profiles, payload.activeProfile);
       }
@@ -5713,6 +6201,9 @@
         pendingProfileId = "";
       }
       waitingForProxyAuth = false;
+      passkeyRequiredScope = "";
+      passkeyRetryPending = false;
+      setPasskeyRetryUi(false);
       if (serverConfig.profileMode && loginSupportsPasskey()) {
         localStorage.removeItem(tokenStorageKey(activeProfile()?.authRealm || loginRealm));
       }
@@ -5745,7 +6236,12 @@
               STORAGE_ACTIVE_SESSION_KEY,
               STORAGE_OPEN_TABS_KEY,
               STORAGE_EDITOR_TABS_KEY,
+              STORAGE_PASSKEY_AUTH_MODE_KEY,
+              STORAGE_PASSKEY_IDLE_MINUTES_KEY,
+              STORAGE_PASSKEY_BACKGROUNDED_AT_KEY,
             ].forEach((key) => localStorage.removeItem(key));
+            resetAuthenticationLifecycle({ locked: readyIsHidden });
+            terminalReadyWhileHidden = readyIsHidden;
             // Drop the previous user's in-memory tab set too, so it can't
             // leak into the new user's server-synced open-tab list below.
             openTabNames = [];
@@ -5805,7 +6301,7 @@
       }
       // focusTerminal re-shows the composer panel, so layout must be measured
       // *after* it to account for the composer's height in --shortcut-reserve.
-      if (!keepEditorActive) {
+      if (!keepEditorActive && !readyIsHidden) {
         focusTerminal();
         performLayoutNow();
       }
@@ -5900,6 +6396,15 @@
     }
     if (payload.type === "settings") {
       const nextSettings = payload.settings || {};
+      hostAuthenticationDefault = normalizeAuthenticationSettings(nextSettings.authentication);
+      authenticationByRealm = Object.fromEntries(
+        Object.entries(
+          nextSettings.authenticationByRealm && typeof nextSettings.authenticationByRealm === "object"
+            ? nextSettings.authenticationByRealm
+            : {},
+        ).map(([realm, settings]) => [realm, normalizeAuthenticationSettings(settings)]),
+      );
+      applyAuthenticationScope();
       const hostPersisted = payload.persisted === true;
       if (!hostPersisted && !hostSettingsReady && hasLocalSettingsOverride()) {
         hostSettingsReady = true;
@@ -5991,12 +6496,25 @@
           activeTabKey = terminalTabKey(nextSession);
         }
         persistActiveSession(nextSession);
-        reconnectForSessionSwitch = true;
+        reconnectForSessionSwitch = !serverConfig.profileMode;
       }
       return;
     }
     if (payload.type === "auth-error") {
       waitingForProxyAuth = false;
+      if (passkeyRequiredScope) {
+        passkeyRetryPending = true;
+        setPasskeyRetryUi(true);
+        loginOverlay.classList.remove("hidden");
+        loginMessage.textContent = payload.message || "Passkey authentication is required.";
+        try {
+          socket?.close(4000, "passkey retry");
+        } catch (_closeError) {
+          // Ignore a socket already closing after the authentication error.
+        }
+        return;
+      }
+      setPasskeyRetryUi(false);
       if (serverConfig.profileMode && payload.profile) {
         pendingProfileId = payload.profile;
         loginRealm = payload.realm || activeProfile()?.authRealm || "";
@@ -6755,6 +7273,36 @@
   }
 
 
+  function openAuthentication() {
+    closeSettingsMenu();
+    applyAuthenticationScope();
+    authenticationOverlay.classList.remove("hidden");
+  }
+
+  function saveAuthentication() {
+    authenticationSettings = normalizeAuthenticationSettings({
+      mode: authenticationModeInput.value,
+      idleMinutes: authenticationIdleInput.value,
+    });
+    localStorage.setItem(
+      authenticationStorageKey(STORAGE_PASSKEY_AUTH_MODE_KEY),
+      authenticationSettings.mode,
+    );
+    localStorage.setItem(
+      authenticationStorageKey(STORAGE_PASSKEY_IDLE_MINUTES_KEY),
+      String(authenticationSettings.idleMinutes),
+    );
+    applyAuthenticationScope();
+    saveHostSettings();
+    authenticationOverlay.classList.add("hidden");
+    if (authenticationSettings.mode === "off" && passkeyRequiredScope) {
+      passkeyRequiredScope = "";
+      passkeyRetryPending = false;
+      setPasskeyLocked(false);
+      reconnectSocket();
+    }
+  }
+
   function openUsage() {
     closeSettingsMenu();
     usageOverlay.classList.remove("hidden");
@@ -7325,6 +7873,13 @@
 
   loginForm.addEventListener("submit", (event) => {
     event.preventDefault();
+    if (passkeyRetryPending && passkeyRequiredScope) {
+      passkeyRetryPending = false;
+      loginMessage.textContent = "";
+      loginOverlay.classList.add("hidden");
+      reconnectSocket();
+      return;
+    }
     const token = tokenInput.value.trim();
     const userName = userInput ? userInput.value.trim() : "";
     if (serverConfig.multiTenant && !userName) {
@@ -7337,8 +7892,12 @@
       return;
     }
     if (serverConfig.multiTenant) {
+      const ownerChanged = currentUser !== userName;
       currentUser = userName;
       localStorage.setItem(STORAGE_USER_KEY, userName);
+      if (ownerChanged) {
+        resetAuthenticationLifecycle();
+      }
     }
     if (token) {
       localStorage.setItem(tokenStorageKey(), token);
@@ -7373,17 +7932,25 @@
     localStorage.removeItem(tokenStorageKey());
     if (serverConfig.multiTenant) {
       localStorage.removeItem(STORAGE_USER_KEY);
-      currentUser = "";
     }
     // Revoke this device's silent key so it can't auto-reconnect, and ask the
     // server to drop the stored public key.
     try {
-      sendMessage({ type: "forget-key", deviceId: getDeviceId() });
+      sendMessage({
+        type: "forget-key",
+        realm: deviceProtocolRealm(loginRealm),
+        profile: serverConfig.profileMode ? activeProfileId : "",
+        deviceId: getDeviceId(),
+      });
     } catch (_error) {
       // ignore
     }
     hasDeviceKey = false;
-    forgetDeviceKey();
+    forgetDeviceKey(loginRealm);
+    if (serverConfig.multiTenant) {
+      currentUser = "";
+    }
+    resetAuthenticationLifecycle();
     if (socket) {
       reconnectForSessionSwitch = false;
       try {
@@ -7393,6 +7960,7 @@
       }
     }
     syncLoginFields();
+    setPasskeyRetryUi(false);
     loginOverlay.classList.remove("hidden");
     loginMessage.textContent = "";
     (serverConfig.multiTenant && userInput ? userInput : tokenInput).focus();
@@ -7770,6 +8338,20 @@
     openGestureEditor();
   });
   document.getElementById("displayButton").addEventListener("click", openDisplay);
+  authenticationButton.addEventListener("click", openAuthentication);
+  authenticationModeInput.addEventListener("change", () => {
+    authenticationIdleControl.classList.toggle(
+      "hidden",
+      authenticationModeInput.value !== "idle",
+    );
+  });
+  document.getElementById("closeAuthenticationButton").addEventListener("click", saveAuthentication);
+  document.getElementById("saveAuthenticationButton").addEventListener("click", saveAuthentication);
+  authenticationOverlay.addEventListener("click", (event) => {
+    if (event.target === authenticationOverlay) {
+      saveAuthentication();
+    }
+  });
   document.getElementById("usageButton").addEventListener("click", openUsage);
   document.getElementById("closeUsageButton").addEventListener("click", closeUsage);
   document.getElementById("refreshUsageButton").addEventListener("click", () => {
@@ -7918,18 +8500,19 @@
   });
   window.addEventListener("focus", () => {
     updateViewportMetrics();
-    refreshConnection();
+    resumeApplication();
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") {
-      refreshConnection();
+    if (document.visibilityState === "hidden") {
+      recordBackgrounded();
+    } else if (document.visibilityState === "visible") {
+      resumeApplication();
     }
   });
-  window.addEventListener("online", refreshConnection);
-  window.addEventListener("pageshow", (event) => {
-    if (event.persisted) {
-      refreshConnection();
-    }
+  window.addEventListener("pagehide", recordBackgrounded);
+  window.addEventListener("online", () => resumeApplication());
+  window.addEventListener("pageshow", () => {
+    resumeApplication();
   });
   document.addEventListener("click", (event) => {
     if (
@@ -8002,7 +8585,8 @@
     // Learn whether this device already holds a silent key before deciding
     // whether to prompt for a token, so enrolled devices never see the overlay.
     .then(prepareAuthenticationClient, async () => {
-      await refreshDeviceKeyFlag();
+      resumeHandlingReady = true;
+      await resumeApplication();
       return true;
     })
     .then((authenticationReady) => {

@@ -1,16 +1,73 @@
 import asyncio
+import base64
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
 from mobile_terminal_config import AuthRealmConfig, ProfileConfig, ProxyConfig
 from proxy import INTERNAL_TOKEN_HEADER, PRINCIPAL_HEADER, ProxyServer
-from webauthn_auth import PasskeyAuth, PasskeyVerificationError
+from webauthn_auth import (
+    PasskeyAuth,
+    PasskeyVerificationError,
+    PendingDeviceEnrollment,
+    device_authentication_transcript,
+    device_enrollment_transcript,
+)
+
+
+def device_key_pair_and_signature(transcript):
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_key = base64.b64encode(
+        private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    ).decode("ascii")
+    der_signature = private_key.sign(transcript, ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der_signature)
+    signature = base64.b64encode(
+        r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    ).decode("ascii")
+    return private_key, public_key, signature
+
+
+def enrollment_payload(ticket):
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_key = base64.b64encode(
+        private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    ).decode("ascii")
+    transcript = device_enrollment_transcript(
+        ticket.rp_id,
+        ticket.realm,
+        ticket.profile,
+        ticket.enrollment_id,
+        ticket.nonce,
+        ticket.device_id,
+        public_key,
+    )
+    der_signature = private_key.sign(transcript, ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der_signature)
+    return {
+        **ticket.message(),
+        "type": "register-key",
+        "deviceId": ticket.device_id,
+        "publicKey": public_key,
+        "signature": base64.b64encode(
+            r.to_bytes(32, "big") + s.to_bytes(32, "big")
+        ).decode("ascii"),
+    }
 
 
 class StubConnection:
@@ -98,7 +155,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(message, str)
         return json.loads(message)
 
-    def passkey_proxy(self, passkeys, authenticate=None):
+    def passkey_proxy(self, passkeys, authenticate=None, state_dir=Path("state")):
         profile = ProfileConfig(
             id="powerhouse",
             label="Powerhouse",
@@ -109,7 +166,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
             path=Path("config.json"),
             host="127.0.0.1",
             port=8085,
-            state_dir=Path("state"),
+            state_dir=state_dir,
             label="ps",
             auth_realms={
                 "mine": AuthRealmConfig(
@@ -173,7 +230,8 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsInstance(proxy.passkeys, PasskeyAuth)
-        self.assertEqual(proxy.passkeys.state_dir, state_dir)
+        self.assertEqual(proxy.passkeys.state_dir, state_dir / "realms")
+        self.assertEqual(proxy.passkeys.store_filename, "passkeys.json")
         self.assertEqual(proxy.passkeys.rp_id, "example.ts.net")
         self.assertEqual(proxy.passkeys.expected_origin, "https://terminal.example.ts.net")
 
@@ -185,14 +243,25 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
 
         proxy, profile = self.passkey_proxy(passkeys, reject_token)
         connection = StubConnection(
-            [{"type": "webauthn-auth", "challengeId": "auth-id", "assertion": {}}]
+            [
+                {
+                    "type": "auth",
+                    "realm": "mine",
+                    "profile": "powerhouse",
+                    "requirePasskey": True,
+                },
+                {"type": "webauthn-auth", "challengeId": "auth-id", "assertion": {}},
+            ]
         )
 
         principal = await proxy.authenticate_realm(connection, profile, binding="connection-id")
 
         self.assertEqual(principal, "ben")
-        self.assertEqual(connection.sent[0]["type"], "webauthn-auth-options")
-        self.assertEqual(connection.sent[0]["realm"], "mine")
+        self.assertEqual(
+            [message["type"] for message in connection.sent],
+            ["auth-challenge", "webauthn-auth-options"],
+        )
+        self.assertEqual(connection.sent[1]["realm"], "mine")
         self.assertIn(("finish-auth", "mine", "auth-id", "connection-id"), passkeys.calls)
 
     async def test_token_is_bootstrap_only_until_passkey_registration_finishes(self):
@@ -203,7 +272,12 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
         )
         connection = StubConnection(
             [
-                {"type": "auth", "token": "external-secret"},
+                {
+                    "type": "auth",
+                    "realm": "mine",
+                    "profile": "powerhouse",
+                    "token": "external-secret",
+                },
                 {
                     "type": "webauthn-register",
                     "challengeId": "register-id",
@@ -221,12 +295,340 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(("finish-register", "mine", "register-id", "connection-id"), passkeys.calls)
 
+    async def test_enrolled_device_key_authenticates_silently_per_realm(self):
+        transcript = device_authentication_transcript(
+            "example.ts.net", "mine", "powerhouse", "fixed-nonce"
+        )
+        _private_key, public_key, signature = device_key_pair_and_signature(transcript)
+
+        with tempfile.TemporaryDirectory() as root:
+            proxy, profile = self.passkey_proxy(
+                StubPasskeys([{"credentialId": "credential", "principal": "ben"}]),
+                lambda _request: self.fail("token must not authorize an enrolled device"),
+                Path(root),
+            )
+            self.assertTrue(
+                proxy.device_keys.register("mine", "device-id", public_key, "ben", "test")
+            )
+            connection = StubConnection(
+                [
+                    {
+                        "type": "auth",
+                        "realm": "mine",
+                        "profile": "powerhouse",
+                        "deviceId": "device-id",
+                        "signature": signature,
+                        "requirePasskey": False,
+                    }
+                ]
+            )
+            with mock.patch("proxy.secrets.token_urlsafe", return_value="fixed-nonce"):
+                principal = await proxy.authenticate_realm(
+                    connection,
+                    profile,
+                    binding="connection-id",
+                )
+
+            self.assertEqual(principal, "ben")
+            self.assertEqual([message["type"] for message in connection.sent], ["auth-challenge"])
+            self.assertTrue((Path(root) / "realms" / "mine" / "device-keys.json").is_file())
+
+    async def test_invalid_device_key_requires_passkey_and_schedules_enrollment(self):
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key = base64.b64encode(
+            private_key.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        ).decode("ascii")
+        passkeys = StubPasskeys([{"credentialId": "credential", "principal": "ben"}])
+        with tempfile.TemporaryDirectory() as root:
+            proxy, profile = self.passkey_proxy(
+                passkeys,
+                lambda _request: self.fail("token must not replace an invalid device key"),
+                Path(root),
+            )
+            proxy.device_keys.register("mine", "device-id", public_key, "ben", "test")
+            connection = StubConnection(
+                [
+                    {
+                        "type": "auth",
+                        "realm": "mine",
+                        "profile": "powerhouse",
+                        "deviceId": "device-id",
+                        "signature": "invalid",
+                        "requirePasskey": False,
+                    },
+                    {"type": "webauthn-auth", "challengeId": "auth-id", "assertion": {}},
+                ]
+            )
+            enrollment = {}
+
+            principal = await proxy.authenticate_realm(
+                connection,
+                profile,
+                binding="connection-id",
+                enrollment=enrollment,
+            )
+
+        self.assertEqual(principal, "ben")
+        self.assertEqual(
+            [message["type"] for message in connection.sent],
+            ["auth-challenge", "webauthn-auth-options"],
+        )
+        self.assertEqual(
+            enrollment,
+            {
+                "realm": "mine",
+                "profile": "powerhouse",
+                "deviceId": "device-id",
+                "principal": "ben",
+            },
+        )
+
+    async def test_missing_device_key_requires_passkey_and_schedules_enrollment(self):
+        passkeys = StubPasskeys([{"credentialId": "credential", "principal": "ben"}])
+        with tempfile.TemporaryDirectory() as root:
+            proxy, profile = self.passkey_proxy(passkeys, state_dir=Path(root))
+            connection = StubConnection(
+                [
+                    {
+                        "type": "auth",
+                        "realm": "mine",
+                        "profile": "powerhouse",
+                        "deviceId": "device-id",
+                        "requirePasskey": False,
+                    },
+                    {"type": "webauthn-auth", "challengeId": "auth-id", "assertion": {}},
+                ]
+            )
+            enrollment = {}
+
+            principal = await proxy.authenticate_realm(
+                connection,
+                profile,
+                binding="connection-id",
+                enrollment=enrollment,
+            )
+
+        self.assertEqual(principal, "ben")
+        self.assertEqual(enrollment["deviceId"], "device-id")
+        self.assertIn(("finish-auth", "mine", "auth-id", "connection-id"), passkeys.calls)
+
+    async def test_require_passkey_shape_matrix_allows_silent_key_only_for_literal_false(self):
+        transcript = device_authentication_transcript(
+            "example.ts.net", "mine", "powerhouse", "fixed-nonce"
+        )
+        _private_key, public_key, signature = device_key_pair_and_signature(transcript)
+        missing = object()
+        cases = (
+            ("missing", missing, True),
+            ("null", None, True),
+            ("string", "false", True),
+            ("true", True, True),
+            ("false", False, False),
+        )
+
+        for name, value, needs_passkey in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                passkeys = StubPasskeys(
+                    [{"credentialId": "credential", "principal": "ben"}]
+                )
+                proxy, profile = self.passkey_proxy(passkeys, state_dir=Path(root))
+                proxy.device_keys.register("mine", "device-id", public_key, "ben", "test")
+                auth = {
+                    "type": "auth",
+                    "realm": "mine",
+                    "profile": "powerhouse",
+                    "deviceId": "device-id",
+                    "signature": signature,
+                }
+                if value is not missing:
+                    auth["requirePasskey"] = value
+                messages = [auth]
+                if needs_passkey:
+                    messages.append(
+                        {"type": "webauthn-auth", "challengeId": "auth-id", "assertion": {}}
+                    )
+                connection = StubConnection(messages)
+                with mock.patch("proxy.secrets.token_urlsafe", return_value="fixed-nonce"):
+                    principal = await proxy.authenticate_realm(
+                        connection,
+                        profile,
+                        binding="connection-id",
+                    )
+
+                self.assertEqual(principal, "ben")
+                self.assertEqual(
+                    any(call[0] == "finish-auth" for call in passkeys.calls),
+                    needs_passkey,
+                )
+
+    async def test_enrollment_ticket_survives_profile_switch_and_rejects_replay(self):
+        with tempfile.TemporaryDirectory() as root:
+            proxy, profile = self.passkey_proxy(StubPasskeys(), state_dir=Path(root))
+            other_profile = ProfileConfig(
+                id="other",
+                label="Other",
+                auth_realm="mine",
+                backend="ws://127.0.0.1:8091",
+            )
+            ticket = PendingDeviceEnrollment.issue(
+                rp_id="example.ts.net",
+                realm="mine",
+                profile=profile.id,
+                device_id="device-id",
+                principal="ben",
+                now=100.0,
+            )
+            payload = enrollment_payload(ticket)
+            pending = {ticket.enrollment_id: ticket}
+            connection = StubConnection()
+            with (
+                mock.patch("proxy.time.monotonic", return_value=101.0),
+                mock.patch.object(proxy.device_keys, "register") as register,
+            ):
+                self.assertTrue(
+                    await proxy._handle_device_key_message(
+                        connection, other_profile, pending, payload
+                    )
+                )
+                self.assertTrue(
+                    await proxy._handle_device_key_message(
+                        connection, other_profile, pending, payload
+                    )
+                )
+
+            register.assert_called_once_with(
+                "mine",
+                "device-id",
+                payload["publicKey"],
+                "ben",
+                "test browser",
+            )
+            self.assertEqual(pending, {})
+
+    async def test_enrollment_rejects_bad_mismatch_expired_and_preserves_unrelated_ticket(self):
+        cases = ("bad-signature", "mismatch", "expired")
+        for name in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                proxy, profile = self.passkey_proxy(StubPasskeys(), state_dir=Path(root))
+                ticket = PendingDeviceEnrollment.issue(
+                    rp_id="example.ts.net",
+                    realm="mine",
+                    profile=profile.id,
+                    device_id="device-id",
+                    principal="ben",
+                    now=100.0,
+                )
+                payload = enrollment_payload(ticket)
+                now = 101.0
+                if name == "bad-signature":
+                    payload["signature"] = base64.b64encode(b"\0" * 64).decode("ascii")
+                elif name == "mismatch":
+                    payload["realm"] = "other"
+                else:
+                    now = ticket.expires_at
+                pending = {ticket.enrollment_id: ticket}
+                with (
+                    mock.patch("proxy.time.monotonic", return_value=now),
+                    mock.patch.object(proxy.device_keys, "register") as register,
+                ):
+                    self.assertTrue(
+                        await proxy._handle_device_key_message(
+                            StubConnection(), profile, pending, payload
+                        )
+                    )
+                register.assert_not_called()
+                self.assertEqual(pending, {})
+
+        proxy, profile = self.passkey_proxy(StubPasskeys())
+        ticket = PendingDeviceEnrollment.issue(
+            rp_id="example.ts.net",
+            realm="mine",
+            profile=profile.id,
+            device_id="device-id",
+            principal="ben",
+        )
+        pending = {ticket.enrollment_id: ticket}
+        payload = {**enrollment_payload(ticket), "enrollmentId": "unrelated-id"}
+        with mock.patch.object(proxy.device_keys, "register") as register:
+            self.assertTrue(
+                await proxy._handle_device_key_message(
+                    StubConnection(), profile, pending, payload
+                )
+            )
+        register.assert_not_called()
+        self.assertIn(ticket.enrollment_id, pending)
+
+    async def test_enrollment_seed_waits_for_its_bound_profile_ready(self):
+        async def backend_handler(connection):
+            await connection.send(
+                json.dumps(
+                    {
+                        "type": "ready",
+                        "session": "shell",
+                        "openTabs": ["shell"],
+                        "multiTenant": False,
+                    }
+                )
+            )
+
+        async with serve(backend_handler, "127.0.0.1", 0) as backend_server:
+            backend_port = backend_server.sockets[0].getsockname()[1]
+            proxy, _profile = self.passkey_proxy(StubPasskeys())
+            other_profile = ProfileConfig(
+                id="other",
+                label="Other",
+                auth_realm="mine",
+                backend=f"ws://127.0.0.1:{backend_port}",
+            )
+            seed = {
+                "realm": "mine",
+                "profile": "powerhouse",
+                "deviceId": "device-id",
+                "principal": "ben",
+            }
+            pending = {}
+            connection = RelayConnection()
+
+            relay = asyncio.create_task(
+                proxy._relay_profile(
+                    connection,
+                    other_profile,
+                    "ben",
+                    "",
+                    seed,
+                    pending,
+                )
+            )
+            for _ in range(100):
+                if any(message.get("type") == "ready" for message in connection.sent):
+                    break
+                await asyncio.sleep(0.01)
+            await connection.incoming.put(
+                json.dumps({"type": "switch-profile", "profile": "powerhouse"})
+            )
+            await asyncio.wait_for(relay, timeout=2)
+
+        self.assertNotIn("enroll-key", [message.get("type") for message in connection.sent])
+        self.assertEqual(pending, {})
+        self.assertEqual(seed["profile"], "powerhouse")
+
     async def test_passkey_failures_are_generic_and_do_not_expose_verification_details(self):
         passkeys = StubPasskeys([{"credentialId": "credential", "principal": "ben"}])
         passkeys.authentication_error = PasskeyVerificationError("sensitive credential detail")
         proxy, _profile = self.passkey_proxy(passkeys)
         connection = StubConnection(
-            [{"type": "webauthn-auth", "challengeId": "auth-id", "assertion": {}}]
+            [
+                {
+                    "type": "auth",
+                    "realm": "mine",
+                    "profile": "powerhouse",
+                    "requirePasskey": True,
+                },
+                {"type": "webauthn-auth", "challengeId": "auth-id", "assertion": {}},
+            ]
         )
 
         await proxy.websocket_handler(connection)
@@ -450,8 +852,23 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                     node_modules_root=Path(root),
                     render_icon=lambda _label, _size: b"",
                 )
-                proxy.save_settings({"uiScale": 0.9})
-                self.assertEqual(proxy.load_settings(), {"uiScale": 0.9})
+                proxy.save_settings(
+                    {
+                        "uiScale": 0.9,
+                        "authenticationByRealm": {
+                            "mine": {"mode": "idle", "idleMinutes": 0},
+                        },
+                    }
+                )
+                self.assertEqual(
+                    proxy.load_settings(),
+                    {
+                        "uiScale": 0.9,
+                        "authenticationByRealm": {
+                            "mine": {"mode": "idle", "idleMinutes": 1},
+                        },
+                    },
+                )
                 async with serve(
                     proxy.websocket_handler,
                     "127.0.0.1",

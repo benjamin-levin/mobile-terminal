@@ -58,7 +58,8 @@ class RuntimeConfigTest(unittest.TestCase):
             self.assertIsNone(load_runtime_config({"MOBILE_TERMINAL_CONFIG": str(path)}))
 
     def test_standalone_keeps_silent_keys_and_adds_passkey_authentication(self):
-        self.assertIn('{"type": "enroll-key"}', SERVER_PY)
+        self.assertIn("PendingDeviceEnrollment.issue", SERVER_PY)
+        self.assertIn("enrollment.message()", SERVER_PY)
         self.assertIn('if message_type == "register-key":', SERVER_PY)
         self.assertIn("PasskeyAuth", SERVER_PY)
         self.assertIn("register_passkey", SERVER_PY)

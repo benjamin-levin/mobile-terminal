@@ -110,6 +110,15 @@ button {
   overflow: hidden;
 }
 
+.passkey-locked .terminal-stage,
+.passkey-locked .shortcuts-panel,
+.passkey-locked .topbar {
+  filter: blur(14px);
+  opacity: 0.18;
+  pointer-events: none;
+  user-select: none;
+}
+
 /* Keyboard open: extend the shell downward by the accessory-pill gap. The
    shortcuts panel is absolute bottom:0 inside the shell, so it rides down and
    the dock meets the iOS pill. Growing height (not translateY) avoids the
@@ -1668,16 +1677,17 @@ code {
   }
 
   .overlay {
+    --sheet-top-offset: calc(env(safe-area-inset-top) + max(8px, var(--page-pad-y)));
     align-items: stretch;
     justify-content: flex-start;
-    padding: max(8px, var(--page-pad-y)) 0 0;
+    padding: var(--sheet-top-offset) 0 0;
   }
 
   .editor-sheet,
   .display-sheet {
     width: 100%;
-    height: calc(var(--app-height) - max(8px, var(--page-pad-y)));
-    max-height: calc(var(--app-height) - max(8px, var(--page-pad-y)));
+    height: calc(var(--app-height) - var(--sheet-top-offset));
+    max-height: calc(var(--app-height) - var(--sheet-top-offset));
     margin-top: 0;
     border-left: 0;
     border-right: 0;

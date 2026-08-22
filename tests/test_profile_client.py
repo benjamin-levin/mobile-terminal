@@ -9,6 +9,7 @@ APP_JS = (ROOT / "static" / "app.js").read_text()
 INDEX_HTML = (ROOT / "static" / "index.html").read_text()
 PROXY_PY = (ROOT / "proxy.py").read_text()
 SW_JS = (ROOT / "static" / "sw.js").read_text()
+PASSKEY_JS = (ROOT / "static" / "passkey.js").read_text()
 
 
 class ProfileClientWiringTest(unittest.TestCase):
@@ -62,8 +63,9 @@ class ProfileClientWiringTest(unittest.TestCase):
 
     def test_proxy_shell_and_message_router_load_passkey_helper(self):
         self.assertIn('<script defer src="/static/passkey.js"></script>', PROXY_PY)
-        self.assertIn('const CACHE = "mobile-terminal-proxy-v2";', PROXY_PY)
-        self.assertIn("await window.MobileTerminalPasskeys.handleMessage(payload, sendMessage)", APP_JS)
+        self.assertIn('const CACHE = "mobile-terminal-proxy-v4";', PROXY_PY)
+        self.assertIn("await window.MobileTerminalPasskeys.handleMessage(", APP_JS)
+        self.assertIn("sendAuthenticationMessage,", APP_JS)
         self.assertIn("ensurePasskeyHelper", APP_JS)
         self.assertIn("showProxySignIn(payload", APP_JS)
         self.assertLess(
@@ -76,11 +78,20 @@ class ProfileClientWiringTest(unittest.TestCase):
         self.assertIn('type: "revoke-all-credentials"', APP_JS)
         self.assertIn('payload.type === "devices"', APP_JS)
 
-    def test_plain_server_loads_passkeys_and_reuses_open_socket_for_token_fallback(self):
+    def test_plain_server_loads_passkeys_and_closes_socket_for_passkey_retry(self):
         self.assertIn("Boolean(serverConfig.passkeyAuth)", APP_JS)
         self.assertIn("const passkeyAvailable = loginSupportsPasskey();", APP_JS)
-        self.assertIn("if (waitingForProxyAuth && socket && socket.readyState === WebSocket.OPEN)", APP_JS)
-        self.assertIn('const CACHE = "mobile-terminal-v8";', SW_JS)
+        self.assertIn("setPasskeyRetryUi(true);", APP_JS)
+        self.assertIn('authenticationSocket?.close(4000, "passkey retry");', APP_JS)
+        self.assertNotIn("passkeyRetryAllowsToken", APP_JS)
+        self.assertIn('const CACHE = "mobile-terminal-v9";', SW_JS)
+
+    def test_passkey_ceremony_is_cancelled_and_bound_to_its_socket(self):
+        self.assertIn("cancelPasskeyCeremony();", APP_JS)
+        self.assertIn("authenticationSocket !== socket", APP_JS)
+        self.assertIn("ceremonyController?.signal", APP_JS)
+        self.assertIn("async function handleMessage(payload, send, signal)", PASSKEY_JS)
+        self.assertGreaterEqual(PASSKEY_JS.count("...(signal ? { signal } : {})"), 2)
 
     def test_early_websocket_keeps_profile_state_proxy_only(self):
         self.assertIn('localStorage.getItem("mobile-terminal.active-session")', INDEX_HTML)
