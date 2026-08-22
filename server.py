@@ -50,7 +50,12 @@ STATIC_ROOT = ROOT / "static"
 NODE_MODULES_ROOT = ROOT / "node_modules"
 WS_PATH = "/_ws"
 SETTINGS_PATH = ROOT / "mobile-terminal-settings.json"
-OPEN_TABS_PATH = ROOT / "mobile-terminal-open-tabs.json"
+OPEN_TABS_PATH = Path(
+    os.environ.get(
+        "MOBILE_TERMINAL_OPEN_TABS_PATH",
+        str(ROOT / "mobile-terminal-open-tabs.json"),
+    )
+).expanduser()
 USAGE_PATH = ROOT / "mobile-terminal-usage.json"
 USAGE_RETENTION_DAYS = 365
 USAGE_VERSION = 2
