@@ -134,16 +134,20 @@ class StubPasskeys:
         self.credentials.append({"principal": "ben", "credentialId": "credential"})
         return {"principal": "ben", "credentialId": "credential"}
 
-    def revoke_credential(self, realm, credential_id):
-        self.calls.append(("revoke", realm, credential_id))
+    def revoke_credential(self, realm, credential_id, *, principal=None):
+        self.calls.append(("revoke", realm, credential_id, principal))
+        if principal != "ben":
+            raise PasskeyVerificationError("credential owner mismatch")
         self.credentials = [
             credential for credential in self.credentials
             if credential.get("credentialId") != credential_id
         ]
         return True
 
-    def revoke_all_credentials(self, realm):
-        self.calls.append(("revoke-all", realm))
+    def revoke_all_credentials(self, realm, *, principal=None):
+        self.calls.append(("revoke-all", realm, principal))
+        if principal != "ben":
+            raise PasskeyVerificationError("credential owner mismatch")
         count = len(self.credentials)
         self.credentials = []
         return count
@@ -464,6 +468,68 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                     needs_passkey,
                 )
 
+    async def test_forget_key_requires_matching_principal(self):
+        _private_key, public_key, _signature = device_key_pair_and_signature(b"test")
+
+        with tempfile.TemporaryDirectory() as root:
+            proxy, profile = self.passkey_proxy(StubPasskeys(), state_dir=Path(root))
+            self.assertTrue(
+                proxy.device_keys.register(
+                    "mine",
+                    "device-id",
+                    public_key,
+                    "ben",
+                    "test",
+                )
+            )
+            store_path = Path(root) / "realms" / "mine" / "device-keys.json"
+            original = store_path.read_text()
+            payload = {
+                "type": "forget-key",
+                "realm": "mine",
+                "profile": "powerhouse",
+                "deviceId": "device-id",
+            }
+
+            rejected = (
+                ("other-user", payload),
+                ("", payload),
+                ("ben", {**payload, "realm": "other"}),
+                ("ben", {**payload, "profile": "other"}),
+                ("ben", {**payload, "deviceId": "missing-device"}),
+            )
+            for principal, rejected_payload in rejected:
+                with self.subTest(principal=principal, payload=rejected_payload):
+                    connection = StubConnection()
+                    self.assertTrue(
+                        await proxy._handle_device_key_message(
+                            connection,
+                            profile,
+                            principal,
+                            {},
+                            rejected_payload,
+                        )
+                    )
+                    self.assertEqual(connection.sent, [])
+                    self.assertEqual(store_path.read_text(), original)
+
+            pre_auth = StubConnection([payload])
+            self.assertIsNone(await proxy.authenticate_realm(pre_auth, profile))
+            self.assertEqual(
+                [message["type"] for message in pre_auth.sent],
+                ["auth-challenge"],
+            )
+            self.assertEqual(store_path.read_text(), original)
+
+            connection = StubConnection()
+            self.assertTrue(
+                await proxy._handle_device_key_message(
+                    connection, profile, "ben", {}, payload
+                )
+            )
+            self.assertEqual(connection.sent, [])
+            self.assertEqual(json.loads(store_path.read_text())["devices"], {})
+
     async def test_enrollment_ticket_survives_profile_switch_and_rejects_replay(self):
         with tempfile.TemporaryDirectory() as root:
             proxy, profile = self.passkey_proxy(StubPasskeys(), state_dir=Path(root))
@@ -490,12 +556,12 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
             ):
                 self.assertTrue(
                     await proxy._handle_device_key_message(
-                        connection, other_profile, pending, payload
+                        connection, other_profile, "ben", pending, payload
                     )
                 )
                 self.assertTrue(
                     await proxy._handle_device_key_message(
-                        connection, other_profile, pending, payload
+                        connection, other_profile, "ben", pending, payload
                     )
                 )
 
@@ -536,7 +602,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                 ):
                     self.assertTrue(
                         await proxy._handle_device_key_message(
-                            StubConnection(), profile, pending, payload
+                            StubConnection(), profile, "ben", pending, payload
                         )
                     )
                 register.assert_not_called()
@@ -555,7 +621,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(proxy.device_keys, "register") as register:
             self.assertTrue(
                 await proxy._handle_device_key_message(
-                    StubConnection(), profile, pending, payload
+                    StubConnection(), profile, "ben", pending, payload
                 )
             )
         register.assert_not_called()
@@ -638,6 +704,73 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sensitive", json.dumps(connection.sent))
         self.assertEqual(connection.closed, (4001, "auth failed"))
 
+    async def test_unauthorized_passkey_revocations_are_indistinguishable(self):
+        messages = (
+            {"type": "revoke-credential", "credentialId": "credential"},
+            {"type": "revoke-credential", "credentialId": "missing"},
+            {"type": "revoke-all-credentials"},
+        )
+        expected = [{"type": "notice", "message": "Passkey operation failed."}]
+
+        for principal in ("", "other-user"):
+            for payload in messages:
+                with self.subTest(principal=principal, payload=payload):
+                    passkeys = StubPasskeys(
+                        [{"credentialId": "credential", "principal": "ben"}]
+                    )
+                    proxy, profile = self.passkey_proxy(passkeys)
+                    connection = StubConnection()
+
+                    self.assertTrue(
+                        await proxy._handle_credential_message(
+                            connection,
+                            profile,
+                            principal,
+                            payload,
+                        )
+                    )
+                    self.assertEqual(
+                        passkeys.credentials,
+                        [{"credentialId": "credential", "principal": "ben"}],
+                    )
+                    self.assertEqual(connection.sent, expected)
+
+            passkeys = StubPasskeys(
+                [{"credentialId": "credential", "principal": "ben"}]
+            )
+            proxy, profile = self.passkey_proxy(passkeys)
+            connection = StubConnection()
+            self.assertFalse(
+                await proxy._cascade_passkeys_for_rotation(
+                    connection,
+                    profile,
+                    principal,
+                    {"type": "rotate-token", "cascadePasskeys": True},
+                )
+            )
+            self.assertEqual(
+                passkeys.credentials,
+                [{"credentialId": "credential", "principal": "ben"}],
+            )
+            self.assertEqual(connection.sent, expected)
+
+        passkeys = StubPasskeys(
+            [{"credentialId": "credential", "principal": "ben"}]
+        )
+        proxy, profile = self.passkey_proxy(passkeys)
+        pre_auth = StubConnection(
+            [{"type": "revoke-credential", "credentialId": "credential"}]
+        )
+        self.assertIsNone(await proxy.authenticate_realm(pre_auth, profile))
+        self.assertEqual(
+            passkeys.credentials,
+            [{"credentialId": "credential", "principal": "ben"}],
+        )
+        self.assertEqual(
+            [message["type"] for message in pre_auth.sent],
+            ["auth-challenge"],
+        )
+
     async def test_passkey_credentials_can_be_listed_and_revoked_per_realm(self):
         passkeys = StubPasskeys([{"credentialId": "credential", "principal": "ben"}])
         proxy, profile = self.passkey_proxy(passkeys)
@@ -647,6 +780,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
             await proxy._handle_credential_message(
                 connection,
                 profile,
+                "ben",
                 {"type": "request-devices"},
             )
         )
@@ -655,19 +789,22 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
             await proxy._handle_credential_message(
                 connection,
                 profile,
+                "ben",
                 {"type": "revoke-credential", "credentialId": "credential"},
             )
         )
         self.assertEqual(connection.sent[-1], {"type": "devices", "devices": []})
+        self.assertIn(("revoke", "mine", "credential", "ben"), passkeys.calls)
         passkeys.credentials = [{"credentialId": "other", "principal": "ben"}]
         self.assertTrue(
             await proxy._handle_credential_message(
                 connection,
                 profile,
+                "ben",
                 {"type": "revoke-all-credentials"},
             )
         )
-        self.assertIn(("revoke-all", "mine"), passkeys.calls)
+        self.assertIn(("revoke-all", "mine", "ben"), passkeys.calls)
         self.assertEqual(connection.sent[-1], {"type": "devices", "devices": []})
 
         passkeys.credentials = [{"credentialId": "rotated", "principal": "ben"}]
@@ -675,6 +812,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
             await proxy._cascade_passkeys_for_rotation(
                 connection,
                 profile,
+                "ben",
                 {"type": "rotate-token", "cascadePasskeys": True},
             )
         )
@@ -732,7 +870,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
             )
             await asyncio.wait_for(received_rotation.wait(), timeout=2)
             self.assertEqual(passkeys.credentials, [])
-            self.assertIn(("revoke-all", "mine"), passkeys.calls)
+            self.assertIn(("revoke-all", "mine", "ben"), passkeys.calls)
             relay.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await relay

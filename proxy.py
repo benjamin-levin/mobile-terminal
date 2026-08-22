@@ -178,15 +178,17 @@ class RealmDeviceKeyRegistry:
             self._save_unlocked(realm, payload)
         return True
 
-    def forget(self, realm: str, device_id: str) -> None:
-        if not device_id:
-            return
+    def forget(self, realm: str, device_id: str, *, principal: str) -> bool:
+        if not device_id or not principal:
+            return False
         with self._lock:
             payload = self._load_unlocked(realm)
-            if device_id not in payload["devices"]:
-                return
+            record = payload["devices"].get(device_id)
+            if not isinstance(record, dict) or record.get("principal") != principal:
+                return False
             del payload["devices"][device_id]
             self._save_unlocked(realm, payload)
+            return True
 
 
 def _remote_host(remote_address: Any) -> str | None:
@@ -792,6 +794,7 @@ class ProxyServer:
         self,
         connection: ServerConnection,
         profile: ProfileConfig,
+        principal: str,
         pending_enrollments: dict[str, PendingDeviceEnrollment],
         payload: dict[str, Any],
     ) -> bool:
@@ -824,6 +827,7 @@ class ProxyServer:
                 self.device_keys.forget(
                     profile.auth_realm,
                     str(payload.get("deviceId", ""))[:64],
+                    principal=principal,
                 )
             return True
         return False
@@ -832,6 +836,7 @@ class ProxyServer:
         self,
         connection: ServerConnection,
         profile: ProfileConfig,
+        principal: str,
         payload: dict[str, Any],
     ) -> bool:
         if not self._profile_passkeys_enabled(profile):
@@ -848,10 +853,14 @@ class ProxyServer:
                 removed = self.passkeys.revoke_credential(
                     profile.auth_realm,
                     payload.get("credentialId", ""),
+                    principal=principal,
                 )
                 message = "Passkey revoked." if removed else "Passkey was not found."
             else:
-                revoked = self.passkeys.revoke_all_credentials(profile.auth_realm)
+                revoked = self.passkeys.revoke_all_credentials(
+                    profile.auth_realm,
+                    principal=principal,
+                )
                 message = f"Revoked {revoked} passkey{'s' if revoked != 1 else ''}."
         except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
             print(f"passkey credential revocation failed: {type(exc).__name__}")
@@ -868,13 +877,17 @@ class ProxyServer:
         self,
         connection: ServerConnection,
         profile: ProfileConfig,
+        principal: str,
         payload: dict[str, Any],
     ) -> bool:
         if payload.get("cascadePasskeys") is not True or not self._profile_passkeys_enabled(profile):
             return True
         assert self.passkeys is not None
         try:
-            self.passkeys.revoke_all_credentials(profile.auth_realm)
+            self.passkeys.revoke_all_credentials(
+                profile.auth_realm,
+                principal=principal,
+            )
         except (PasskeyChallengeError, PasskeyVerificationError, PasskeyStoreError, ValueError) as exc:
             print(f"passkey rotation cascade failed: {type(exc).__name__}")
             await self.send_json(
@@ -914,6 +927,7 @@ class ProxyServer:
         self,
         connection: ServerConnection,
         profile: ProfileConfig,
+        principal: str,
         message: str,
     ) -> tuple[str, str] | None:
         self._mark_profile(profile, "down", message)
@@ -941,7 +955,12 @@ class ProxyServer:
                 payload = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if await self._handle_credential_message(connection, profile, payload):
+            if await self._handle_credential_message(
+                connection,
+                profile,
+                principal,
+                payload,
+            ):
                 continue
             if payload.get("type") == "request-profiles":
                 await self.send_json(
@@ -966,6 +985,7 @@ class ProxyServer:
             return await self._unavailable_profile(
                 connection,
                 profile,
+                principal,
                 profile.status_message or "This profile is not running yet.",
             )
 
@@ -986,6 +1006,7 @@ class ProxyServer:
             return await self._unavailable_profile(
                 connection,
                 profile,
+                principal,
                 "Backend is unavailable. Choose another profile or retry.",
             )
 
@@ -1069,6 +1090,7 @@ class ProxyServer:
                     return await self._unavailable_profile(
                         connection,
                         profile,
+                        principal,
                         "Backend connection closed. Choose another profile or retry.",
                     )
                 try:
@@ -1097,17 +1119,24 @@ class ProxyServer:
                 if await self._handle_device_key_message(
                     connection,
                     profile,
+                    principal,
                     pending_enrollments,
                     payload,
                 ):
                     continue
-                if await self._handle_credential_message(connection, profile, payload):
+                if await self._handle_credential_message(
+                    connection,
+                    profile,
+                    principal,
+                    payload,
+                ):
                     continue
                 if (
                     message_type == "rotate-token"
                     and not await self._cascade_passkeys_for_rotation(
                         connection,
                         profile,
+                        principal,
                         payload,
                     )
                 ):

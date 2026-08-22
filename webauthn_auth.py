@@ -511,22 +511,35 @@ class PasskeyAuth:
                 key=lambda record: record.get("created", ""),
             )
 
-    def revoke_credential(self, realm: str, credential_id: str) -> bool:
+    def revoke_credential(
+        self,
+        realm: str,
+        credential_id: str,
+        *,
+        principal: str | None = None,
+    ) -> bool:
         realm = self._validate_realm(realm)
         credential_id = _b64url_encode(_b64url_decode(credential_id))
         with self._store_lock:
             store = self._load_store_unlocked(realm)
+            self._require_principal_ownership_unlocked(store, principal)
             if credential_id not in store["credentials"]:
                 return False
             del store["credentials"][credential_id]
             self._save_store_unlocked(realm, store)
             return True
 
-    def revoke_all_credentials(self, realm: str) -> int:
+    def revoke_all_credentials(
+        self,
+        realm: str,
+        *,
+        principal: str | None = None,
+    ) -> int:
         """Revoke a realm's passkeys, for example as part of token rotation cascade."""
         realm = self._validate_realm(realm)
         with self._store_lock:
             store = self._load_store_unlocked(realm)
+            self._require_principal_ownership_unlocked(store, principal)
             revoked = len(store["credentials"])
             if revoked:
                 store["credentials"] = {}
@@ -615,6 +628,20 @@ class PasskeyAuth:
     @staticmethod
     def _public_record(record: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in record.items() if key != "publicKey"}
+
+    @classmethod
+    def _require_principal_ownership_unlocked(
+        cls,
+        store: dict[str, Any],
+        principal: str | None,
+    ) -> None:
+        try:
+            principal = cls._validate_principal(principal)
+        except ValueError as exc:
+            raise PasskeyVerificationError("Passkey operation failed.") from exc
+        realm_user = store.get("realmUser")
+        if realm_user is not None and realm_user["principal"] != principal:
+            raise PasskeyVerificationError("Passkey operation failed.")
 
     def _load_store_unlocked(self, realm: str) -> dict[str, Any]:
         path = self._realm_path(realm)

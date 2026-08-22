@@ -304,21 +304,96 @@ class PasskeyAuthTest(unittest.TestCase):
     def test_revocation_is_individual_and_can_cascade(self):
         self.register()
         self.assertEqual(len(self.auth.list_credentials("mine")), 1)
-        self.assertFalse(self.auth.revoke_credential("other", CREDENTIAL_ID_B64))
-        self.assertTrue(self.auth.revoke_credential("mine", CREDENTIAL_ID_B64))
-        self.assertFalse(self.auth.revoke_credential("mine", CREDENTIAL_ID_B64))
+        self.assertFalse(
+            self.auth.revoke_credential(
+                "other",
+                CREDENTIAL_ID_B64,
+                principal="ben",
+            )
+        )
+        self.assertTrue(
+            self.auth.revoke_credential(
+                "mine",
+                CREDENTIAL_ID_B64,
+                principal="ben",
+            )
+        )
+        self.assertFalse(
+            self.auth.revoke_credential(
+                "mine",
+                CREDENTIAL_ID_B64,
+                principal="ben",
+            )
+        )
 
         self.register(label="Replacement")
-        self.assertEqual(self.auth.revoke_all_credentials("mine"), 1)
-        self.assertEqual(self.auth.revoke_all_credentials("mine"), 0)
+        self.assertEqual(
+            self.auth.revoke_all_credentials("mine", principal="ben"),
+            1,
+        )
+        self.assertEqual(
+            self.auth.revoke_all_credentials("mine", principal="ben"),
+            0,
+        )
         self.assertEqual(self.auth.list_credentials("mine"), [])
+
+    def test_revocation_requires_matching_principal(self):
+        self.register()
+        store_path = self.state_dir / "mine" / "device-keys.json"
+        original = store_path.read_text()
+        operations = (
+            lambda: self.auth.revoke_credential("mine", CREDENTIAL_ID_B64),
+            lambda: self.auth.revoke_all_credentials("mine"),
+            lambda: self.auth.revoke_credential(
+                "mine",
+                CREDENTIAL_ID_B64,
+                principal="",
+            ),
+            lambda: self.auth.revoke_all_credentials(
+                "mine",
+                principal="",
+            ),
+            lambda: self.auth.revoke_credential(
+                "mine",
+                CREDENTIAL_ID_B64,
+                principal="other-user",
+            ),
+            lambda: self.auth.revoke_all_credentials(
+                "mine",
+                principal="other-user",
+            ),
+        )
+
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaises(
+                PasskeyVerificationError
+            ) as raised:
+                operation()
+            self.assertEqual(str(raised.exception), "Passkey operation failed.")
+            self.assertEqual(store_path.read_text(), original)
+
+        self.assertTrue(
+            self.auth.revoke_credential(
+                "mine",
+                CREDENTIAL_ID_B64,
+                principal="ben",
+            )
+        )
+        self.register(label="Replacement")
+        self.assertEqual(
+            self.auth.revoke_all_credentials("mine", principal="ben"),
+            1,
+        )
 
     def test_stable_realm_user_id_and_principal_survive_revoke_all(self):
         options, _, _ = self.register()
         original_user_id = options["options"]["user"]["id"]
         self.assertEqual(original_user_id, b64url(self.auth.user_id_for_realm("mine")))
 
-        self.assertEqual(self.auth.revoke_all_credentials("mine"), 1)
+        self.assertEqual(
+            self.auth.revoke_all_credentials("mine", principal="ben"),
+            1,
+        )
         next_options = self.auth.begin_registration("mine", principal="ben")
         self.assertEqual(next_options["options"]["user"]["id"], original_user_id)
         self.assertNotEqual(
@@ -347,7 +422,13 @@ class PasskeyAuthTest(unittest.TestCase):
 
     def test_authentication_after_revoke_is_rejected(self):
         private_key, credential_id, _ = self.register_real()
-        self.assertTrue(self.auth.revoke_credential("mine", b64url(credential_id)))
+        self.assertTrue(
+            self.auth.revoke_credential(
+                "mine",
+                b64url(credential_id),
+                principal="ben",
+            )
+        )
         with self.assertRaises(PasskeyVerificationError):
             self.authenticate_real(private_key, credential_id, sign_count=1)
 
