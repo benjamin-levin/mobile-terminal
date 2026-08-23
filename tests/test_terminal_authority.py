@@ -1,9 +1,12 @@
 import asyncio
 import copy
 import json
+import os
+import shutil
 import subprocess
 import threading
 import unittest
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -16,6 +19,8 @@ from server import (
     PaneRowTracker,
     PaneSnapshot,
     TmuxBridge,
+    UnavailableCommandProvenance,
+    _absolute_row,
     _authored_physical_map,
     _command_row_digest,
     _slice_display_cells,
@@ -596,6 +601,104 @@ class ComposerProvenanceLifecycleTest(unittest.IsolatedAsyncioTestCase):
             await app.sync_mobile_composer(bridge, "session", "cursor", 2, revision=2)
             self.assertIsNone(app.command_provenance_state("session").active)
 
+    async def test_other_bridge_noop_duplicate_preserves_unavailable_taint(self):
+        app = object.__new__(AppServer)
+        app.mobile_composer_states = {}
+        app.command_provenance_states = {"session": CommandProvenanceState()}
+        app.scroll_states = {}
+        provenance = app.command_provenance_state("session")
+        write_lock = asyncio.Lock()
+        connection_a = RecordingConnection()
+        connection_b = RecordingConnection()
+        bridge_a = TmuxBridge(
+            connection_a,
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+            write_lock=write_lock,
+        )
+        bridge_b = TmuxBridge(
+            connection_b,
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+            write_lock=write_lock,
+        )
+        connection_a.bridge = bridge_a
+        connection_b.bridge = bridge_b
+        bridge_a.pane_id = bridge_b.pane_id = "%1"
+        bridge_a.quiet = mock.AsyncMock()
+        bridge_a.command = mock.AsyncMock(return_value=[])
+        bridge_b.command = mock.AsyncMock(return_value=[])
+        exact = "printf '%s' tainted"
+
+        with (
+            mock.patch("server.pane_in_mode", return_value=False),
+            mock.patch(
+                "server.capture_pane_snapshot",
+                side_effect=RuntimeError("forced provenance capture failure"),
+            ),
+        ):
+            await app.handle_command(
+                connection_a,
+                bridge_a,
+                {"session": "session"},
+                {
+                    "type": "composer-sync",
+                    "value": exact,
+                    "cursor": len(exact),
+                    "revision": 1,
+                },
+            )
+
+        taint = provenance.unavailable
+        self.assertIsNotNone(taint)
+        self.assertIsNone(provenance.active)
+        bridge_a.command.assert_awaited_once_with(
+            f"send-keys -t %1 -H {exact.encode().hex(' ')}"
+        )
+
+        with mock.patch("server.pane_in_mode", return_value=False):
+            await app.handle_command(
+                connection_b,
+                bridge_b,
+                {"session": "session"},
+                {
+                    "type": "composer-sync",
+                    "value": exact,
+                    "cursor": len(exact),
+                    "revision": 2,
+                },
+            )
+
+        bridge_b.command.assert_not_awaited()
+        self.assertIs(provenance.unavailable, taint)
+        self.assertIsNone(provenance.active)
+        text, error = await bridge_b.authoritative_selection(
+            {
+                "requestId": "tainted-noop",
+                "profile": "",
+                "session": "session",
+                "paneId": "%1",
+                "epoch": 0,
+                "revision": 0,
+                "cutoff": 0,
+                "layoutGeneration": 0,
+                "cols": 20,
+                "rows": 6,
+                "baseY": 0,
+                "bufferType": "normal",
+                "selection": {
+                    "start": {"x": 0, "y": 0},
+                    "end": {"x": 1, "y": 0},
+                },
+            }
+        )
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+
     async def test_semantic_sync_generic_input_and_layout_change_invalidate_active(self):
         app = object.__new__(AppServer)
         app.mobile_composer_states = {}
@@ -663,6 +766,270 @@ class ComposerProvenanceLifecycleTest(unittest.IsolatedAsyncioTestCase):
             source="composer-sync",
             owner_id=1,
         )
+
+
+class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        if not shutil.which("tmux") or not shutil.which("zsh") or not shutil.which("script"):
+            self.skipTest("tmux, zsh, and script are required")
+        self.session_name = f"mt-provenance-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-x",
+                "36",
+                "-y",
+                "8",
+                "-s",
+                self.session_name,
+                "env PS1='$ ' zsh -f",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.ordinary_client = subprocess.Popen(
+            [
+                "script",
+                "-qfec",
+                f"exec tmux attach-session -t {self.session_name}",
+                "/dev/null",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        await self._wait_for_ordinary_client()
+
+        self.app = object.__new__(AppServer)
+        self.app.mobile_composer_states = {}
+        self.app.command_provenance_states = {
+            self.session_name: CommandProvenanceState()
+        }
+        self.app.terminal_write_locks = {self.session_name: asyncio.Lock()}
+        self.app.scroll_states = {}
+        self.connection = RecordingConnection()
+        self.bridge = TmuxBridge(
+            self.connection,
+            self.session_name,
+            "/bin/zsh",
+            "/",
+            create_if_missing=False,
+            initial_size=(36, 8),
+            provenance_state=self.app.command_provenance_state(self.session_name),
+            write_lock=self.app.terminal_write_lock(self.session_name),
+        )
+        self.connection.bridge = self.bridge
+        await self.bridge.open()
+        self.bridge.phase = "forward"
+        await self.bridge.quiet(0.08)
+        self.state = {"session": self.session_name, "user": ""}
+
+    async def asyncTearDown(self):
+        bridge = getattr(self, "bridge", None)
+        if bridge is not None:
+            await bridge.close()
+        ordinary_client = getattr(self, "ordinary_client", None)
+        if ordinary_client is not None and ordinary_client.poll() is None:
+            ordinary_client.terminate()
+            try:
+                await asyncio.wait_for(asyncio.to_thread(ordinary_client.wait), timeout=1)
+            except asyncio.TimeoutError:
+                ordinary_client.kill()
+                await asyncio.to_thread(ordinary_client.wait)
+        session_name = getattr(self, "session_name", "")
+        if session_name:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session_name],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+    async def _wait_for_ordinary_client(self):
+        deadline = asyncio.get_running_loop().time() + 3
+        while asyncio.get_running_loop().time() < deadline:
+            result = subprocess.run(
+                [
+                    "tmux",
+                    "list-clients",
+                    "-t",
+                    self.session_name,
+                    "-F",
+                    "#{client_control_mode}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if "0" in result.stdout.splitlines():
+                return
+            await asyncio.sleep(0.03)
+        self.fail("ordinary tmux client did not attach")
+
+    def _assert_ordinary_client_remains_attached(self):
+        result = subprocess.run(
+            [
+                "tmux",
+                "list-clients",
+                "-t",
+                self.session_name,
+                "-F",
+                "#{client_control_mode}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("0", result.stdout.splitlines())
+
+    async def _send_native_paste_syncs(self, value):
+        for revision in (1, 2):
+            await self.app.handle_command(
+                self.connection,
+                self.bridge,
+                self.state,
+                {
+                    "type": "composer-sync",
+                    "value": value,
+                    "cursor": len(value),
+                    "revision": revision,
+                },
+            )
+
+    async def _selection_payload(self, active=None):
+        if active is None:
+            start_x = end_x = start_y = end_y = 0
+            cols, rows, base_y = 36, 8, 0
+        else:
+            pane = None
+            for attempt in range(10):
+                try:
+                    pane = capture_pane_snapshot(
+                        self.session_name,
+                        self.bridge.pane_id,
+                    )
+                    break
+                except RuntimeError:
+                    if attempt == 9:
+                        raise
+                    await asyncio.sleep(0.03)
+            identity = self.bridge.provenance_state.row_tracker.observe(
+                pane,
+                self.bridge.offset,
+            )
+            start_absolute_row = _absolute_row(pane, identity, active.start_row)
+            end_absolute_row = _absolute_row(pane, identity, active.end_row)
+            start_x = active.start_x
+            end_x = active.end_x
+            start_y = pane.seed_history + start_absolute_row - pane.history
+            end_y = pane.seed_history + end_absolute_row - pane.history
+            cols, rows, base_y = pane.cols, pane.rows, pane.seed_history
+        return {
+            "type": "selection-request",
+            "requestId": uuid.uuid4().hex,
+            "profile": "",
+            "session": self.session_name,
+            "paneId": self.bridge.pane_id,
+            "epoch": self.bridge.epoch_state["epoch"],
+            "revision": self.bridge.offset,
+            "cutoff": self.bridge.cutoff,
+            "layoutGeneration": self.bridge.epoch_state["layout"],
+            "cols": cols,
+            "rows": rows,
+            "baseY": base_y,
+            "bufferType": "normal",
+            "selection": {
+                "start": {"x": start_x, "y": start_y},
+                "end": {"x": end_x, "y": end_y},
+            },
+        }
+
+    def _last_selection_result(self):
+        payloads = [
+            json.loads(message)
+            for message in self.connection.messages
+            if isinstance(message, str)
+        ]
+        return next(
+            payload
+            for payload in reversed(payloads)
+            if payload.get("type") == "selection-result"
+        )
+
+    async def test_native_paste_uses_exact_source_with_stable_ordinary_client(self):
+        exact = "printf '%s' 'ONE-LINE-" + ("0123456789" * 8) + "'"
+        await self._send_native_paste_syncs(exact)
+        await self.bridge.settle_active_provenance_fence()
+        active = self.bridge.provenance_state.active
+
+        self.assertIsNotNone(active)
+        self.assertEqual(active.draft, exact)
+        self.assertEqual(active.revision, 2)
+        self._assert_ordinary_client_remains_attached()
+        await self.app.handle_command(
+            self.connection,
+            self.bridge,
+            self.state,
+            await self._selection_payload(active),
+        )
+
+        result = self._last_selection_result()
+        self.assertEqual(result.get("text"), exact)
+        self.assertNotIn("error", result)
+
+    async def test_failed_start_write_stays_tainted_across_duplicate_sync(self):
+        exact = "printf '%s' 'TAINTED-" + ("abcdefghij" * 6) + "'"
+        with mock.patch(
+            "server.capture_pane_snapshot",
+            side_effect=RuntimeError("forced pre-write capture failure"),
+        ):
+            await self.app.handle_command(
+                self.connection,
+                self.bridge,
+                self.state,
+                {
+                    "type": "composer-sync",
+                    "value": exact,
+                    "cursor": len(exact),
+                    "revision": 1,
+                },
+            )
+        await self.app.handle_command(
+            self.connection,
+            self.bridge,
+            self.state,
+            {
+                "type": "composer-sync",
+                "value": exact,
+                "cursor": len(exact),
+                "revision": 2,
+            },
+        )
+
+        rendered = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-J", "-t", self.bridge.pane_id],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertIn("TAINTED-", rendered)
+        self.assertIsNone(self.bridge.provenance_state.active)
+        self.assertEqual(self.bridge.provenance_state.unavailable.draft, exact)
+        self.assertEqual(self.bridge.provenance_state.unavailable.revision, 2)
+        self._assert_ordinary_client_remains_attached()
+        await self.app.handle_command(
+            self.connection,
+            self.bridge,
+            self.state,
+            await self._selection_payload(),
+        )
+
+        result = self._last_selection_result()
+        self.assertEqual(result.get("error"), "Terminal changed; select again.")
+        self.assertNotIn("text", result)
 
 
 class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
@@ -1020,7 +1387,6 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch("server.asyncio.sleep", new=mock.AsyncMock()),
             mock.patch("server.capture_pane_snapshot", return_value=pane),
-            mock.patch("server.session_clients_are_owned", return_value=True),
         ):
             await bridge._capture_active_provenance_fence(active)
 
@@ -1088,7 +1454,6 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch("server.pane_metadata", return_value=metadata),
             mock.patch("server.capture_pane_snapshot", return_value=pane),
-            mock.patch("server.session_clients_are_owned", return_value=True),
         ):
             record = await bridge.write_accepted_enter(active, 5, 0)
 
@@ -1137,17 +1502,14 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         )
         bridge.provenance_state.active = active
 
-        with (
-            mock.patch("server.capture_pane_snapshot", return_value=pane),
-            mock.patch("server.session_clients_are_owned", return_value=True),
-        ):
+        with mock.patch("server.capture_pane_snapshot", return_value=pane):
             record = await bridge.write_accepted_enter(active, 5, 0)
 
         self.assertIsNone(record)
         self.assertEqual(tuple(bridge.provenance_state.accepted_records), ())
         bridge.command.assert_awaited_once_with("send-keys -t %1 -H 0d")
 
-    async def test_unowned_tmux_client_disables_accepted_override(self):
+    async def test_stable_ordinary_tmux_client_does_not_disable_accepted_override(self):
         bridge = TmuxBridge(RecordingConnection(), "session", "/bin/sh", "/")
         bridge.pane_id = "%1"
         bridge.quiet = mock.AsyncMock()
@@ -1179,41 +1541,54 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         )
         bridge.provenance_state.active = active
 
-        with (
-            mock.patch("server.capture_pane_snapshot", return_value=pane),
-            mock.patch("server.session_clients_are_owned", return_value=False),
-        ):
+        with mock.patch("server.capture_pane_snapshot", return_value=pane):
             record = await bridge.write_accepted_enter(active, 5, 0)
 
-        self.assertIsNone(record)
-        self.assertEqual(tuple(bridge.provenance_state.accepted_records), ())
+        self.assertEqual(record.draft, "exact command")
+        self.assertEqual(tuple(bridge.provenance_state.accepted_records), (record,))
         bridge.command.assert_awaited_once_with("send-keys -t %1 -H 0d")
 
-    async def test_failed_composer_enter_keeps_draft_and_history_state(self):
-        app = object.__new__(AppServer)
-        app.mobile_composer_states = {}
-        state = app.mobile_composer_state("session")
-        state.update(
-            {
-                "draft": "unfinished",
-                "cursor": 4,
-                "history": ["older"],
-                "revision": 8,
-                "tracked": True,
-                "source": "composer-sync",
-            }
-        )
-        before = copy.deepcopy(state)
-        bridge = mock.Mock()
-        bridge.session_name = "session"
-        bridge.settle_active_provenance_fence = mock.AsyncMock()
-        bridge.write = mock.AsyncMock(side_effect=RuntimeError("tmux closed"))
+    async def test_failed_or_cancelled_composer_enter_keeps_draft_history_and_taint(self):
+        for write_error in (RuntimeError("tmux closed"), asyncio.CancelledError()):
+            with self.subTest(write_error=type(write_error).__name__):
+                app = object.__new__(AppServer)
+                app.mobile_composer_states = {}
+                app.command_provenance_states = {}
+                state = app.mobile_composer_state("session")
+                state.update(
+                    {
+                        "draft": "unfinished",
+                        "cursor": 4,
+                        "history": ["older"],
+                        "revision": 8,
+                        "tracked": True,
+                        "source": "composer-sync",
+                    }
+                )
+                before = copy.deepcopy(state)
+                bridge = mock.Mock()
+                bridge.session_name = "session"
+                bridge.pane_id = "%1"
+                bridge.settle_active_provenance_fence = mock.AsyncMock()
+                bridge.write = mock.AsyncMock(side_effect=write_error)
+                provenance = app.command_provenance_state("session")
+                taint = UnavailableCommandProvenance(
+                    session_name="session",
+                    pane_id="%1",
+                    layout_generation=provenance.layout_generation,
+                    draft="unfinished",
+                    revision=8,
+                    owner_id=id(bridge),
+                )
+                provenance.mark_unavailable(taint)
 
-        with mock.patch("server.pane_in_mode", return_value=False):
-            with self.assertRaisesRegex(RuntimeError, "tmux closed"):
-                await app.commit_mobile_composer(bridge, "session", revision=9)
+                with mock.patch("server.pane_in_mode", return_value=False):
+                    with self.assertRaises(type(write_error)):
+                        await app.commit_mobile_composer(bridge, "session", revision=9)
 
-        self.assertEqual(state, before)
+                self.assertEqual(state, before)
+                self.assertIsNone(provenance.active)
+                self.assertIs(provenance.unavailable, taint)
 
     async def test_failed_composer_history_write_keeps_pending_draft_state(self):
         app = object.__new__(AppServer)
@@ -1344,10 +1719,7 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
             "selection": {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}},
         }
 
-        with (
-            mock.patch("server.capture_pane_snapshot", return_value=pane),
-            mock.patch("server.session_clients_are_owned", return_value=True),
-        ):
+        with mock.patch("server.capture_pane_snapshot", return_value=pane):
             text, error = await bridge.authoritative_selection(payload)
             self.assertEqual((text, error), (exact, None))
 
@@ -1358,15 +1730,11 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(text)
         self.assertEqual(error, "Terminal changed; select again.")
 
-        payload["requestId"] = "unowned-client"
+        payload["requestId"] = "stable-ordinary-client"
         payload["selection"] = {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}}
-        with (
-            mock.patch("server.capture_pane_snapshot", return_value=pane),
-            mock.patch("server.session_clients_are_owned", return_value=False),
-        ):
+        with mock.patch("server.capture_pane_snapshot", return_value=pane):
             text, error = await bridge.authoritative_selection(payload)
-        self.assertIsNone(text)
-        self.assertEqual(error, "Terminal changed; select again.")
+        self.assertEqual((text, error), (exact, None))
 
         changed = snapshot(
             cols=10,
@@ -1378,10 +1746,7 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         )
         payload["requestId"] = "out-of-band"
         payload["selection"] = {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}}
-        with (
-            mock.patch("server.capture_pane_snapshot", return_value=changed),
-            mock.patch("server.session_clients_are_owned", return_value=True),
-        ):
+        with mock.patch("server.capture_pane_snapshot", return_value=changed):
             text, error = await bridge.authoritative_selection(payload)
         self.assertIsNone(text)
         self.assertEqual(error, "Terminal changed; select again.")
@@ -1461,10 +1826,7 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
                 return pane
             return function(*args, **kwargs)
 
-        with (
-            mock.patch("server.asyncio.to_thread", side_effect=to_thread),
-            mock.patch("server.session_clients_are_owned", return_value=True),
-        ):
+        with mock.patch("server.asyncio.to_thread", side_effect=to_thread):
             copying = asyncio.create_task(bridge.authoritative_selection(payload))
             await capture_started.wait()
             writing = asyncio.create_task(writer.write("x"))
@@ -1530,13 +1892,13 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
             "bufferType": "normal",
             "selection": {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}},
         }
-        def clients_owned(*_args):
+        def capture_with_external_revision(*_args):
             bridge.offset += 1
-            return True
+            return pane
 
-        with (
-            mock.patch("server.capture_pane_snapshot", return_value=pane),
-            mock.patch("server.session_clients_are_owned", side_effect=clients_owned),
+        with mock.patch(
+            "server.capture_pane_snapshot",
+            side_effect=capture_with_external_revision,
         ):
             text, error = await bridge.authoritative_selection(payload)
 
@@ -1600,10 +1962,7 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
             "selection": {"start": {"x": 2, "y": 0}, "end": {"x": 8, "y": 0}},
         }
 
-        with (
-            mock.patch("server.capture_pane_snapshot", return_value=pane),
-            mock.patch("server.session_clients_are_owned", return_value=True),
-        ):
+        with mock.patch("server.capture_pane_snapshot", return_value=pane):
             text, error = await bridge.authoritative_selection(payload)
 
         self.assertIsNone(text)
