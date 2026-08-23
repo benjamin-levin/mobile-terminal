@@ -222,6 +222,9 @@
   let authenticationByRealm = {};
   let hostAuthenticationDefault = normalizeAuthenticationSettings(null);
   let authenticationSettings = normalizeAuthenticationSettings(null);
+  let draftAuthenticationSettings = normalizeAuthenticationSettings(null);
+  let draftAuthenticationRealm = "";
+  let draftAuthenticationScope = "";
   let passkeyRequiredScope = "";
   let passkeyRetryPending = false;
   let passkeyCeremonyController = null;
@@ -269,6 +272,26 @@
     return scope === "standalone" ? base : `${base}.${encodeURIComponent(scope)}`;
   }
 
+  function removeAuthenticationStorage() {
+    const bases = [
+      STORAGE_PASSKEY_AUTH_MODE_KEY,
+      STORAGE_PASSKEY_IDLE_MINUTES_KEY,
+      STORAGE_PASSKEY_BACKGROUNDED_AT_KEY,
+    ];
+    try {
+      const keys = [];
+      for (let index = 0; index < localStorage.length; index += 1) {
+        const key = localStorage.key(index);
+        if (key && bases.some((base) => key === base || key.startsWith(`${base}.`))) {
+          keys.push(key);
+        }
+      }
+      keys.forEach((key) => localStorage.removeItem(key));
+    } catch (_error) {
+      // User-switch cleanup is best-effort when browser storage is unavailable.
+    }
+  }
+
   function hostAuthenticationSettings(realm = loginRealm) {
     if (realm && authenticationByRealm[realm]) {
       return normalizeAuthenticationSettings(authenticationByRealm[realm]);
@@ -292,16 +315,31 @@
     }
   }
 
-  function applyAuthenticationScope(realm = loginRealm) {
-    authenticationSettings = loadAuthenticationSettings(realm);
+  function syncAuthenticationControls(settings = draftAuthenticationSettings) {
     if (authenticationModeInput) {
-      authenticationModeInput.value = authenticationSettings.mode;
+      authenticationModeInput.value = settings.mode;
     }
     if (authenticationIdleInput) {
-      authenticationIdleInput.value = String(authenticationSettings.idleMinutes);
+      authenticationIdleInput.value = String(settings.idleMinutes);
     }
     if (authenticationIdleControl) {
-      authenticationIdleControl.classList.toggle("hidden", authenticationSettings.mode !== "idle");
+      authenticationIdleControl.classList.toggle("hidden", settings.mode !== "idle");
+    }
+  }
+
+  function updateAuthenticationDraft(settings, realm = loginRealm) {
+    draftAuthenticationSettings = normalizeAuthenticationSettings(settings);
+    draftAuthenticationRealm = realm;
+    draftAuthenticationScope = authenticationScope(realm);
+    syncAuthenticationControls();
+  }
+
+  function applyAuthenticationScope(realm = loginRealm) {
+    const scope = authenticationScope(realm);
+    authenticationSettings = loadAuthenticationSettings(realm);
+    const draftIsOpen = authenticationOverlay && !authenticationOverlay.classList.contains("hidden");
+    if (!draftIsOpen || draftAuthenticationScope !== scope) {
+      updateAuthenticationDraft(authenticationSettings, realm);
     }
   }
 
@@ -317,6 +355,9 @@
     authenticationByRealm = {};
     hostAuthenticationDefault = normalizeAuthenticationSettings(null);
     authenticationSettings = normalizeAuthenticationSettings(null);
+    draftAuthenticationSettings = normalizeAuthenticationSettings(null);
+    draftAuthenticationRealm = "";
+    draftAuthenticationScope = "";
     passkeyRequiredScope = "";
     passkeyRetryPending = false;
     resumeDecisionPromise = null;
@@ -1092,8 +1133,7 @@
     );
   }
 
-  function activeAuthenticationSettings() {
-    const realm = activeProfile()?.authRealm || loginRealm;
+  function activeAuthenticationSettings(realm = activeProfile()?.authRealm || loginRealm) {
     if (!serverConfig.profileMode || !realm) {
       return { authentication: normalizeAuthenticationSettings(authenticationSettings) };
     }
@@ -1298,7 +1338,7 @@
     saveHostSettings();
   }
 
-  function saveHostSettings() {
+  function saveHostSettings(authenticationRealm) {
     sendMessage({
       type: "save-settings",
       settings: {
@@ -1306,7 +1346,7 @@
         gestures: gestureBindings,
         uiScale,
         terminalFontSize,
-        ...activeAuthenticationSettings(),
+        ...activeAuthenticationSettings(authenticationRealm),
         ...activeFileBookmarkSettings(),
       },
     });
@@ -5623,6 +5663,30 @@
     window.__mtBoot = null;
   }
 
+  async function applyAuthoritativeAuthenticationScope(realm) {
+    const previousScope = authenticationScope();
+    loginRealm = realm;
+    applyAuthenticationScope(realm);
+    if (!resumeHandlingReady || authenticationScope(realm) === previousScope) {
+      return;
+    }
+    setPasskeyLocked(true);
+    const pendingResumeDecision = resumeDecisionPromise;
+    if (pendingResumeDecision) {
+      try {
+        await pendingResumeDecision;
+      } catch (_error) {
+        // The authoritative scope still needs its own fail-closed decision.
+      }
+    }
+    passkeyRequiredScope = "";
+    passkeyRetryPending = false;
+    initialResumeDecisionMade = false;
+    handledResumeMarker = "";
+    backgroundRecordedScope = "";
+    await resumeApplication();
+  }
+
   // Reply to the server's challenge with a realm- and RP-bound device proof.
   async function sendAuthResponse(
     nonce,
@@ -5634,8 +5698,7 @@
     if (!authSocket || authSocket !== socket || authSocket.readyState !== WebSocket.OPEN) return;
     const keyRealm = serverConfig.profileMode ? realm : loginRealm;
     if (serverConfig.profileMode && realm) {
-      loginRealm = realm;
-      applyAuthenticationScope(realm);
+      await applyAuthoritativeAuthenticationScope(realm);
     }
     const token = localStorage.getItem(tokenStorageKey(keyRealm)) || "";
     const scope = authenticationScope(keyRealm);
@@ -5745,6 +5808,41 @@
     return revealHiddenReady;
   }
 
+  function writeBackgroundedAt(realm = loginRealm, backgroundedAt = Date.now()) {
+    if (
+      authenticationScope(realm) !== authenticationScope() ||
+      !Number.isSafeInteger(backgroundedAt) ||
+      backgroundedAt <= 0
+    ) {
+      return false;
+    }
+    try {
+      localStorage.setItem(
+        authenticationStorageKey(STORAGE_PASSKEY_BACKGROUNDED_AT_KEY, realm),
+        String(backgroundedAt),
+      );
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function recordVisibleIdleCheckpoint() {
+    const realm = loginRealm;
+    if (
+      !resumeHandlingReady ||
+      !initialResumeDecisionMade ||
+      document.visibilityState !== "visible" ||
+      waitingForProxyAuth ||
+      passkeyRequiredScope ||
+      terminalReadyWhileHidden ||
+      loadAuthenticationSettings(realm).mode !== "idle"
+    ) {
+      return false;
+    }
+    return writeBackgroundedAt(realm, Date.now());
+  }
+
   function recordBackgrounded(event) {
     if (event?.type !== "pagehide" && document.visibilityState !== "hidden") {
       return;
@@ -5754,19 +5852,15 @@
     if (backgroundRecordedScope === scope) {
       return;
     }
-    backgroundRecordedScope = scope;
+    const backgroundedAt = Date.now();
     if (loadAuthenticationSettings(realm).mode !== "off") {
       // Obscure the terminal before the browser captures an app-switcher frame.
       setPasskeyLocked(true);
     }
-    try {
-      localStorage.setItem(
-        authenticationStorageKey(STORAGE_PASSKEY_BACKGROUNDED_AT_KEY, realm),
-        String(Date.now()),
-      );
-    } catch (_error) {
-      // A missing marker fails closed for idle and every-open policies.
-    }
+    backgroundRecordedScope = scope;
+    // A failed write leaves an unknown marker, which fails closed for idle and
+    // every-open policies.
+    writeBackgroundedAt(realm, backgroundedAt);
   }
 
   function parseBackgroundedAt(raw) {
@@ -5834,6 +5928,9 @@
     await refreshDeviceKeyFlag(realm);
     if (scope !== authenticationScope()) {
       return;
+    }
+    if (!requiresPasskey && settings.mode === "idle" && !passkeyRequiredScope) {
+      writeBackgroundedAt(realm, Date.now());
     }
     if (requiresPasskey) {
       if (!initial) {
@@ -6098,7 +6195,12 @@
     ) {
       waitingForProxyAuth = true;
       pendingProfileId = payload.profile || pendingProfileId || activeProfileId;
-      loginRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
+      const authenticationRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
+      if (serverConfig.profileMode && authenticationRealm) {
+        await applyAuthoritativeAuthenticationScope(authenticationRealm);
+      } else {
+        loginRealm = authenticationRealm;
+      }
       const authenticationSocket = socket;
       cancelPasskeyCeremony();
       const ceremonyController =
@@ -6154,7 +6256,6 @@
       if (serverConfig.profileMode) {
         waitingForProxyAuth = true;
         pendingProfileId = payload.profile || pendingProfileId || activeProfileId;
-        loginRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
       }
       sendAuthResponse(
         payload.nonce,
@@ -6204,6 +6305,9 @@
       passkeyRequiredScope = "";
       passkeyRetryPending = false;
       setPasskeyRetryUi(false);
+      if (!readyIsHidden && loadAuthenticationSettings(loginRealm).mode === "idle") {
+        writeBackgroundedAt(loginRealm, Date.now());
+      }
       if (serverConfig.profileMode && loginSupportsPasskey()) {
         localStorage.removeItem(tokenStorageKey(activeProfile()?.authRealm || loginRealm));
       }
@@ -6236,10 +6340,8 @@
               STORAGE_ACTIVE_SESSION_KEY,
               STORAGE_OPEN_TABS_KEY,
               STORAGE_EDITOR_TABS_KEY,
-              STORAGE_PASSKEY_AUTH_MODE_KEY,
-              STORAGE_PASSKEY_IDLE_MINUTES_KEY,
-              STORAGE_PASSKEY_BACKGROUNDED_AT_KEY,
             ].forEach((key) => localStorage.removeItem(key));
+            removeAuthenticationStorage();
             resetAuthenticationLifecycle({ locked: readyIsHidden });
             terminalReadyWhileHidden = readyIsHidden;
             // Drop the previous user's in-memory tab set too, so it can't
@@ -7276,24 +7378,38 @@
   function openAuthentication() {
     closeSettingsMenu();
     applyAuthenticationScope();
+    updateAuthenticationDraft(authenticationSettings, loginRealm);
     authenticationOverlay.classList.remove("hidden");
   }
 
   function saveAuthentication() {
-    authenticationSettings = normalizeAuthenticationSettings({
-      mode: authenticationModeInput.value,
-      idleMinutes: authenticationIdleInput.value,
-    });
-    localStorage.setItem(
-      authenticationStorageKey(STORAGE_PASSKEY_AUTH_MODE_KEY),
-      authenticationSettings.mode,
+    const realm = draftAuthenticationRealm;
+    const scope = draftAuthenticationScope;
+    if (scope !== authenticationScope(realm) || scope !== authenticationScope()) {
+      authenticationOverlay.classList.add("hidden");
+      applyAuthenticationScope();
+      return;
+    }
+    updateAuthenticationDraft(
+      {
+        mode: authenticationModeInput.value,
+        idleMinutes: authenticationIdleInput.value,
+      },
+      realm,
     );
     localStorage.setItem(
-      authenticationStorageKey(STORAGE_PASSKEY_IDLE_MINUTES_KEY),
-      String(authenticationSettings.idleMinutes),
+      authenticationStorageKey(STORAGE_PASSKEY_AUTH_MODE_KEY, realm),
+      draftAuthenticationSettings.mode,
     );
-    applyAuthenticationScope();
-    saveHostSettings();
+    localStorage.setItem(
+      authenticationStorageKey(STORAGE_PASSKEY_IDLE_MINUTES_KEY, realm),
+      String(draftAuthenticationSettings.idleMinutes),
+    );
+    if (draftAuthenticationSettings.mode === "idle") {
+      writeBackgroundedAt(realm, Date.now());
+    }
+    applyAuthenticationScope(realm);
+    saveHostSettings(realm);
     authenticationOverlay.classList.add("hidden");
     if (authenticationSettings.mode === "off" && passkeyRequiredScope) {
       passkeyRequiredScope = "";
@@ -8340,10 +8456,16 @@
   document.getElementById("displayButton").addEventListener("click", openDisplay);
   authenticationButton.addEventListener("click", openAuthentication);
   authenticationModeInput.addEventListener("change", () => {
-    authenticationIdleControl.classList.toggle(
-      "hidden",
-      authenticationModeInput.value !== "idle",
-    );
+    updateAuthenticationDraft({
+      mode: authenticationModeInput.value,
+      idleMinutes: authenticationIdleInput.value,
+    }, draftAuthenticationRealm);
+  });
+  authenticationIdleInput.addEventListener("change", () => {
+    updateAuthenticationDraft({
+      mode: authenticationModeInput.value,
+      idleMinutes: authenticationIdleInput.value,
+    }, draftAuthenticationRealm);
   });
   document.getElementById("closeAuthenticationButton").addEventListener("click", saveAuthentication);
   document.getElementById("saveAuthenticationButton").addEventListener("click", saveAuthentication);
@@ -8510,6 +8632,7 @@
     }
   });
   window.addEventListener("pagehide", recordBackgrounded);
+  window.setInterval(recordVisibleIdleCheckpoint, 15000);
   window.addEventListener("online", () => resumeApplication());
   window.addEventListener("pageshow", () => {
     resumeApplication();

@@ -1143,7 +1143,8 @@ body[data-keyboard-open="true"] .shortcut-bar {
   box-shadow: var(--shadow);
 }
 
-.display-sheet {
+.display-sheet,
+.authentication-sheet {
   overflow: auto;
 }
 
@@ -1400,6 +1401,20 @@ body[data-keyboard-open="true"] .shortcut-bar {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.authentication-control {
+  margin-top: calc(18px * var(--ui-scale));
+  display: grid;
+  gap: calc(12px * var(--ui-scale));
+  padding: calc(16px * var(--ui-scale));
+  border: 1px solid rgba(130, 207, 255, 0.12);
+  border-radius: calc(var(--surface-radius) + 2px);
+  background: rgba(8, 19, 26, 0.72);
+}
+
+.authentication-control .field-label {
+  margin: 0;
 }
 
 .display-control {
@@ -1684,7 +1699,8 @@ code {
   }
 
   .editor-sheet,
-  .display-sheet {
+  .display-sheet,
+  .authentication-sheet {
     width: 100%;
     height: calc(var(--app-height) - var(--sheet-top-offset));
     max-height: calc(var(--app-height) - var(--sheet-top-offset));
@@ -1703,6 +1719,25 @@ code {
      scrolls) instead of scrolling the whole sheet. */
   .editor-sheet {
     overflow: hidden;
+  }
+
+  .authentication-sheet {
+    display: block;
+  }
+
+  .authentication-sheet .authentication-control {
+    width: 100%;
+    height: auto;
+  }
+
+  .authentication-sheet .text-input {
+    height: auto;
+    min-height: var(--input-min-height);
+  }
+
+  .authentication-sheet .helper-text {
+    width: 100%;
+    text-align: left;
   }
 
   .display-sheet {

@@ -305,7 +305,7 @@ Desktop  Downloads  mobile-terminal</pre>
     </div>
 
     <div id="authenticationOverlay" class="overlay hidden">
-      <div class="sheet display-sheet">
+      <div class="sheet authentication-sheet">
         <div class="editor-header">
           <div>
             <p class="eyebrow">Authentication</p>
@@ -313,7 +313,7 @@ Desktop  Downloads  mobile-terminal</pre>
           </div>
           <button id="closeAuthenticationButton" class="ghost-button" type="button">Done</button>
         </div>
-        <div class="display-control">
+        <div class="authentication-control">
           <label class="field-label" for="authenticationModeInput">Require a passkey</label>
           <select id="authenticationModeInput" class="text-input">
             <option value="every-open">Every time the app opens</option>
@@ -322,7 +322,7 @@ Desktop  Downloads  mobile-terminal</pre>
           </select>
           <p class="helper-text">This choice is stored for this device and authentication realm.</p>
         </div>
-        <div id="authenticationIdleControl" class="display-control">
+        <div id="authenticationIdleControl" class="authentication-control">
           <label class="field-label" for="authenticationIdleInput">Idle minutes</label>
           <input id="authenticationIdleInput" class="text-input" type="number" inputmode="numeric" min="1" max="1440" step="1" value="15">
           <p class="helper-text">Choose a value from 1 minute to 1440 minutes.</p>
