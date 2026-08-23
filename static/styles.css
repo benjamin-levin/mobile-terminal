@@ -6,6 +6,10 @@
   --editor-ui-font-size: max(calc(11px * var(--ui-scale)), calc(var(--terminal-font-size) * 0.9));
   --editor-code-font-size: var(--terminal-font-size);
   --keyboard-inset: 0px;
+  --safe-area-inset-top: env(safe-area-inset-top, 0px);
+  --safe-area-inset-right: env(safe-area-inset-right, 0px);
+  --safe-area-inset-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-inset-left: env(safe-area-inset-left, 0px);
   /* Standalone-PWA quirk: visualViewport.height stops ~22 CSS px short of iOS's
      floating keyboard accessory pill, leaving a constant gap under the shortcut
      dock. Grow the app-shell by this constant only while the keyboard is open so
@@ -449,67 +453,60 @@ h2 {
 
 .term-select-handle {
   position: absolute;
-  width: 2px;
-  margin-left: -1px;
+  min-width: 44px;
+  min-height: 44px;
   z-index: 31;
   pointer-events: auto;
   touch-action: none;
 }
 
-.term-select-handle::before {
-  content: "";
+.term-select-stem {
   position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
+  left: var(--term-select-stem-left);
+  top: var(--term-select-stem-top);
   width: 2px;
+  height: var(--term-select-stem-height);
+  transform: translateX(-1px);
   border-radius: 1px;
   background: #ffd166;
   box-shadow: 0 0 4px rgba(255, 209, 102, 0.6);
+  pointer-events: none;
 }
 
 .term-select-knob {
   position: absolute;
-  left: 50%;
-  width: 30px;
-  height: 30px;
-  transform: translateX(-50%);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.term-select-knob::after {
-  content: "";
+  left: var(--term-select-knob-left);
+  top: var(--term-select-knob-top);
   width: 16px;
   height: 16px;
   border-radius: 50%;
   background: #ffd166;
   box-shadow: 0 1px 5px rgba(0, 0, 0, 0.55);
-}
-
-.term-select-handle-start .term-select-knob {
-  top: -30px;
-}
-
-.term-select-handle-end .term-select-knob {
-  bottom: -30px;
+  pointer-events: none;
 }
 
 .term-select-chips {
   position: absolute;
   z-index: 32;
-  pointer-events: none; /* the container only positions; chips take the taps */
-  transform: translate(-50%, -100%);
   display: flex;
+  flex-wrap: nowrap;
   gap: 6px;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  pointer-events: auto;
+  touch-action: pan-x;
 }
 
-.term-select-chips.is-below {
-  transform: translate(-50%, 0);
+.term-select-chips::-webkit-scrollbar {
+  display: none;
 }
 
 .term-select-chip {
+  flex: 0 0 auto;
   pointer-events: auto;
   margin: 0;
   padding: 7px 16px;

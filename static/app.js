@@ -1554,14 +1554,114 @@
   const TERM_LONGPRESS_SLOP = 12; // px the finger may drift before it's a scroll
   const TERM_DOUBLETAP_MS = 120; // max gap between the two taps of a double-tap
   const TERM_DOUBLETAP_DIST = 28; // px the two taps may be apart
+  const TERM_SELECTION_TARGET_SIZE = 44;
+  const TERM_SELECTION_KNOB_SIZE = 16;
+  const TERM_SELECTION_TOOLBAR_GAP = 8;
   let termSel = null; // in-flight press/drag session, or null
   let termSelHandles = null; // lazily-created { layer, start, end, copy } DOM
+  let terminalSelectionSyncFrameId = null;
+  let terminalSelectionSyncForced = false;
   let suppressNextTerminalClick = false;
   let suppressComposerOpenThisTouch = false; // set when a tap only dismisses a selection
   let selectionTapCopy = null; // {x,y} when a touch landed inside the live selection
   let lastTermTapAt = 0; // for double-tap-to-select-word recognition
   let lastTermTapX = 0;
   let lastTermTapY = 0;
+
+  function clampSelectionValue(value, minimum, maximum) {
+    return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
+  }
+
+  function clampSelectionPoint(point, bounds) {
+    return {
+      x: clampSelectionValue(point.x, bounds.left, bounds.right),
+      y: clampSelectionValue(point.y, bounds.top, bounds.bottom),
+    };
+  }
+
+  function computeSelectionOverlayBounds(terminalRect, screenRect, viewportRect, safeArea) {
+    const safeViewport = {
+      left: viewportRect.left + safeArea.left,
+      top: viewportRect.top + safeArea.top,
+      right: viewportRect.right - safeArea.right,
+      bottom: viewportRect.bottom - safeArea.bottom,
+    };
+    const left = Math.max(terminalRect.left, screenRect.left, safeViewport.left);
+    const top = Math.max(terminalRect.top, screenRect.top, safeViewport.top);
+    const right = Math.max(left, Math.min(terminalRect.right, screenRect.right, safeViewport.right));
+    const bottom = Math.max(top, Math.min(terminalRect.bottom, screenRect.bottom, safeViewport.bottom));
+    return { left, top, right, bottom, width: right - left, height: bottom - top };
+  }
+
+  function computeSelectionHandlePlacement(
+    boundaryX,
+    lineTop,
+    lineBottom,
+    bounds,
+    side,
+    targetSize,
+    knobSize,
+  ) {
+    const width = Math.min(targetSize, bounds.width);
+    const height = Math.min(targetSize, bounds.height);
+    const knobWidth = knobSize;
+    const knobHeight = knobSize;
+    const knobCenterY = side === "start" ? lineTop - knobSize / 2 : lineBottom + knobSize / 2;
+    const left = clampSelectionValue(boundaryX - width / 2, bounds.left, bounds.right - width);
+    const top = clampSelectionValue(knobCenterY - height / 2, bounds.top, bounds.bottom - height);
+    const knobLeft = clampSelectionValue(
+      boundaryX - knobWidth / 2,
+      bounds.left,
+      bounds.right - knobWidth,
+    );
+    const knobTop = clampSelectionValue(
+      knobCenterY - knobHeight / 2,
+      bounds.top,
+      bounds.bottom - knobHeight,
+    );
+    return {
+      left,
+      top,
+      width,
+      height,
+      stemX: boundaryX,
+      stemTop: lineTop,
+      stemHeight: Math.max(0, lineBottom - lineTop),
+      knobLeft,
+      knobTop,
+      knobWidth,
+      knobHeight,
+    };
+  }
+
+  function computeSelectionToolbarPlacement(selectionRect, toolbarSize, bounds, gap) {
+    const availableWidth = bounds.width;
+    const availableHeight = bounds.height;
+    const centeredLeft = (selectionRect.left + selectionRect.right - toolbarSize.width) / 2;
+    const left = toolbarSize.width > availableWidth
+      ? bounds.left
+      : clampSelectionValue(centeredLeft, bounds.left, bounds.right - toolbarSize.width);
+    const aboveTop = selectionRect.top - gap - toolbarSize.height;
+    const belowTop = selectionRect.bottom + gap;
+    const fitsAbove = aboveTop >= bounds.top;
+    const fitsBelow = belowTop + toolbarSize.height <= bounds.bottom;
+    const aboveSpace = selectionRect.top - gap - bounds.top;
+    const belowSpace = bounds.bottom - selectionRect.bottom - gap;
+    const side = fitsAbove || (!fitsBelow && aboveSpace >= belowSpace) ? "above" : "below";
+    const preferredTop = side === "above" ? aboveTop : belowTop;
+    const top = clampSelectionValue(
+      preferredTop,
+      bounds.top,
+      bounds.bottom - Math.min(toolbarSize.height, availableHeight),
+    );
+    return {
+      left,
+      top,
+      side,
+      maxWidth: availableWidth,
+      overflowX: toolbarSize.width > availableWidth,
+    };
+  }
 
   function hapticPulse(ms) {
     try {
@@ -1575,6 +1675,52 @@
 
   function terminalScreenEl() {
     return terminalElement.querySelector(".xterm-screen");
+  }
+
+  function terminalSelectionSafeArea() {
+    const style = window.getComputedStyle(document.documentElement);
+    const readInset = (name) => Number.parseFloat(style.getPropertyValue(name)) || 0;
+    return {
+      top: readInset("--safe-area-inset-top"),
+      right: readInset("--safe-area-inset-right"),
+      bottom: readInset("--safe-area-inset-bottom"),
+      left: readInset("--safe-area-inset-left"),
+    };
+  }
+
+  function terminalSelectionViewportRect() {
+    const viewport = window.visualViewport;
+    const left = viewport ? viewport.offsetLeft : 0;
+    const top = viewport ? viewport.offsetTop : 0;
+    const width = viewport ? viewport.width : window.innerWidth;
+    const height = viewport ? viewport.height : window.innerHeight;
+    return { left, top, right: left + width, bottom: top + height };
+  }
+
+  function terminalSelectionOverlayBounds(screen) {
+    return computeSelectionOverlayBounds(
+      terminalPanel.getBoundingClientRect(),
+      screen.getBoundingClientRect(),
+      terminalSelectionViewportRect(),
+      terminalSelectionSafeArea(),
+    );
+  }
+
+  function clampTerminalSelectionDragPoint(clientX, clientY) {
+    const screen = terminalScreenEl();
+    if (!screen) {
+      return { x: clientX, y: clientY };
+    }
+    const rect = screen.getBoundingClientRect();
+    return clampSelectionPoint(
+      { x: clientX, y: clientY },
+      {
+        left: rect.left,
+        top: rect.top,
+        right: Math.max(rect.left, rect.right - 0.5),
+        bottom: Math.max(rect.top, rect.bottom - 0.5),
+      },
+    );
   }
 
   function mouseEventsCaptured() {
@@ -1668,6 +1814,25 @@
     return !!(termSel && (termSel.active || termSel.draggingHandle));
   }
 
+  function scheduleTerminalSelectionUISync(force = false) {
+    terminalSelectionSyncForced = terminalSelectionSyncForced || force;
+    if (terminalSelectionSyncFrameId !== null) {
+      return;
+    }
+    terminalSelectionSyncFrameId = window.requestAnimationFrame(() => {
+      terminalSelectionSyncFrameId = null;
+      const shouldSync =
+        terminalSelectionSyncForced ||
+        isSelectionUIVisible() ||
+        selectionUIBusy() ||
+        (termSel && termSel.doubleTap);
+      terminalSelectionSyncForced = false;
+      if (shouldSync) {
+        updateTerminalSelectionUI();
+      }
+    });
+  }
+
   function clearTerminalSelectionUI() {
     if (termSelHandles) {
       termSelHandles.layer.style.display = "none";
@@ -1691,9 +1856,11 @@
       const handle = document.createElement("div");
       handle.className = `term-select-handle term-select-handle-${side}`;
       handle.dataset.handle = side;
+      const stem = document.createElement("span");
+      stem.className = "term-select-stem";
       const knob = document.createElement("span");
       knob.className = "term-select-knob";
-      handle.appendChild(knob);
+      handle.append(stem, knob);
       attachHandleDrag(handle);
       return handle;
     };
@@ -1712,19 +1879,50 @@
       btn.className = "term-select-chip";
       btn.textContent = label;
       let touchHandledAt = 0;
-      btn.addEventListener("touchstart", (event) => event.stopPropagation(), {
-        passive: true,
-      });
+      let touchStartPoint = null;
+      btn.addEventListener(
+        "touchstart",
+        (event) => {
+          event.stopPropagation();
+          const touch = event.touches[0];
+          touchStartPoint = touch ? { x: touch.clientX, y: touch.clientY, moved: false } : null;
+        },
+        { passive: true },
+      );
+      btn.addEventListener(
+        "touchmove",
+        (event) => {
+          event.stopPropagation();
+          const touch = event.touches[0];
+          if (
+            touch &&
+            touchStartPoint &&
+            Math.hypot(touch.clientX - touchStartPoint.x, touch.clientY - touchStartPoint.y) >
+              TERM_LONGPRESS_SLOP
+          ) {
+            touchStartPoint.moved = true;
+          }
+        },
+        { passive: true },
+      );
       btn.addEventListener(
         "touchend",
         async (event) => {
           event.preventDefault();
           event.stopPropagation();
+          const moved = touchStartPoint && touchStartPoint.moved;
+          touchStartPoint = null;
+          if (moved) {
+            return;
+          }
           touchHandledAt = performance.now();
           await onActivate();
         },
         { passive: false },
       );
+      btn.addEventListener("touchcancel", () => {
+        touchStartPoint = null;
+      });
       btn.addEventListener("click", async (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -1745,6 +1943,9 @@
     });
     const chips = document.createElement("div");
     chips.className = "term-select-chips";
+    ["touchstart", "touchmove", "touchend", "touchcancel"].forEach((type) => {
+      chips.addEventListener(type, (event) => event.stopPropagation(), { passive: true });
+    });
     chips.append(copy, paste);
     layer.append(start, end, chips);
     terminalElement.appendChild(layer);
@@ -1752,8 +1953,9 @@
     return termSelHandles;
   }
 
-  // Reposition the handles + copy chip to the current selection's endpoints.
-  // Endpoints that have scrolled out of the viewport are hidden.
+  // Reposition the handles + action toolbar to the current selection. Endpoint
+  // stems stay on their exact cell boundaries while their touch targets and knobs
+  // are independently kept inside the visible terminal-safe rectangle.
   function updateTerminalSelectionUI() {
     const pos =
       typeof term.getSelectionPosition === "function" ? term.getSelectionPosition() : null;
@@ -1770,43 +1972,94 @@
     const cell = terminalCellSize();
     const screenRect = screen.getBoundingClientRect();
     const hostRect = terminalElement.getBoundingClientRect();
+    const bounds = terminalSelectionOverlayBounds(screen);
+    if (bounds.width <= 0 || bounds.height <= 0) {
+      clearTerminalSelectionUI();
+      return;
+    }
+    handles.layer.style.display = "block";
     const ydisp = term.buffer.active.viewportY;
-    const place = (el, col, absRow) => {
+    const place = (el, col, absRow, side) => {
       const vrow = absRow - ydisp;
       if (vrow < 0 || vrow >= term.rows) {
         el.style.display = "none";
         return null;
       }
-      const left = screenRect.left - hostRect.left + col * cell.width;
-      const top = screenRect.top - hostRect.top + vrow * cell.height;
+      const boundaryX = screenRect.left + clampSelectionValue(col, 0, term.cols) * cell.width;
+      const lineTop = screenRect.top + vrow * cell.height;
+      const lineBottom = lineTop + cell.height;
+      const placement = computeSelectionHandlePlacement(
+        boundaryX,
+        lineTop,
+        lineBottom,
+        bounds,
+        side,
+        TERM_SELECTION_TARGET_SIZE,
+        TERM_SELECTION_KNOB_SIZE,
+      );
       el.style.display = "block";
-      el.style.left = `${left}px`;
-      el.style.top = `${top}px`;
-      el.style.height = `${cell.height}px`;
-      return { left, top, bottom: top + cell.height };
+      el.style.left = `${placement.left - hostRect.left}px`;
+      el.style.top = `${placement.top - hostRect.top}px`;
+      el.style.width = `${placement.width}px`;
+      el.style.height = `${placement.height}px`;
+      el.style.setProperty("--term-select-stem-left", `${placement.stemX - placement.left}px`);
+      el.style.setProperty("--term-select-stem-top", `${placement.stemTop - placement.top}px`);
+      el.style.setProperty("--term-select-stem-height", `${placement.stemHeight}px`);
+      el.style.setProperty("--term-select-knob-left", `${placement.knobLeft - placement.left}px`);
+      el.style.setProperty("--term-select-knob-top", `${placement.knobTop - placement.top}px`);
+      return {
+        left: placement.stemX,
+        right: placement.stemX,
+        top: Math.min(lineTop, placement.knobTop),
+        bottom: Math.max(lineBottom, placement.knobTop + placement.knobHeight),
+      };
     };
-    const startBox = place(handles.start, pos.start.x, pos.start.y);
-    const endBox = place(handles.end, pos.end.x, pos.end.y);
-    // The start knob sits ~30px above the top line and the end knob ~30px below
-    // the bottom line, so the Copy chip has to clear that much to not cover a
-    // handle. Place it above the topmost endpoint; if that clips off the top of
-    // the pane, drop it below the lowest endpoint instead.
-    const KNOB_CLEARANCE = 42;
-    const topBox = startBox && endBox ? (startBox.top <= endBox.top ? startBox : endBox) : startBox || endBox;
-    const bottomBox =
-      startBox && endBox ? (startBox.bottom >= endBox.bottom ? startBox : endBox) : startBox || endBox;
-    if (topBox) {
-      const aboveTop = topBox.top - KNOB_CLEARANCE;
-      const below = aboveTop < 8;
-      handles.chips.classList.toggle("is-below", below);
-      handles.chips.style.left = `${topBox.left}px`;
-      handles.chips.style.top = below
-        ? `${bottomBox.bottom + KNOB_CLEARANCE}px`
-        : `${aboveTop}px`;
-      handles.chips.style.display = "flex";
-    } else {
+    const startBox = place(handles.start, pos.start.x, pos.start.y, "start");
+    const endBox = place(handles.end, pos.end.x, pos.end.y, "end");
+    const visibleBoxes = [startBox, endBox].filter(Boolean);
+    const firstVisibleRow = ydisp;
+    const lastVisibleRow = ydisp + term.rows - 1;
+    const selectionOverlapsViewport = pos.start.y <= lastVisibleRow && pos.end.y >= firstVisibleRow;
+    if (!visibleBoxes.length && !selectionOverlapsViewport) {
       handles.chips.style.display = "none";
+      handles.layer.style.display = "block";
+      return;
     }
+    const multiRow = pos.start.y !== pos.end.y;
+    const selectionRect = visibleBoxes.length
+      ? {
+          left: multiRow ? bounds.left : Math.min(...visibleBoxes.map((box) => box.left)),
+          right: multiRow ? bounds.right : Math.max(...visibleBoxes.map((box) => box.right)),
+          top: clampSelectionValue(
+            Math.min(...visibleBoxes.map((box) => box.top)),
+            bounds.top,
+            bounds.bottom,
+          ),
+          bottom: clampSelectionValue(
+            Math.max(...visibleBoxes.map((box) => box.bottom)),
+            bounds.top,
+            bounds.bottom,
+          ),
+        }
+      : { left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom };
+    handles.chips.style.display = "flex";
+    handles.chips.style.maxWidth = "none";
+    const toolbarRect = handles.chips.getBoundingClientRect();
+    const toolbarSize = {
+      width: Math.max(toolbarRect.width, handles.chips.scrollWidth),
+      height: toolbarRect.height,
+    };
+    const toolbarPlacement = computeSelectionToolbarPlacement(
+      selectionRect,
+      toolbarSize,
+      bounds,
+      TERM_SELECTION_TOOLBAR_GAP,
+    );
+    handles.chips.classList.toggle("is-below", toolbarPlacement.side === "below");
+    handles.chips.style.left = `${toolbarPlacement.left - hostRect.left}px`;
+    handles.chips.style.top = `${toolbarPlacement.top - hostRect.top}px`;
+    handles.chips.style.maxWidth = `${toolbarPlacement.maxWidth}px`;
+    handles.chips.dataset.overflowX = toolbarPlacement.overflowX ? "true" : "false";
     handles.layer.style.display = "block";
   }
 
@@ -1875,9 +2128,10 @@
         }
         termSel = { draggingHandle: handle.dataset.handle, anchor };
         const touch = event.touches[0];
+        const point = clampTerminalSelectionDragPoint(touch.clientX, touch.clientY);
         dispatchTerminalMouse("mousedown", anchor.clientX, anchor.clientY, 1);
-        dispatchTerminalMouse("mousemove", touch.clientX, touch.clientY, 1);
-        updateTerminalSelectionUI();
+        dispatchTerminalMouse("mousemove", point.x, point.y, 1);
+        scheduleTerminalSelectionUISync();
       },
       { passive: false },
     );
@@ -1890,8 +2144,9 @@
         event.preventDefault();
         event.stopPropagation();
         const touch = event.touches[0];
-        dispatchTerminalMouse("mousemove", touch.clientX, touch.clientY, 1);
-        updateTerminalSelectionUI();
+        const point = clampTerminalSelectionDragPoint(touch.clientX, touch.clientY);
+        dispatchTerminalMouse("mousemove", point.x, point.y, 1);
+        scheduleTerminalSelectionUISync();
       },
       { passive: false },
     );
@@ -1903,9 +2158,10 @@
       const touch = event.changedTouches && event.changedTouches[0];
       const clientX = touch ? touch.clientX : termSel.anchor.clientX;
       const clientY = touch ? touch.clientY : termSel.anchor.clientY;
-      dispatchTerminalMouse("mouseup", clientX, clientY, 1);
+      const point = clampTerminalSelectionDragPoint(clientX, clientY);
+      dispatchTerminalMouse("mouseup", point.x, point.y, 1);
       termSel = null;
-      updateTerminalSelectionUI();
+      scheduleTerminalSelectionUISync();
     };
     handle.addEventListener("touchend", finishHandleDrag, { passive: false });
     handle.addEventListener("touchcancel", finishHandleDrag, { passive: false });
@@ -1956,7 +2212,7 @@
     }
     suppressNextTerminalClick = true;
     hapticPulse();
-    updateTerminalSelectionUI();
+    scheduleTerminalSelectionUISync(true);
     return true;
   }
 
@@ -1999,9 +2255,10 @@
       window.clearTimeout(termSel.timer);
     }
     if (termSel.active) {
-      dispatchTerminalMouse("mouseup", termSel.lastX, termSel.lastY, 1);
+      const point = clampTerminalSelectionDragPoint(termSel.lastX, termSel.lastY);
+      dispatchTerminalMouse("mouseup", point.x, point.y, 1);
       suppressNextTerminalClick = true;
-      updateTerminalSelectionUI();
+      scheduleTerminalSelectionUISync(true);
     }
     termSel = null;
   }
@@ -3505,6 +3762,7 @@
       positionSettingsMenu();
       positionAuxMenu();
       positionBtopTargetMenu();
+      scheduleTerminalSelectionUISync();
     }, 40);
   }
 
@@ -3522,6 +3780,7 @@
     positionSettingsMenu();
     positionAuxMenu();
     positionBtopTargetMenu();
+    scheduleTerminalSelectionUISync();
   }
 
   function refreshFollowOutput() {
@@ -3616,6 +3875,7 @@
       if (term.rows > 0) {
         term.refresh(0, term.rows - 1);
       }
+      scheduleTerminalSelectionUISync();
     });
   }
 
@@ -4055,17 +4315,18 @@
     // re-renders, and tear the UI down if the selection is cleared elsewhere.
     term.onRender(() => {
       if (isSelectionUIVisible()) {
-        updateTerminalSelectionUI();
+        scheduleTerminalSelectionUISync();
       }
     });
     term.onSelectionChange(() => {
       if (selectionUIBusy()) {
+        scheduleTerminalSelectionUISync();
         return;
       }
       if (!terminalSelectionText()) {
         clearTerminalSelectionUI();
       } else if (isSelectionUIVisible()) {
-        updateTerminalSelectionUI();
+        scheduleTerminalSelectionUISync();
       }
     });
 
@@ -4193,10 +4454,12 @@
           const touch = event.touches[0];
           if (termSel.active) {
             // Long-press engaged: drag extends the selection, never scrolls.
-            termSel.lastX = touch.clientX;
-            termSel.lastY = touch.clientY;
+            const point = clampTerminalSelectionDragPoint(touch.clientX, touch.clientY);
+            termSel.lastX = point.x;
+            termSel.lastY = point.y;
             event.preventDefault();
-            dispatchTerminalMouse("mousemove", touch.clientX, touch.clientY, 1);
+            dispatchTerminalMouse("mousemove", point.x, point.y, 1);
+            scheduleTerminalSelectionUISync();
             return;
           }
           if (
@@ -4615,6 +4878,7 @@
     const preserveTerminalCols = lastLayoutViewportWidth > 0 && Math.abs(viewportWidth - lastLayoutViewportWidth) < 1;
     lastLayoutViewportWidth = viewportWidth;
     scheduleLayoutRefresh({ preserveTerminalCols });
+    scheduleTerminalSelectionUISync();
   }
 
   function renderTabs() {
@@ -8581,11 +8845,13 @@
 
   term.onScroll(() => {
     refreshFollowOutput();
+    scheduleTerminalSelectionUISync();
   });
 
   const layoutObserver = new ResizeObserver(() => {
     measureShortcutHeight();
     fitTerminal({ preserveCols: true });
+    scheduleTerminalSelectionUISync();
   });
   layoutObserver.observe(shortcutsPanel);
   layoutObserver.observe(composerPanel);
