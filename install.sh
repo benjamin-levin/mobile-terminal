@@ -15,6 +15,7 @@ TAILSCALE_VALUE=""
 NO_TOKEN_VALUE=""
 ALLOW_CLIENTS_VALUE=""
 SERVICE_MODE="auto"
+PROVIDER_HOOKS_MODE="auto"
 
 usage() {
   cat <<'EOF'
@@ -31,6 +32,8 @@ Options:
   --allow-clients <list>     Comma-separated MOBILE_TERMINAL_ALLOW_CLIENTS value
   --service auto|systemd|launchd|none
                              Choose how to install the long-running service
+  --provider-hooks auto|off|required
+                             Install provider lifecycle hooks (default: auto)
   --help                     Show this help
 EOF
 }
@@ -73,6 +76,15 @@ while [[ $# -gt 0 ]]; do
       SERVICE_MODE="$2"
       shift 2
       ;;
+    --provider-hooks)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for --provider-hooks" >&2
+        usage >&2
+        exit 1
+      fi
+      PROVIDER_HOOKS_MODE="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -84,6 +96,16 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "$PROVIDER_HOOKS_MODE" in
+  auto|off|required)
+    ;;
+  *)
+    echo "Invalid --provider-hooks mode: $PROVIDER_HOOKS_MODE" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
 
 log() {
   printf '[install] %s\n' "$*"
@@ -243,6 +265,26 @@ ensure_python_env() {
   fi
 }
 
+install_provider_hooks() {
+  case "$PROVIDER_HOOKS_MODE" in
+    off)
+      log "Skipping provider lifecycle hooks (--provider-hooks off)"
+      ;;
+    required)
+      log "Installing provider lifecycle hooks"
+      "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/install_provider_hooks.py"
+      ;;
+    auto)
+      log "Installing provider lifecycle hooks"
+      if "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/install_provider_hooks.py"; then
+        log "Provider lifecycle hooks installed"
+      else
+        log "Provider lifecycle hook installation failed; continuing (--provider-hooks auto)"
+      fi
+      ;;
+  esac
+}
+
 write_env_file() {
   if [[ -f "$ENV_FILE" ]]; then
     chmod 600 "$ENV_FILE"
@@ -389,6 +431,7 @@ main() {
   ensure_runtime_dependencies
   ensure_node_modules
   ensure_python_env
+  install_provider_hooks
   write_env_file
   install_service
   log "Install complete"
