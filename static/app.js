@@ -1557,10 +1557,16 @@
   const TERM_SELECTION_TARGET_SIZE = 44;
   const TERM_SELECTION_KNOB_SIZE = 16;
   const TERM_SELECTION_TOOLBAR_GAP = 8;
+  const TERM_SELECTION_MAGNIFIER_WIDTH = 112;
+  const TERM_SELECTION_MAGNIFIER_HEIGHT = 72;
+  const TERM_SELECTION_MAGNIFIER_OFFSET = 72;
+  const TERM_SELECTION_MAGNIFIER_ZOOM = 1.8;
   let termSel = null; // in-flight press/drag session, or null
-  let termSelHandles = null; // lazily-created { layer, start, end, copy } DOM
+  let termSelHandles = null; // lazily-created selection overlay DOM
   let terminalSelectionSyncFrameId = null;
   let terminalSelectionSyncForced = false;
+  let selectionDragFeedback = null;
+  let selectionDragFeedbackGeneration = 0;
   let suppressNextTerminalClick = false;
   let suppressComposerOpenThisTouch = false; // set when a tap only dismisses a selection
   let selectionTapCopy = null; // {x,y} when a touch landed inside the live selection
@@ -1660,6 +1666,126 @@
       side,
       maxWidth: availableWidth,
       overflowX: toolbarSize.width > availableWidth,
+    };
+  }
+
+  function createSelectionDragMotionState(point, timestamp) {
+    return {
+      point: { x: point.x, y: point.y },
+      rawPoint: { x: point.x, y: point.y },
+      sampledAt: timestamp,
+      rawSampledAt: timestamp,
+      speed: 0,
+      instantaneousSpeed: 0,
+      cumulativeMovement: 0,
+      lowSpeedSince: null,
+      lastMeaningfulAt: null,
+      hasMeaningfulMovement: false,
+    };
+  }
+
+  function sampleSelectionDragMotion(state, point, timestamp, options = {}) {
+    const meaningfulDistance = options.meaningfulDistance ?? 4;
+    const jitterDistance = options.jitterDistance ?? 0.5;
+    const blend = options.blend ?? 0.35;
+    const now = Math.max(state.rawSampledAt, timestamp);
+    const distance = Math.hypot(point.x - state.rawPoint.x, point.y - state.rawPoint.y);
+    if (distance <= jitterDistance) {
+      return {
+        ...state,
+        rawPoint: { x: point.x, y: point.y },
+        rawSampledAt: now,
+      };
+    }
+    const elapsed = Math.max(1, now - state.rawSampledAt);
+    const instantaneousSpeed = distance / elapsed;
+    const speed = state.speed * (1 - blend) + instantaneousSpeed * blend;
+    const cumulativeMovement = state.cumulativeMovement + distance;
+    const hasMeaningfulMovement =
+      state.hasMeaningfulMovement || cumulativeMovement >= meaningfulDistance;
+    const showSpeed = options.showSpeed ?? 0.18;
+    const continuouslySlow = instantaneousSpeed <= showSpeed && speed <= showSpeed;
+    return {
+      point: { x: point.x, y: point.y },
+      rawPoint: { x: point.x, y: point.y },
+      sampledAt: now,
+      rawSampledAt: now,
+      speed,
+      instantaneousSpeed,
+      cumulativeMovement,
+      lowSpeedSince: hasMeaningfulMovement && continuouslySlow
+        ? state.lowSpeedSince ?? now
+        : null,
+      lastMeaningfulAt: hasMeaningfulMovement ? now : null,
+      hasMeaningfulMovement,
+    };
+  }
+
+  function decideSelectionMagnifierVisibility(state, timestamp, visible, options = {}) {
+    const now = Math.max(state.sampledAt, timestamp);
+    const dwell = options.dwell ?? 100;
+    const hideSpeed = options.hideSpeed ?? 0.45;
+    const fastSample =
+      now === state.sampledAt &&
+      (state.instantaneousSpeed >= hideSpeed || state.speed >= hideSpeed);
+    if (fastSample) {
+      return false;
+    }
+    if (visible) {
+      return true;
+    }
+    const slowDwell =
+      state.hasMeaningfulMovement &&
+      state.lowSpeedSince !== null &&
+      now - state.lowSpeedSince >= dwell;
+    const pauseDwell =
+      state.hasMeaningfulMovement &&
+      state.lastMeaningfulAt !== null &&
+      now - state.lastMeaningfulAt >= dwell;
+    return slowDwell || pauseDwell;
+  }
+
+  function selectionMagnifierDwellDeadline(state, timestamp, options = {}) {
+    const now = Math.max(state.sampledAt, timestamp);
+    const dwell = options.dwell ?? 100;
+    const deadlines = [];
+    if (state.hasMeaningfulMovement && state.lowSpeedSince !== null) {
+      deadlines.push(state.lowSpeedSince + dwell);
+    }
+    if (state.hasMeaningfulMovement && state.lastMeaningfulAt !== null) {
+      deadlines.push(state.lastMeaningfulAt + dwell);
+    }
+    const pending = deadlines.filter((deadline) => deadline > now);
+    return pending.length ? Math.min(...pending) : null;
+  }
+
+  function computeSelectionMagnifierPlacement(point, size, bounds, offset) {
+    const width = Math.min(size.width, bounds.width);
+    const height = Math.min(size.height, bounds.height);
+    const left = clampSelectionValue(
+      point.x - width / 2,
+      bounds.left,
+      bounds.right - width,
+    );
+    const aboveTop = point.y - offset - height / 2;
+    const belowTop = point.y + offset - height / 2;
+    const fitsAbove = aboveTop >= bounds.top;
+    const fitsBelow = belowTop + height <= bounds.bottom;
+    const aboveSpace = point.y - bounds.top;
+    const belowSpace = bounds.bottom - point.y;
+    const side = fitsAbove || (!fitsBelow && aboveSpace >= belowSpace) ? "above" : "below";
+    const preferredTop = side === "above" ? aboveTop : belowTop;
+    const top = clampSelectionValue(preferredTop, bounds.top, bounds.bottom - height);
+    return { left, top, width, height, side };
+  }
+
+  function computeSelectionMagnifierTransform(point, sourceRect, lensSize, zoom) {
+    const sourceX = clampSelectionValue(point.x, sourceRect.left, sourceRect.right) - sourceRect.left;
+    const sourceY = clampSelectionValue(point.y, sourceRect.top, sourceRect.bottom) - sourceRect.top;
+    return {
+      translateX: lensSize.width / 2 - sourceX * zoom,
+      translateY: lensSize.height / 2 - sourceY * zoom,
+      scale: zoom,
     };
   }
 
@@ -1806,6 +1932,235 @@
     });
   }
 
+  function hideSelectionMagnifier(clearSnapshot = false) {
+    if (!termSelHandles) {
+      return;
+    }
+    termSelHandles.magnifier.classList.remove("is-visible");
+    if (clearSnapshot) {
+      termSelHandles.magnifierContent.replaceChildren();
+    }
+  }
+
+  function refreshSelectionMagnifierSnapshot() {
+    const rows = terminalElement.querySelector(".xterm-rows");
+    if (!rows || !termSelHandles) {
+      hideSelectionMagnifier();
+      return false;
+    }
+    const clone = rows.cloneNode(true);
+    clone.querySelectorAll(".xterm-cursor").forEach((element) => {
+      for (const className of Array.from(element.classList)) {
+        if (className.startsWith("xterm-cursor")) {
+          element.classList.remove(className);
+        }
+      }
+      for (const attribute of Array.from(element.attributes)) {
+        if (attribute.name.includes("cursor")) {
+          element.removeAttribute(attribute.name);
+        }
+      }
+    });
+    clone.querySelectorAll(
+      "textarea, input, button, select, a, [href], [contenteditable], [tabindex], " +
+        "[onclick], [onmousedown], [onpointerdown], [role='button'], [role='link'], " +
+        ".xterm-helper-textarea, .xterm-selection, .xterm-selection-layer, " +
+        ".term-select-layer",
+    ).forEach((element) => element.remove());
+    if (clone.hasAttribute("id")) {
+      clone.removeAttribute("id");
+    }
+    clone.querySelectorAll("[id]").forEach((element) => element.removeAttribute("id"));
+    clone.setAttribute("aria-hidden", "true");
+
+    const owner = rows.closest(".xterm");
+    const rendererContext = document.createElement("div");
+    rendererContext.className = owner?.className || "xterm";
+    rendererContext.classList.add("term-select-magnifier-renderer-context");
+    const screenContext = document.createElement("div");
+    screenContext.className = rows.parentElement?.className || "xterm-screen";
+    screenContext.appendChild(clone);
+    rendererContext.appendChild(screenContext);
+    termSelHandles.magnifierContent.replaceChildren(rendererContext);
+    selectionDragFeedback.snapshotDirty = false;
+    return true;
+  }
+
+  function renderSelectionDragFeedbackFrame(generation) {
+    if (!selectionDragFeedback || selectionDragFeedback.generation !== generation) {
+      return;
+    }
+    selectionDragFeedback.frameId = null;
+    if (!selectionDragFeedback.visible) {
+      hideSelectionMagnifier();
+      return;
+    }
+    if (!terminalSelectionText()) {
+      clearTerminalSelectionUI();
+      return;
+    }
+    const screen = terminalScreenEl();
+    const rows = terminalElement.querySelector(".xterm-rows");
+    if (!screen || !rows) {
+      hideSelectionMagnifier();
+      return;
+    }
+    const handles = ensureSelectionHandles();
+    if (selectionDragFeedback.snapshotDirty && !refreshSelectionMagnifierSnapshot()) {
+      return;
+    }
+    const bounds = terminalSelectionOverlayBounds(screen);
+    if (bounds.width <= 0 || bounds.height <= 0) {
+      hideSelectionMagnifier();
+      return;
+    }
+    const placement = computeSelectionMagnifierPlacement(
+      selectionDragFeedback.point,
+      { width: TERM_SELECTION_MAGNIFIER_WIDTH, height: TERM_SELECTION_MAGNIFIER_HEIGHT },
+      bounds,
+      TERM_SELECTION_MAGNIFIER_OFFSET,
+    );
+    const sourceRect = rows.getBoundingClientRect();
+    if (sourceRect.width <= 0 || sourceRect.height <= 0) {
+      hideSelectionMagnifier();
+      return;
+    }
+    const transform = computeSelectionMagnifierTransform(
+      selectionDragFeedback.point,
+      sourceRect,
+      placement,
+      TERM_SELECTION_MAGNIFIER_ZOOM,
+    );
+    const hostRect = terminalElement.getBoundingClientRect();
+    handles.magnifier.style.left = `${placement.left - hostRect.left}px`;
+    handles.magnifier.style.top = `${placement.top - hostRect.top}px`;
+    handles.magnifier.style.width = `${placement.width}px`;
+    handles.magnifier.style.height = `${placement.height}px`;
+    handles.magnifier.dataset.side = placement.side;
+    handles.magnifierContent.style.width = `${sourceRect.width}px`;
+    handles.magnifierContent.style.height = `${sourceRect.height}px`;
+    handles.magnifierContent.style.transform =
+      `translate3d(${transform.translateX}px, ${transform.translateY}px, 0) scale(${transform.scale})`;
+    handles.magnifier.classList.add("is-visible");
+  }
+
+  function scheduleSelectionDragFeedbackFrame() {
+    if (
+      !selectionDragFeedback ||
+      !selectionDragFeedback.visible ||
+      selectionDragFeedback.frameId !== null
+    ) {
+      return;
+    }
+    const generation = selectionDragFeedback.generation;
+    selectionDragFeedback.frameId = window.requestAnimationFrame(() => {
+      renderSelectionDragFeedbackFrame(generation);
+    });
+  }
+
+  function scheduleSelectionDragFeedbackDwell(timestamp) {
+    if (!selectionDragFeedback) {
+      return;
+    }
+    if (selectionDragFeedback.timerId !== null) {
+      window.clearTimeout(selectionDragFeedback.timerId);
+      selectionDragFeedback.timerId = null;
+    }
+    if (selectionDragFeedback.visible) {
+      return;
+    }
+    const deadline = selectionMagnifierDwellDeadline(
+      selectionDragFeedback.motion,
+      timestamp,
+    );
+    if (deadline === null) {
+      return;
+    }
+    const generation = selectionDragFeedback.generation;
+    selectionDragFeedback.timerId = window.setTimeout(() => {
+      if (!selectionDragFeedback || selectionDragFeedback.generation !== generation) {
+        return;
+      }
+      selectionDragFeedback.timerId = null;
+      applySelectionDragFeedbackDecision(performance.now(), generation);
+    }, Math.max(0, deadline - timestamp));
+  }
+
+  function applySelectionDragFeedbackDecision(timestamp, generation) {
+    if (!selectionDragFeedback || selectionDragFeedback.generation !== generation) {
+      return;
+    }
+    const visible = decideSelectionMagnifierVisibility(
+      selectionDragFeedback.motion,
+      timestamp,
+      selectionDragFeedback.visible,
+    );
+    selectionDragFeedback.visible = visible;
+    if (visible) {
+      scheduleSelectionDragFeedbackFrame();
+    } else {
+      hideSelectionMagnifier();
+    }
+    scheduleSelectionDragFeedbackDwell(timestamp);
+  }
+
+  function beginSelectionDragFeedback(point) {
+    endSelectionDragFeedback();
+    if (!point) {
+      return;
+    }
+    const timestamp = performance.now();
+    const motion = createSelectionDragMotionState(point, timestamp);
+    selectionDragFeedback = {
+      generation: selectionDragFeedbackGeneration,
+      point: motion.point,
+      motion,
+      visible: false,
+      snapshotDirty: true,
+      frameId: null,
+      timerId: null,
+    };
+    ensureSelectionHandles();
+    scheduleSelectionDragFeedbackDwell(timestamp);
+  }
+
+  function updateSelectionDragFeedback(point) {
+    if (!selectionDragFeedback || !point) {
+      return;
+    }
+    const timestamp = performance.now();
+    selectionDragFeedback.motion = sampleSelectionDragMotion(
+      selectionDragFeedback.motion,
+      point,
+      timestamp,
+    );
+    selectionDragFeedback.point = selectionDragFeedback.motion.point;
+    selectionDragFeedback.snapshotDirty = true;
+    applySelectionDragFeedbackDecision(timestamp, selectionDragFeedback.generation);
+  }
+
+  function endSelectionDragFeedback() {
+    selectionDragFeedbackGeneration += 1;
+    if (selectionDragFeedback) {
+      if (selectionDragFeedback.timerId !== null) {
+        window.clearTimeout(selectionDragFeedback.timerId);
+      }
+      if (selectionDragFeedback.frameId !== null) {
+        window.cancelAnimationFrame(selectionDragFeedback.frameId);
+      }
+    }
+    selectionDragFeedback = null;
+    hideSelectionMagnifier(true);
+  }
+
+  function markSelectionDragFeedbackDirty() {
+    if (!selectionDragFeedback) {
+      return;
+    }
+    selectionDragFeedback.snapshotDirty = true;
+    scheduleSelectionDragFeedbackFrame();
+  }
+
   function isSelectionUIVisible() {
     return !!(termSelHandles && termSelHandles.layer.style.display !== "none");
   }
@@ -1816,6 +2171,7 @@
 
   function scheduleTerminalSelectionUISync(force = false) {
     terminalSelectionSyncForced = terminalSelectionSyncForced || force;
+    markSelectionDragFeedbackDirty();
     if (terminalSelectionSyncFrameId !== null) {
       return;
     }
@@ -1834,6 +2190,7 @@
   }
 
   function clearTerminalSelectionUI() {
+    endSelectionDragFeedback();
     if (termSelHandles) {
       termSelHandles.layer.style.display = "none";
     }
@@ -1947,9 +2304,27 @@
       chips.addEventListener(type, (event) => event.stopPropagation(), { passive: true });
     });
     chips.append(copy, paste);
-    layer.append(start, end, chips);
+    const magnifier = document.createElement("div");
+    magnifier.className = "term-select-magnifier";
+    magnifier.setAttribute("aria-hidden", "true");
+    const magnifierViewport = document.createElement("div");
+    magnifierViewport.className = "term-select-magnifier-viewport";
+    const magnifierContent = document.createElement("div");
+    magnifierContent.className = "term-select-magnifier-content";
+    magnifierViewport.appendChild(magnifierContent);
+    magnifier.appendChild(magnifierViewport);
+    layer.append(start, end, chips, magnifier);
     terminalElement.appendChild(layer);
-    termSelHandles = { layer, start, end, copy, paste, chips };
+    termSelHandles = {
+      layer,
+      start,
+      end,
+      copy,
+      paste,
+      chips,
+      magnifier,
+      magnifierContent,
+    };
     return termSelHandles;
   }
 
@@ -2131,6 +2506,7 @@
         const point = clampTerminalSelectionDragPoint(touch.clientX, touch.clientY);
         dispatchTerminalMouse("mousedown", anchor.clientX, anchor.clientY, 1);
         dispatchTerminalMouse("mousemove", point.x, point.y, 1);
+        beginSelectionDragFeedback(point);
         scheduleTerminalSelectionUISync();
       },
       { passive: false },
@@ -2146,6 +2522,7 @@
         const touch = event.touches[0];
         const point = clampTerminalSelectionDragPoint(touch.clientX, touch.clientY);
         dispatchTerminalMouse("mousemove", point.x, point.y, 1);
+        updateSelectionDragFeedback(point);
         scheduleTerminalSelectionUISync();
       },
       { passive: false },
@@ -2160,6 +2537,7 @@
       const clientY = touch ? touch.clientY : termSel.anchor.clientY;
       const point = clampTerminalSelectionDragPoint(clientX, clientY);
       dispatchTerminalMouse("mouseup", point.x, point.y, 1);
+      endSelectionDragFeedback();
       termSel = null;
       scheduleTerminalSelectionUISync();
     };
@@ -2245,6 +2623,7 @@
     // Word-select under the finger as the anchor, keeping the drag "down" so a
     // continued move extends the selection.
     dispatchTerminalMouse("mousedown", termSel.startX, termSel.startY, 2);
+    beginSelectionDragFeedback({ x: termSel.startX, y: termSel.startY });
   }
 
   function finishTerminalSelectionPress() {
@@ -2257,6 +2636,7 @@
     if (termSel.active) {
       const point = clampTerminalSelectionDragPoint(termSel.lastX, termSel.lastY);
       dispatchTerminalMouse("mouseup", point.x, point.y, 1);
+      endSelectionDragFeedback();
       suppressNextTerminalClick = true;
       scheduleTerminalSelectionUISync(true);
     }
@@ -2268,6 +2648,7 @@
       if (termSel.timer) {
         window.clearTimeout(termSel.timer);
       }
+      endSelectionDragFeedback();
       termSel = null;
     }
   }
@@ -4459,6 +4840,7 @@
             termSel.lastY = point.y;
             event.preventDefault();
             dispatchTerminalMouse("mousemove", point.x, point.y, 1);
+            updateSelectionDragFeedback(point);
             scheduleTerminalSelectionUISync();
             return;
           }
@@ -4968,6 +5350,7 @@
     closeProfileMenu();
     closeSessionMenu();
     closeTabMenu();
+    clearTerminalSelectionUI();
     resetComposerTracking(true);
     term.reset();
     applyActiveProfile();
@@ -6565,6 +6948,7 @@
       return;
     }
     if (payload.type === "ready") {
+      clearTerminalSelectionUI();
       const readyIsHidden = document.visibilityState === "hidden";
       applyTerminalReadyVisibility(readyIsHidden);
       if (Array.isArray(payload.profiles) || payload.activeProfile) {
@@ -7194,6 +7578,7 @@
     // Remember the tab we're leaving so the selection "To tab" chip can target
     // the most recent *other* tab.
     previousSessionName = selectedSessionName || activeSessionName;
+    clearTerminalSelectionUI();
     addOpenTab(sessionName);
     activeTabKey = terminalTabKey(sessionName);
     selectedSessionName = sessionName;
