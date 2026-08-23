@@ -1433,11 +1433,123 @@
     });
   }
 
+  function staleVisualContinuationText(buffer, previousLine, line, cols, previousText, endColumn) {
+    if (
+      buffer.type !== "alternate" ||
+      line.isWrapped ||
+      previousLine.length <= cols ||
+      line.length <= cols ||
+      !previousText.trim()
+    ) {
+      return null;
+    }
+
+    const hiddenText = previousLine.translateToString(true, cols, previousLine.length);
+    const visibleText = line.translateToString(true, 0, cols);
+    if (!/^[\x20-\x7e\t]*$/.test(hiddenText) || !/^[\x20-\x7e\t]*$/.test(visibleText)) {
+      return null;
+    }
+    const hiddenContentStart = hiddenText.search(/[^ \t]/);
+    const visibleContentStart = visibleText.search(/[^ \t]/);
+    if (hiddenContentStart < 0 || visibleContentStart < 0) {
+      return null;
+    }
+    const hiddenContent = hiddenText.slice(hiddenContentStart).replace(/[ \t]+$/, "");
+    const visibleContent = visibleText.slice(visibleContentStart).replace(/[ \t]+$/, "");
+    if (hiddenContent.length < 2 || visibleContent.length < 2) {
+      return null;
+    }
+
+    let visibleMatchStart = visibleContentStart;
+    if (hiddenContent.startsWith(visibleContent)) {
+      visibleMatchStart = visibleContentStart;
+    } else if (visibleContent.endsWith(hiddenContent)) {
+      visibleMatchStart += visibleContent.length - hiddenContent.length;
+    } else {
+      return null;
+    }
+
+    const hiddenVisualStart = visibleMatchStart - hiddenContentStart;
+    const hiddenSelectionStart = Math.max(0, -hiddenVisualStart);
+    const hiddenSelectionEnd = Math.min(hiddenText.length, endColumn - hiddenVisualStart);
+    if (hiddenSelectionEnd <= hiddenSelectionStart) {
+      return "";
+    }
+    return hiddenText.slice(hiddenSelectionStart, hiddenSelectionEnd);
+  }
+
+  function extractTerminalSelectionText(buffer, cols, selection) {
+    if (
+      !buffer ||
+      !Number.isInteger(cols) ||
+      cols <= 0 ||
+      !selection?.start ||
+      !selection?.end ||
+      selection.start.y > selection.end.y
+    ) {
+      return null;
+    }
+
+    let text = "";
+    let previousLine = null;
+    let previousLineText = "";
+    for (let row = selection.start.y; row <= selection.end.y; row += 1) {
+      const line = buffer.getLine(row);
+      if (!line || typeof line.translateToString !== "function") {
+        return null;
+      }
+      const startColumn = Math.max(0, Math.min(cols, row === selection.start.y ? selection.start.x : 0));
+      const endColumn = Math.max(0, Math.min(cols, row === selection.end.y ? selection.end.x : cols));
+      const lineText = line.translateToString(true, startColumn, Math.min(endColumn, line.length));
+
+      if (row === selection.start.y) {
+        text = lineText;
+      } else if (line.isWrapped) {
+        text += lineText;
+      } else {
+        const staleContinuation = staleVisualContinuationText(
+          buffer,
+          previousLine,
+          line,
+          cols,
+          previousLineText,
+          endColumn,
+        );
+        if (staleContinuation !== null) {
+          // Alternate-screen rows do not reflow when xterm shrinks. tmux redraws
+          // a visual continuation with cursor moves, so isWrapped can be false.
+          // Reuse the matching hidden suffix because it is the only canonical
+          // source for boundary whitespace. ASCII-only alignment avoids guessing
+          // at multi-column character boundaries; a coincidental match remains
+          // fundamentally indistinguishable.
+          text += staleContinuation;
+        } else {
+          text += `\n${lineText}`;
+        }
+      }
+      previousLine = line;
+      previousLineText = lineText;
+    }
+    return text.replaceAll(String.fromCharCode(160), " ");
+  }
+
   function terminalSelectionText() {
     if (typeof term.getSelection !== "function") {
       return "";
     }
-    return term.getSelection();
+    if (
+      typeof term.getSelectionPosition !== "function" ||
+      !term.buffer?.active ||
+      !Number.isInteger(term.cols)
+    ) {
+      return term.getSelection();
+    }
+    const selection = term.getSelectionPosition();
+    if (!selection) {
+      return "";
+    }
+    const extracted = extractTerminalSelectionText(term.buffer.active, term.cols, selection);
+    return extracted === null ? term.getSelection() : extracted;
   }
 
   function copyTextWithFallback(text) {

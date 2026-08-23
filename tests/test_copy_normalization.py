@@ -55,6 +55,121 @@ assert.equal(normalizeTerminalCopyText("crlf\r\nlone-cr\rfinal\r\n"),
 ''',
         )
 
+    def test_buffer_selection_preserves_wraps_hard_lines_and_whitespace(self):
+        self.run_node(
+            [
+                "staleVisualContinuationText",
+                "extractTerminalSelectionText",
+            ],
+            r'''
+function makeLine(text, { length = text.length, isWrapped = false } = {}) {
+  const cells = Array.from(text);
+  while (cells.length < length) cells.push(null);
+  return {
+    isWrapped,
+    length,
+    translateToString(trimRight = false, start = 0, end = length) {
+      const selected = cells.slice(start, Math.min(end, length));
+      if (trimRight) {
+        while (selected.length && selected[selected.length - 1] === null) selected.pop();
+      }
+      return selected.map((cell) => cell === null ? " " : cell).join("");
+    },
+  };
+}
+function makeBuffer(lines, type = "normal") {
+  return { type, getLine(row) { return lines[row]; } };
+}
+function extract(lines, cols, start, end, type = "normal") {
+  return extractTerminalSelectionText(makeBuffer(lines, type), cols, { start, end });
+}
+
+assert.equal(extract([
+  makeLine("soft "),
+  makeLine("wrap", { length: 5, isWrapped: true }),
+], 5, { x: 0, y: 0 }, { x: 4, y: 1 }), "soft wrap");
+
+assert.equal(extract([
+  makeLine("12345"),
+  makeLine("abcde"),
+], 5, { x: 0, y: 0 }, { x: 5, y: 1 }), "12345\nabcde");
+
+assert.equal(extract([
+  makeLine("first  ", { length: 12 }),
+  makeLine("", { length: 12 }),
+  makeLine("  indented", { length: 12 }),
+  makeLine("last\t value", { length: 12 }),
+], 12, { x: 0, y: 0 }, { x: 11, y: 3 }), "first  \n\n  indented\nlast\t value");
+
+assert.equal(extract([
+  makeLine(" \t edge  ", { length: 10 }),
+], 10, { x: 0, y: 0 }, { x: 9, y: 0 }), " \t edge  ");
+''',
+        )
+
+    def test_stale_alternate_rows_are_clipped_and_visual_continuations_are_narrowly_joined(self):
+        self.run_node(
+            [
+                "staleVisualContinuationText",
+                "extractTerminalSelectionText",
+            ],
+            r'''
+function makeLine(text, { length = text.length, isWrapped = false } = {}) {
+  const cells = Array.from(text);
+  while (cells.length < length) cells.push(null);
+  return {
+    isWrapped,
+    length,
+    translateToString(trimRight = false, start = 0, end = length) {
+      const selected = cells.slice(start, Math.min(end, length));
+      if (trimRight) {
+        while (selected.length && selected[selected.length - 1] === null) selected.pop();
+      }
+      return selected.map((cell) => cell === null ? " " : cell).join("");
+    },
+  };
+}
+function extract(lines, cols, start, end, type = "alternate") {
+  const buffer = { type, getLine(row) { return lines[row]; } };
+  return extractTerminalSelectionText(buffer, cols, { start, end });
+}
+
+assert.equal(extract([
+  makeLine("helloSECRET"),
+], 5, { x: 0, y: 0 }, { x: 5, y: 0 }), "hello");
+assert.equal(extract([
+  makeLine("helloSECRET"),
+], 5, { x: 1, y: 0 }, { x: 4, y: 0 }), "ell");
+
+const visualRows = [
+  makeLine("Tabbed line", { length: 11 }),
+  makeLine("  line", { length: 11 }),
+];
+assert.equal(extract(visualRows, 6, { x: 0, y: 0 }, { x: 6, y: 1 }), "Tabbed line");
+assert.equal(extract(visualRows, 6, { x: 2, y: 0 }, { x: 4, y: 1 }), "bbed li");
+assert.equal(extract(visualRows, 6, { x: 0, y: 0 }, { x: 2, y: 1 }), "Tabbed ");
+
+const twoSpaceRows = [
+  makeLine("Tabbed  line", { length: 12 }),
+  makeLine("  line", { length: 12 }),
+];
+assert.equal(extract(twoSpaceRows, 6, { x: 0, y: 0 }, { x: 6, y: 1 }), "Tabbed  line");
+assert.equal(extract(twoSpaceRows, 6, { x: 0, y: 0 }, { x: 3, y: 1 }), "Tabbed  l");
+
+assert.equal(extract([
+  makeLine("123456"),
+  makeLine("abcdef"),
+], 6, { x: 0, y: 0 }, { x: 6, y: 1 }), "123456\nabcdef");
+
+assert.equal(extract([
+  makeLine("alpha OTHER", { length: 11 }),
+  makeLine("  beta", { length: 11 }),
+], 6, { x: 0, y: 0 }, { x: 6, y: 1 }), "alpha \n  beta");
+assert.equal(extract(visualRows, 6, { x: 0, y: 0 }, { x: 6, y: 1 }, "normal"),
+  "Tabbed\n  line");
+''',
+        )
+
     def test_direct_pty_normalization_preserves_legacy_one_line_policy(self):
         self.run_node(
             ["normalizeTerminalCopyText", "normalizeDirectPtyPasteText"],
@@ -94,8 +209,9 @@ assert.deepEqual(sent, [{ type: "input", data: "foo bar baz" }]);
 
     def test_copy_and_pending_text_use_fidelity_normalization(self):
         selection = extract_function("terminalSelectionText")
-        self.assertIn("return term.getSelection();", selection)
-        self.assertNotIn("normalize", selection)
+        self.assertIn("term.getSelectionPosition()", selection)
+        self.assertIn("extractTerminalSelectionText(term.buffer.active, term.cols, selection)", selection)
+        self.assertIn("extracted === null ? term.getSelection() : extracted", selection)
 
         copy = app_section(
             "  async function copyTerminalSelection()",
