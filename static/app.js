@@ -39,6 +39,8 @@
   const EDITOR_TAB_PREFIX = "editor:";
   const FILE_REQUEST_TIMEOUT_MS = 8000;
   const FILE_BOOKMARK_LIMIT = 40;
+  const ACTIVITY_REPORT_INTERVAL_MS = 1000;
+  const FORCED_ACTIVITY_DEDUPE_MS = 250;
   let decoder = new TextDecoder();
   const defaultShortcuts = [
     { label: "Esc", sequence: "{ESC}", visible: true },
@@ -619,6 +621,8 @@
   let resumeProbeTimer = null;
   let socketConnectStartedAt = 0;
   let lastServerMessageAt = 0;
+  let lastActivityReportAt = -Infinity;
+  let lastForcedActivityReportAt = -Infinity;
   let fitTimer = null;
   let terminalFitScheduled = false;
   let pendingFitPreserveCols = false;
@@ -4316,9 +4320,44 @@
     renderSessionMenu();
   }
 
+  function reportActivity(force = false) {
+    const now = performance.now();
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    if (force) {
+      if (now - lastForcedActivityReportAt < FORCED_ACTIVITY_DEDUPE_MS) {
+        return false;
+      }
+    } else if (now - lastActivityReportAt < ACTIVITY_REPORT_INTERVAL_MS) {
+      return false;
+    }
+    socket.send(JSON.stringify(force ? { type: "activity", force: true } : { type: "activity" }));
+    lastActivityReportAt = now;
+    if (force) {
+      lastForcedActivityReportAt = now;
+    }
+    return true;
+  }
+
+  function reportForcedActivity() {
+    return reportActivity(true);
+  }
+
   function sendMessage(payload) {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return false;
+    }
+    if (
+      payload &&
+      [
+        "composer-sync",
+        "composer-enter",
+        "composer-history",
+        "composer-force-clear",
+      ].includes(payload.type)
+    ) {
+      reportActivity();
     }
     if (payload && (payload.type === "input" || payload.type === "composer-sync" || payload.type === "composer-enter")) {
       followOutput = true;
@@ -9580,6 +9619,9 @@
     updateDisplayDraft(DEFAULT_UI_SCALE, DEFAULT_TERMINAL_FONT);
   });
 
+  document.addEventListener("pointerdown", reportForcedActivity, { capture: true, passive: true });
+  document.addEventListener("touchstart", reportForcedActivity, { capture: true, passive: true });
+
   let lastTouchEndAt = 0;
   document.addEventListener(
     "touchend",
@@ -9620,6 +9662,8 @@
   terminalFontInput.addEventListener("input", (event) => {
     updateDisplayDraft(draftUiScale, Number.parseInt(event.target.value, 10));
   });
+
+  term.onKey(() => reportActivity());
 
   term.onData((data) => {
     if (activeTab()?.type === "editor") {
@@ -9684,6 +9728,7 @@
     scheduleViewportSettlePasses();
   });
   window.addEventListener("focus", () => {
+    reportForcedActivity();
     updateViewportMetrics();
     resumeApplication();
   });

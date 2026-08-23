@@ -78,6 +78,8 @@ COMPOSER_CAPTURE_LOGICAL_LINES = 48
 COMPOSER_CAPTURE_MAX_CHARS = 12000
 COMPOSER_REFRESH_DELAYS = (0.02, 0.05, 0.09, 0.14, 0.2, 0.28, 0.38, 0.5)
 MOBILE_COMPOSER_FORCE_CLEAR_BACKSPACES = 1024
+GEOMETRY_CLAIM_INTERVAL_SECONDS = 1.0
+FORCED_GEOMETRY_CLAIM_INTERVAL_SECONDS = 0.25
 COMMAND_PROVENANCE_MAX_CHARS = 65536
 COMMAND_PROVENANCE_RECORDS_PER_SESSION = 24
 FILE_TREE_MAX_ENTRIES = 600
@@ -674,6 +676,25 @@ def _capture_lines(output: str) -> list[str]:
     if not output.endswith("\n"):
         raise RuntimeError("tmux capture-pane returned an unframed snapshot")
     return output[:-1].split("\n")
+
+
+def window_dimensions(session_name: str, pane_id: str | None = None) -> tuple[int, int]:
+    target = pane_id or session_name
+    result = tmux_capture(
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{window_width}\t#{window_height}",
+        check=False,
+    )
+    fields = result.stdout.rstrip("\n").split("\t")
+    if result.returncode != 0 or len(fields) != 2:
+        raise RuntimeError("active tmux window is unavailable")
+    try:
+        return int(fields[0]), int(fields[1])
+    except ValueError as exc:
+        raise RuntimeError("tmux returned invalid window dimensions") from exc
 
 
 def pane_metadata(session_name: str, pane_id: str | None = None) -> tuple[Any, ...]:
@@ -2422,6 +2443,9 @@ class TmuxBridge:
         self.cwd = cwd
         self.create_if_missing = create_if_missing
         self.initial_size = initial_size
+        self.last_reported_dimensions = initial_size
+        self.last_geometry_claim_at: float | None = None
+        self.last_forced_geometry_claim_at: float | None = None
         self.profile_id = profile_id
         self.epoch_state = epoch_state if epoch_state is not None else {"epoch": 0, "layout": 0}
         self.provenance_state = provenance_state or CommandProvenanceState()
@@ -2509,34 +2533,70 @@ class TmuxBridge:
 
     async def _set_size_locked(self, cols: int, rows: int) -> None:
         try:
-            metadata = await asyncio.to_thread(pane_metadata, self.session_name, self.pane_id)
-            dimensions_changed = metadata[2:4] != (cols, rows)
+            dimensions_changed = await asyncio.to_thread(
+                window_dimensions,
+                self.session_name,
+                self.pane_id,
+            ) != (cols, rows)
         except RuntimeError:
             dimensions_changed = True
         if dimensions_changed:
             self.provenance_state.invalidate_layout()
+        await self.command(f"set-option -wu -t {self.pane_id} window-size")
         await self.command(f"refresh-client -C {cols},{rows}")
-        await asyncio.to_thread(
-            tmux_capture,
-            "resize-window",
-            "-t",
-            self.pane_id,
-            "-x",
-            str(cols),
-            "-y",
-            str(rows),
-            check=False,
-        )
+        await self.command("select-window")
 
     async def set_size(self, cols: int, rows: int) -> None:
         async with self.write_lock:
             await self._set_size_locked(cols, rows)
+            self.last_reported_dimensions = (cols, rows)
 
     async def resize(self, cols: int, rows: int) -> None:
         async def mutate() -> None:
             await self.set_size(cols, rows)
 
         await self.reseed("resize", mutate=mutate)
+
+    async def claim_geometry(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if force:
+            if (
+                self.last_forced_geometry_claim_at is not None
+                and now - self.last_forced_geometry_claim_at
+                < FORCED_GEOMETRY_CLAIM_INTERVAL_SECONDS
+            ):
+                return
+            self.last_forced_geometry_claim_at = now
+        elif (
+            self.last_geometry_claim_at is not None
+            and now - self.last_geometry_claim_at < GEOMETRY_CLAIM_INTERVAL_SECONDS
+        ):
+            return
+        self.last_geometry_claim_at = now
+        await self.reclaim_geometry()
+
+    async def reclaim_geometry(self) -> None:
+        dimensions = self.last_reported_dimensions
+        if dimensions is None:
+            return
+        async with self.write_lock:
+            try:
+                current = await asyncio.to_thread(
+                    window_dimensions,
+                    self.session_name,
+                    self.pane_id,
+                )
+            except RuntimeError:
+                return
+            if current == dimensions:
+                await self.command(f"set-option -wu -t {self.pane_id} window-size")
+                await self.command("select-window")
+                return
+
+        async def mutate() -> None:
+            await self.set_size(*dimensions)
+
+        await self.reseed("activity", mutate=mutate)
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
         await self.connection.send(json.dumps(payload, ensure_ascii=False))
@@ -4814,9 +4874,15 @@ class AppServer:
             )
             return
 
+        if message_type == "activity":
+            await bridge.claim_geometry(force=payload.get("force") is True)
+            return
+
         if message_type == "input":
             data = input_data
             user_keystroke = input_is_user_keystroke(data)
+            if user_keystroke:
+                await bridge.claim_geometry()
             if user_keystroke and pane_in_mode(session_name):
                 tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
             if data:

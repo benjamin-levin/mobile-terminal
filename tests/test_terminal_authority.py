@@ -1,9 +1,14 @@
 import asyncio
 import copy
+import fcntl
 import json
 import os
 import shutil
+import signal
+import struct
 import subprocess
+import tempfile
+import termios
 import threading
 import unittest
 import uuid
@@ -708,6 +713,7 @@ class ComposerProvenanceLifecycleTest(unittest.IsolatedAsyncioTestCase):
         connection = mock.AsyncMock()
         bridge = mock.Mock()
         bridge.pane_id = "%1"
+        bridge.claim_geometry = mock.AsyncMock()
         bridge.write = mock.AsyncMock()
 
         async def start(_data, draft, revision, _generation):
@@ -770,8 +776,27 @@ class ComposerProvenanceLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
 class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        if not shutil.which("tmux") or not shutil.which("zsh") or not shutil.which("script"):
-            self.skipTest("tmux, zsh, and script are required")
+        if not shutil.which("tmux") or not shutil.which("zsh"):
+            self.skipTest("tmux and zsh are required")
+        self.tmux_temp_dir = tempfile.TemporaryDirectory(prefix="mt-provenance-")
+        self.tmux_socket_fd = os.open(self.tmux_temp_dir.name, os.O_RDONLY)
+        fd_root = "/proc/self/fd" if Path("/proc/self/fd").is_dir() else "/dev/fd"
+        self.tmux_socket_path = f"{fd_root}/{self.tmux_socket_fd}/socket"
+        original_popen = subprocess.Popen
+        self.tmux_environment = mock.patch.dict(os.environ)
+        self.tmux_environment.start()
+        os.environ.pop("TMUX", None)
+
+        def isolated_popen(args, *popen_args, **kwargs):
+            if isinstance(args, (list, tuple)) and args and args[0] == "tmux":
+                args = ["tmux", "-S", self.tmux_socket_path, *args[1:]]
+                pass_fds = set(kwargs.pop("pass_fds", ()))
+                pass_fds.add(self.tmux_socket_fd)
+                kwargs["pass_fds"] = tuple(pass_fds)
+            return original_popen(args, *popen_args, **kwargs)
+
+        self.tmux_popen_patch = mock.patch("server.subprocess.Popen", side_effect=isolated_popen)
+        self.tmux_popen_patch.start()
         self.session_name = f"mt-provenance-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         subprocess.run(
             [
@@ -790,17 +815,31 @@ class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        self.ordinary_client = subprocess.Popen(
-            [
-                "script",
-                "-qfec",
-                f"exec tmux attach-session -t {self.session_name}",
-                "/dev/null",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        ordinary_master_fd, ordinary_slave_fd = os.openpty()
+        fcntl.ioctl(
+            ordinary_slave_fd,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", 8, 36, 0, 0),
         )
+        self.ordinary_master_fd = ordinary_master_fd
+        try:
+            self.ordinary_client = subprocess.Popen(
+                [
+                    "tmux",
+                    "-S",
+                    self.tmux_socket_path,
+                    "attach-session",
+                    "-t",
+                    self.session_name,
+                ],
+                stdin=ordinary_slave_fd,
+                stdout=ordinary_slave_fd,
+                stderr=ordinary_slave_fd,
+                pass_fds=(self.tmux_socket_fd,),
+                start_new_session=True,
+            )
+        finally:
+            os.close(ordinary_slave_fd)
         await self._wait_for_ordinary_client()
 
         self.app = object.__new__(AppServer)
@@ -839,6 +878,9 @@ class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
             except asyncio.TimeoutError:
                 ordinary_client.kill()
                 await asyncio.to_thread(ordinary_client.wait)
+        ordinary_master_fd = getattr(self, "ordinary_master_fd", None)
+        if ordinary_master_fd is not None:
+            os.close(ordinary_master_fd)
         session_name = getattr(self, "session_name", "")
         if session_name:
             subprocess.run(
@@ -847,6 +889,18 @@ class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        tmux_popen_patch = getattr(self, "tmux_popen_patch", None)
+        if tmux_popen_patch is not None:
+            tmux_popen_patch.stop()
+        tmux_environment = getattr(self, "tmux_environment", None)
+        if tmux_environment is not None:
+            tmux_environment.stop()
+        tmux_socket_fd = getattr(self, "tmux_socket_fd", None)
+        if tmux_socket_fd is not None:
+            os.close(tmux_socket_fd)
+        tmux_temp_dir = getattr(self, "tmux_temp_dir", None)
+        if tmux_temp_dir is not None:
+            tmux_temp_dir.cleanup()
 
     async def _wait_for_ordinary_client(self):
         deadline = asyncio.get_running_loop().time() + 3
@@ -1030,6 +1084,531 @@ class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
         result = self._last_selection_result()
         self.assertEqual(result.get("error"), "Terminal changed; select again.")
         self.assertNotIn("text", result)
+
+
+class GeometryAuthorityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_size_update_clears_only_bridge_window_then_reclaims_with_targetless_select(self):
+        bridge = TmuxBridge(RecordingConnection(), "session", "/bin/sh", "/")
+        bridge.pane_id = "%7"
+        commands = []
+        first_command = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def command(value):
+            commands.append(value)
+            if len(commands) == 1:
+                first_command.set()
+                await release_first.wait()
+            return []
+
+        bridge.command = command
+        with mock.patch("server.window_dimensions", return_value=(90, 30)):
+            sizing = asyncio.create_task(bridge.set_size(80, 24))
+            await first_command.wait()
+            writing = asyncio.create_task(bridge.write("x"))
+            await asyncio.sleep(0)
+            self.assertEqual(commands, ["set-option -wu -t %7 window-size"])
+            release_first.set()
+            await asyncio.gather(sizing, writing)
+
+        self.assertEqual(
+            commands,
+            [
+                "set-option -wu -t %7 window-size",
+                "refresh-client -C 80,24",
+                "select-window",
+                "send-keys -t %7 -H 78",
+            ],
+        )
+        self.assertEqual(bridge.last_reported_dimensions, (80, 24))
+
+    async def test_activity_reseeds_only_when_window_differs_from_last_report(self):
+        bridge = TmuxBridge(
+            RecordingConnection(),
+            "session",
+            "/bin/sh",
+            "/",
+            initial_size=(80, 24),
+        )
+        bridge.pane_id = "%3"
+        bridge.command = mock.AsyncMock(return_value=[])
+        bridge.set_size = mock.AsyncMock()
+
+        async def reseed(_reason, *, mutate):
+            await mutate()
+
+        bridge.reseed = mock.AsyncMock(side_effect=reseed)
+        dimensions = mock.Mock(side_effect=[(80, 24), (100, 32)])
+        with mock.patch("server.window_dimensions", dimensions):
+            await bridge.reclaim_geometry()
+            self.assertEqual(
+                bridge.command.await_args_list,
+                [
+                    mock.call("set-option -wu -t %3 window-size"),
+                    mock.call("select-window"),
+                ],
+            )
+            bridge.reseed.assert_not_awaited()
+            bridge.command.reset_mock()
+            await bridge.reclaim_geometry()
+
+        bridge.command.assert_not_awaited()
+        bridge.reseed.assert_awaited_once()
+        self.assertEqual(bridge.reseed.await_args.args, ("activity",))
+        bridge.set_size.assert_awaited_once_with(80, 24)
+        self.assertEqual(
+            dimensions.call_args_list,
+            [mock.call("session", "%3"), mock.call("session", "%3")],
+        )
+
+    async def test_same_size_activity_select_is_serialized_without_reseed(self):
+        bridge = TmuxBridge(
+            RecordingConnection(),
+            "session",
+            "/bin/sh",
+            "/",
+            initial_size=(80, 24),
+        )
+        bridge.pane_id = "%3"
+        commands = []
+        select_started = asyncio.Event()
+        release_select = asyncio.Event()
+
+        async def command(value):
+            commands.append(value)
+            if value == "select-window":
+                select_started.set()
+                await release_select.wait()
+            return []
+
+        bridge.command = command
+        bridge.reseed = mock.AsyncMock()
+        with mock.patch("server.window_dimensions", return_value=(80, 24)):
+            activity = asyncio.create_task(bridge.reclaim_geometry())
+            await select_started.wait()
+            writing = asyncio.create_task(bridge.write("x"))
+            await asyncio.sleep(0)
+            self.assertEqual(
+                commands,
+                ["set-option -wu -t %3 window-size", "select-window"],
+            )
+            release_select.set()
+            await asyncio.gather(activity, writing)
+
+        self.assertEqual(
+            commands,
+            [
+                "set-option -wu -t %3 window-size",
+                "select-window",
+                "send-keys -t %3 -H 78",
+            ],
+        )
+        bridge.reseed.assert_not_awaited()
+
+    async def test_geometry_claim_throttles_repeated_input_and_forced_bursts(self):
+        bridge = TmuxBridge(RecordingConnection(), "session", "/bin/sh", "/")
+        bridge.reclaim_geometry = mock.AsyncMock()
+
+        with mock.patch(
+            "server.time.monotonic",
+            side_effect=[10.0, 10.2, 10.21, 10.3, 10.47, 11.47],
+        ):
+            await bridge.claim_geometry()
+            await bridge.claim_geometry()
+            await bridge.claim_geometry(force=True)
+            await bridge.claim_geometry(force=True)
+            await bridge.claim_geometry(force=True)
+            await bridge.claim_geometry()
+
+        self.assertEqual(bridge.reclaim_geometry.await_count, 4)
+
+    async def test_only_server_classified_user_input_claims_geometry(self):
+        app = object.__new__(AppServer)
+        app.settle_scroll_history = mock.AsyncMock()
+        app.invalidate_command_provenance = mock.Mock()
+        app.reset_mobile_composer_tracking = mock.Mock()
+        bridge = mock.Mock()
+        calls = []
+
+        async def claim_geometry(*, force=False):
+            calls.append(("claim", force))
+
+        async def write(data):
+            calls.append(("write", data))
+
+        bridge.claim_geometry = mock.AsyncMock(side_effect=claim_geometry)
+        bridge.write = mock.AsyncMock(side_effect=write)
+        with mock.patch("server.pane_in_mode", return_value=False):
+            await app.handle_command(
+                RecordingConnection(),
+                bridge,
+                {"session": "session"},
+                {"type": "input", "data": "x"},
+            )
+
+        self.assertEqual(calls, [("claim", False), ("write", "x")])
+        app.settle_scroll_history.assert_awaited_once_with("session")
+        app.reset_mobile_composer_tracking.assert_called_once_with("session")
+
+        calls.clear()
+        app.settle_scroll_history.reset_mock()
+        app.reset_mobile_composer_tracking.reset_mock()
+        bridge.claim_geometry.reset_mock()
+        await app.handle_command(
+            RecordingConnection(),
+            bridge,
+            {"session": "session"},
+            {"type": "input", "data": "\x1b[?1;2c"},
+        )
+
+        self.assertEqual(calls, [("write", "\x1b[?1;2c")])
+        bridge.claim_geometry.assert_not_awaited()
+        app.settle_scroll_history.assert_not_awaited()
+        app.reset_mobile_composer_tracking.assert_not_called()
+
+    async def test_activity_message_checks_geometry_without_terminal_input(self):
+        app = object.__new__(AppServer)
+        bridge = mock.Mock()
+        bridge.claim_geometry = mock.AsyncMock()
+
+        await app.handle_command(
+            RecordingConnection(),
+            bridge,
+            {"session": "session"},
+            {"type": "activity"},
+        )
+        await app.handle_command(
+            RecordingConnection(),
+            bridge,
+            {"session": "session"},
+            {"type": "activity", "force": True},
+        )
+
+        self.assertEqual(
+            bridge.claim_geometry.await_args_list,
+            [mock.call(force=False), mock.call(force=True)],
+        )
+
+
+class IsolatedTmuxGeometryAuthorityIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        if not shutil.which("tmux"):
+            self.skipTest("tmux is required")
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="mt-geometry-")
+        self.socket_fd = os.open(self.temp_dir.name, os.O_RDONLY)
+        fd_root = "/proc/self/fd" if Path("/proc/self/fd").is_dir() else "/dev/fd"
+        self.socket_path = f"{fd_root}/{self.socket_fd}/socket"
+        self.original_popen = subprocess.Popen
+        self.environment = mock.patch.dict(os.environ)
+        self.environment.start()
+        os.environ.pop("TMUX", None)
+
+        def isolated_popen(args, *popen_args, **kwargs):
+            if isinstance(args, (list, tuple)) and args and args[0] == "tmux":
+                args = ["tmux", "-S", self.socket_path, *args[1:]]
+                pass_fds = set(kwargs.pop("pass_fds", ()))
+                pass_fds.add(self.socket_fd)
+                kwargs["pass_fds"] = tuple(pass_fds)
+            return self.original_popen(args, *popen_args, **kwargs)
+
+        self.popen_patch = mock.patch("server.subprocess.Popen", side_effect=isolated_popen)
+        self.popen_patch.start()
+        self.session_name = f"mt-geometry-{uuid.uuid4().hex[:8]}"
+        self.run_tmux(
+            "new-session",
+            "-d",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "-s",
+            self.session_name,
+        )
+        self.run_tmux("new-window", "-d", "-t", f"{self.session_name}:", "-n", "other")
+        self.connection = RecordingConnection()
+        self.bridge = TmuxBridge(
+            self.connection,
+            self.session_name,
+            "/bin/sh",
+            "/",
+            create_if_missing=False,
+            initial_size=(80, 24),
+        )
+        self.connection.bridge = self.bridge
+        await self.bridge.open()
+        self.bridge.phase = "forward"
+
+    async def asyncTearDown(self):
+        bridge = getattr(self, "bridge", None)
+        if bridge is not None:
+            await bridge.close()
+        desktop_process = getattr(self, "desktop_process", None)
+        if desktop_process is not None and desktop_process.poll() is None:
+            desktop_process.terminate()
+            try:
+                await asyncio.wait_for(asyncio.to_thread(desktop_process.wait), timeout=1)
+            except asyncio.TimeoutError:
+                desktop_process.kill()
+                await asyncio.to_thread(desktop_process.wait)
+        desktop_master_fd = getattr(self, "desktop_master_fd", None)
+        if desktop_master_fd is not None:
+            os.close(desktop_master_fd)
+        if hasattr(self, "socket_path"):
+            self.run_tmux("kill-server", check=False)
+        if hasattr(self, "popen_patch"):
+            self.popen_patch.stop()
+        if hasattr(self, "environment"):
+            self.environment.stop()
+        if hasattr(self, "socket_fd"):
+            os.close(self.socket_fd)
+        if hasattr(self, "temp_dir"):
+            self.temp_dir.cleanup()
+
+    def run_tmux(self, *args, check=True):
+        process = self.original_popen(
+            ["tmux", "-S", self.socket_path, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ,
+            pass_fds=(self.socket_fd,),
+        )
+        stdout, stderr = process.communicate(timeout=5)
+        if check and process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, args, stdout, stderr)
+        return stdout.rstrip("\n")
+
+    async def attach_desktop(self, cols, rows):
+        master_fd, slave_fd = os.openpty()
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        self.desktop_master_fd = master_fd
+        try:
+            self.desktop_process = self.original_popen(
+                ["tmux", "-S", self.socket_path, "attach-session", "-t", self.session_name],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=os.environ,
+                pass_fds=(self.socket_fd,),
+                start_new_session=True,
+            )
+        finally:
+            os.close(slave_fd)
+
+        deadline = asyncio.get_running_loop().time() + 3
+        while asyncio.get_running_loop().time() < deadline:
+            clients = self.run_tmux(
+                "list-clients",
+                "-t",
+                self.session_name,
+                "-F",
+                "#{client_name}\t#{client_control_mode}",
+            )
+            for client in clients.splitlines():
+                name, control = client.split("\t")
+                if control == "0":
+                    self.desktop_client = name
+                    return
+            await asyncio.sleep(0.03)
+        self.fail("ordinary tmux client did not attach")
+
+    def set_desktop_size(self, cols, rows):
+        fcntl.ioctl(
+            self.desktop_master_fd,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", rows, cols, 0, 0),
+        )
+        os.kill(self.desktop_process.pid, signal.SIGWINCH)
+
+    async def wait_for_window_size(self, expected):
+        deadline = asyncio.get_running_loop().time() + 3
+        while asyncio.get_running_loop().time() < deadline:
+            actual = self.run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                self.bridge.pane_id,
+                "#{window_width}x#{window_height}",
+            )
+            if actual == expected:
+                return
+            await asyncio.sleep(0.03)
+        self.fail(f"tmux window remained {actual}, expected {expected}")
+
+    async def test_ordinary_desktop_and_mobile_transfer_authority_repeatedly(self):
+        initial_epoch = self.bridge.epoch_state["epoch"]
+        await self.attach_desktop(100, 30)
+
+        self.set_desktop_size(100, 30)
+        await self.wait_for_window_size("100x30")
+        await self.bridge.quiet(0.1)
+        await self.bridge.reclaim_geometry()
+        await self.wait_for_window_size("80x24")
+        self.assertEqual(self.bridge.epoch_state["epoch"], initial_epoch + 1)
+
+        self.set_desktop_size(100, 30)
+        await self.wait_for_window_size("100x30")
+        await self.bridge.quiet(0.1)
+        await self.bridge.reclaim_geometry()
+        await self.wait_for_window_size("80x24")
+        self.assertEqual(self.bridge.epoch_state["epoch"], initial_epoch + 2)
+
+    async def test_activity_restores_reported_window_without_clearing_other_manual_window(self):
+        first_window = f"{self.session_name}:0"
+        other_window = f"{self.session_name}:1"
+        initial_epoch = self.bridge.epoch_state["epoch"]
+
+        await self.bridge.reclaim_geometry()
+        self.assertEqual(self.bridge.epoch_state["epoch"], initial_epoch)
+
+        self.run_tmux("resize-window", "-t", first_window, "-x", "96", "-y", "28")
+        self.run_tmux("resize-window", "-t", other_window, "-x", "110", "-y", "34")
+        self.assertEqual(
+            self.run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                self.bridge.pane_id,
+                "#{window_width}x#{window_height}",
+            ),
+            "96x28",
+        )
+
+        await self.bridge.reclaim_geometry()
+
+        self.assertEqual(self.bridge.epoch_state["epoch"], initial_epoch + 1)
+        self.assertEqual(
+            self.run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                self.bridge.pane_id,
+                "#{window_width}x#{window_height}",
+            ),
+            "80x24",
+        )
+        self.assertEqual(
+            self.run_tmux("show-options", "-wv", "-t", first_window, "window-size"),
+            "",
+        )
+        self.assertEqual(
+            self.run_tmux("show-options", "-wv", "-t", other_window, "window-size"),
+            "manual",
+        )
+        self.assertEqual(
+            self.run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                other_window,
+                "#{window_width}x#{window_height}",
+            ),
+            "110x34",
+        )
+
+    async def test_same_size_activity_clears_target_manual_and_keeps_other_window_manual(self):
+        first_window = f"{self.session_name}:0"
+        other_window = f"{self.session_name}:1"
+        initial_epoch = self.bridge.epoch_state["epoch"]
+        self.run_tmux("resize-window", "-t", first_window, "-x", "80", "-y", "24")
+        self.run_tmux("resize-window", "-t", other_window, "-x", "110", "-y", "34")
+        self.assertEqual(
+            self.run_tmux("show-options", "-wv", "-t", first_window, "window-size"),
+            "manual",
+        )
+        self.assertEqual(
+            self.run_tmux("show-options", "-wv", "-t", other_window, "window-size"),
+            "manual",
+        )
+
+        await self.bridge.reclaim_geometry()
+
+        self.assertEqual(self.bridge.epoch_state["epoch"], initial_epoch)
+        self.assertEqual(
+            self.run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                self.bridge.pane_id,
+                "#{window_width}x#{window_height}",
+            ),
+            "80x24",
+        )
+        self.assertEqual(
+            self.run_tmux("show-options", "-wv", "-t", first_window, "window-size"),
+            "",
+        )
+        self.assertEqual(
+            self.run_tmux("show-options", "-wAv", "-t", first_window, "window-size"),
+            "latest",
+        )
+        self.assertEqual(
+            self.run_tmux("show-options", "-wv", "-t", other_window, "window-size"),
+            "manual",
+        )
+        self.assertEqual(
+            self.run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                other_window,
+                "#{window_width}x#{window_height}",
+            ),
+            "110x34",
+        )
+
+    async def test_same_size_activity_preserves_split_active_pane_and_window(self):
+        first_window = f"{self.session_name}:0"
+        self.run_tmux("split-window", "-h", "-t", first_window)
+        active_pane = self.run_tmux(
+            "display-message",
+            "-p",
+            "-t",
+            first_window,
+            "#{pane_id}",
+        )
+        self.bridge.pane_id = active_pane
+        before = self.run_tmux(
+            "display-message",
+            "-p",
+            "-t",
+            active_pane,
+            "#{window_index}\t#{pane_id}\t#{window_width}x#{window_height}"
+            "\t#{pane_width}x#{pane_height}\t#{window_layout}",
+        )
+        fields = before.split("\t")
+        self.assertEqual(fields[0:3], ["0", active_pane, "80x24"])
+        self.assertLess(int(fields[3].split("x", 1)[0]), 80)
+        panes_before = self.run_tmux(
+            "list-panes",
+            "-t",
+            first_window,
+            "-F",
+            "#{pane_id}",
+        ).splitlines()
+        self.assertEqual(len(panes_before), 2)
+        initial_epoch = self.bridge.epoch_state["epoch"]
+
+        await self.bridge.reclaim_geometry()
+
+        after = self.run_tmux(
+            "display-message",
+            "-p",
+            "-t",
+            active_pane,
+            "#{window_index}\t#{pane_id}\t#{window_width}x#{window_height}"
+            "\t#{pane_width}x#{pane_height}\t#{window_layout}",
+        )
+        panes_after = self.run_tmux(
+            "list-panes",
+            "-t",
+            first_window,
+            "-F",
+            "#{pane_id}",
+        ).splitlines()
+        self.assertEqual(after, before)
+        self.assertEqual(panes_after, panes_before)
+        self.assertEqual(self.bridge.epoch_state["epoch"], initial_epoch)
 
 
 class ControlTransportTest(unittest.IsolatedAsyncioTestCase):

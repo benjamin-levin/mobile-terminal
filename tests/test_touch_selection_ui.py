@@ -52,6 +52,65 @@ class TouchSelectionUITest(unittest.TestCase):
         )
         self.run_node_source(script)
 
+    def test_activity_reports_throttle_keyboard_but_force_pointer_and_focus(self):
+        script = "\n".join(
+            [
+                'const assert = require("node:assert/strict");',
+                "const ACTIVITY_REPORT_INTERVAL_MS = 1000;",
+                "const FORCED_ACTIVITY_DEDUPE_MS = 250;",
+                "let now = 100;",
+                "global.performance = { now: () => now };",
+                "const WebSocket = { OPEN: 1 };",
+                "const sent = [];",
+                "let socket = { readyState: WebSocket.OPEN, send: (value) => sent.push(JSON.parse(value)) };",
+                "let lastActivityReportAt = -Infinity;",
+                "let lastForcedActivityReportAt = -Infinity;",
+                extract_function("reportActivity"),
+                extract_function("reportForcedActivity"),
+                "assert.equal(reportActivity(), true);",
+                'assert.deepEqual(sent, [{ type: "activity" }]);',
+                "now = 200; assert.equal(reportForcedActivity(), true);",
+                'assert.deepEqual(sent[1], { type: "activity", force: true });',
+                "now = 300; assert.equal(reportForcedActivity(), false);",
+                "now = 450; assert.equal(reportForcedActivity(), true);",
+                "now = 1099; assert.equal(reportActivity(), false);",
+                "now = 1450; assert.equal(reportActivity(), true);",
+                "socket.readyState = 0; now = 2500; assert.equal(reportForcedActivity(), false);",
+                "assert.equal(sent.length, 4);",
+            ]
+        )
+        self.run_node_source(script)
+
+    def test_activity_sources_exclude_pointer_moves_and_generated_terminal_replies(self):
+        pointer_section = app_section(
+            'document.addEventListener("pointerdown", reportForcedActivity',
+            "  let lastTouchEndAt = 0;",
+        )
+        self.assertIn('document.addEventListener("pointerdown", reportForcedActivity', pointer_section)
+        self.assertIn('document.addEventListener("touchstart", reportForcedActivity', pointer_section)
+        self.assertIn("capture: true, passive: true", pointer_section)
+        self.assertNotIn("pointermove", pointer_section)
+        self.assertNotIn("touchmove", pointer_section)
+
+        terminal_input = app_section("  term.onKey(() => reportActivity());", "  term.onScroll(")
+        self.assertIn("term.onKey(() => reportActivity());", terminal_input)
+        on_data = terminal_input[terminal_input.index("term.onData") :]
+        self.assertNotIn("reportActivity", on_data)
+
+        send_message = extract_function("sendMessage")
+        self.assertIn('"composer-sync"', send_message)
+        self.assertIn('"composer-enter"', send_message)
+        self.assertIn('"composer-force-clear"', send_message)
+        self.assertNotIn('"composer-refresh"', send_message)
+        self.assertNotIn('"composer-reset"', send_message)
+        self.assertNotIn('"composer-semantic-sync"', send_message)
+
+        focus_handler = app_section(
+            '  window.addEventListener("focus", () => {',
+            '  document.addEventListener("visibilitychange",',
+        )
+        self.assertIn("reportForcedActivity();", focus_handler)
+
     def test_overlay_bounds_intersect_terminal_screen_viewport_and_safe_area(self):
         self.run_node(
             ["computeSelectionOverlayBounds"],
