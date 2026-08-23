@@ -1462,13 +1462,23 @@
     return copied;
   }
 
-  // Flatten a multi-line selection into a single line so pasting it into a shell
-  // or REPL doesn't fire an Enter per line (each newline would submit early).
-  // xterm joins soft-wrapped rows seamlessly and only emits "\n" at real line
-  // breaks, so those breaks become spaces (never gluing two tokens together).
-  // Runs of blank lines collapse to one space; leading/trailing space is trimmed.
-  function flattenCopyText(text) {
-    return text.replace(/[ \t]*\r?\n[ \t]*/g, " ").replace(/ {2,}/g, " ").trim();
+  // xterm already joins soft-wrapped rows, so preserve its selection exactly apart
+  // from normalizing platform line endings for the clipboard.
+  function normalizeTerminalCopyText(text) {
+    return text.replace(/\r\n?/g, "\n");
+  }
+
+  // Direct PTY paste remains deliberately single-line so a multi-line paste does
+  // not submit each line early. Composer paste keeps the normalized line breaks.
+  function normalizeDirectPtyPasteText(text) {
+    return normalizeTerminalCopyText(text)
+      .replace(/[ \t]*\n[ \t]*/g, " ")
+      .replace(/ {2,}/g, " ")
+      .trim();
+  }
+
+  function sendDirectPtyPaste(text) {
+    sendMessage({ type: "input", data: normalizeDirectPtyPasteText(text) });
   }
 
   async function copyTerminalSelection() {
@@ -1477,15 +1487,13 @@
       showToast("Select terminal text first.");
       return;
     }
-    const text = flattenCopyText(raw);
-    const flattened = /\r?\n/.test(raw);
-    const okMessage = flattened ? "Copied — line breaks removed." : "Copied terminal selection.";
+    const text = normalizeTerminalCopyText(raw);
     try {
       await navigator.clipboard.writeText(text);
-      showToast(okMessage);
+      showToast("Copied terminal selection.");
     } catch (_error) {
       if (copyTextWithFallback(text)) {
-        showToast(okMessage);
+        showToast("Copied terminal selection.");
         return;
       }
       showToast("Clipboard copy is blocked by this browser.");
@@ -1518,9 +1526,9 @@
     return "";
   }
 
-  // Send the current selection (flattened to one line) to the most recent other
-  // tab: switch to it, then drop the text into its composer once it's ready. The
-  // paste lands in the prompt for review — it is not auto-executed.
+  // Send the current selection to the most recent other tab: switch to it, then
+  // drop the text into its composer once it's ready. The paste lands in the
+  // prompt for review — it is not auto-executed.
   async function pasteSelectionToRecentTab() {
     const raw = terminalSelectionText();
     if (!raw) {
@@ -1532,7 +1540,7 @@
       showToast("No other tab to send to.");
       return;
     }
-    pendingPasteAfterSwitch = { session: target, text: flattenCopyText(raw) };
+    pendingPasteAfterSwitch = { session: target, text: normalizeTerminalCopyText(raw) };
     dismissTerminalSelection();
     switchSession(target);
   }
@@ -6416,7 +6424,7 @@
           insertComposerText(text, true);
         } else {
           resetSpeechInputState();
-          sendMessage({ type: "input", data: text });
+          sendDirectPtyPaste(text);
         }
         showToast("Pasted into this tab.");
       } else {
@@ -7878,7 +7886,7 @@
             insertComposerText(text, true);
           } else {
             resetComposerTracking(true);
-            sendMessage({ type: "input", data: text });
+            sendDirectPtyPaste(text);
           }
           if (preserveKeyboardState) {
             restoreShortcutKeyboardState(wasKeyboardFocused);
@@ -7886,7 +7894,7 @@
           return;
         }
         resetSpeechInputState();
-        sendMessage({ type: "input", data: text });
+        sendDirectPtyPaste(text);
         focusTerminal();
       }
     } catch (_error) {
@@ -7902,9 +7910,7 @@
     if (!text || !event.clipboardData) {
       return;
     }
-    // Match copyTerminalSelection(): flatten multi-line selections so a native
-    // copy (Cmd/Ctrl+C) doesn't carry Enter characters into a paste either.
-    event.clipboardData.setData("text/plain", flattenCopyText(text));
+    event.clipboardData.setData("text/plain", normalizeTerminalCopyText(text));
     event.preventDefault();
   });
 
@@ -7983,7 +7989,7 @@
       return;
     }
     resetSpeechInputState();
-    sendMessage({ type: "input", data: text });
+    sendDirectPtyPaste(text);
     focusTerminal();
   });
 
