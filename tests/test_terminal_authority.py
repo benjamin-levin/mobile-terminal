@@ -2,17 +2,25 @@ import asyncio
 import copy
 import json
 import subprocess
+import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from server import (
+    AcceptedCommand,
     AppServer,
+    CommandProvenance,
+    CommandProvenanceState,
+    PaneRowTracker,
     PaneSnapshot,
     TmuxBridge,
     _authored_physical_map,
+    _command_row_digest,
     _slice_display_cells,
     capture_pane_snapshot,
+    exact_provenance_selection,
     extract_authoritative_selection,
 )
 
@@ -25,6 +33,9 @@ def snapshot(
     physical_rows=None,
     tab_stops=(),
     rows=None,
+    cursor_x=0,
+    cursor_y=0,
+    history_limit=100000,
 ):
     plain_physical_rows = list(
         authored_lines if plain_physical_rows is None else plain_physical_rows
@@ -39,8 +50,8 @@ def snapshot(
         cols=cols,
         rows=pane_rows,
         alternate=False,
-        cursor_x=0,
-        cursor_y=0,
+        cursor_x=cursor_x,
+        cursor_y=cursor_y,
         cursor_flag=True,
         cursor_blinking=True,
         cursor_shape="default",
@@ -59,6 +70,7 @@ def snapshot(
         physical_rows=physical_rows,
         plain_physical_rows=plain_physical_rows,
         authored_lines=authored_lines,
+        history_limit=history_limit,
     )
 
 
@@ -227,6 +239,7 @@ class AuthoritativeSelectionTest(unittest.TestCase):
             0,
             1,
             (),
+            2000,
         )
         captures = [
             subprocess.CompletedProcess([], 0, "styled-one\nstyled-two\n", ""),
@@ -256,6 +269,400 @@ class AuthoritativeSelectionTest(unittest.TestCase):
         pane = snapshot(cols=5, authored_lines=["one"], rows=1)
         with self.assertRaises(ValueError):
             extract_authoritative_selection(pane, 0, -1, 1, 0)
+
+
+class CommandProvenanceSelectionTest(unittest.TestCase):
+    def setUp(self):
+        self.draft = (
+            "python3 -c 'print(\"SOFTWRAP|\"+\"0123456789\"*20+\"|END\"); "
+            "print(\"HARD-ONE\"); print(); print(\"  INDENTED\"); "
+            "print(\"\\tTABBED\\tVALUE  WITH  SPACES\"); print(\"TRAIL  \")'"
+        )
+        self.pane = snapshot(
+            cols=10,
+            authored_lines=["$ python3 ", "        -c", "  redraw  "],
+            plain_physical_rows=["$ python3 ", "        -c", "  redraw  "],
+            rows=3,
+            cursor_x=8,
+            cursor_y=2,
+        )
+        self.active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=10,
+            rows=3,
+            layout_generation=4,
+            start_row=0,
+            start_x=2,
+            draft=self.draft,
+            revision=7,
+            source="composer-sync",
+            owner_id=1,
+            end_row=2,
+            end_x=8,
+            row_digest=_command_row_digest(self.pane, 0, 2),
+        )
+        self.accepted = AcceptedCommand(
+            session_name="session",
+            pane_id="%1",
+            cols=10,
+            rows=3,
+            layout_generation=4,
+            start_row=0,
+            start_x=2,
+            end_row=2,
+            end_x=8,
+            draft=self.draft,
+            revision=8,
+            source="composer-sync",
+            row_digest=_command_row_digest(self.pane, 0, 2),
+        )
+
+    def test_active_whole_command_returns_exact_one_line(self):
+        matched, text = exact_provenance_selection(
+            self.pane,
+            "session",
+            4,
+            (0, 2),
+            (2, 8),
+            self.active,
+            (),
+            selected_text="python3 -c 'fake\nhard\nrows'",
+        )
+        self.assertTrue(matched)
+        self.assertEqual(text, self.draft)
+        self.assertNotIn("\n", text)
+
+    def test_accepted_historical_whole_command_returns_exact_draft(self):
+        exact = self.draft + "\t  "
+        record = replace(self.accepted, draft=exact)
+        matched, text = exact_provenance_selection(
+            self.pane,
+            "session",
+            4,
+            (0, 2),
+            (2, 8),
+            None,
+            (record,),
+        )
+        self.assertTrue(matched)
+        self.assertEqual(text, exact)
+
+    def test_stale_active_candidate_does_not_mask_valid_accepted_record(self):
+        stale_active = replace(self.active, layout_generation=3)
+        matched, text = exact_provenance_selection(
+            self.pane,
+            "session",
+            4,
+            (0, 2),
+            (2, 8),
+            stale_active,
+            (self.accepted,),
+            selected_text=self.draft,
+        )
+        self.assertTrue(matched)
+        self.assertEqual(text, self.draft)
+
+    def test_partial_mixed_and_multiple_command_selections_fail_closed(self):
+        selections = (
+            ((0, 3), (2, 8)),
+            ((0, 2), (2, 9)),
+            ((0, 0), (2, 8)),
+        )
+        for start, end in selections:
+            with self.subTest(start=start, end=end):
+                with self.assertRaises(RuntimeError):
+                    exact_provenance_selection(
+                        self.pane,
+                        "session",
+                        4,
+                        start,
+                        end,
+                        None,
+                        (self.accepted,),
+                    )
+        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+            exact_provenance_selection(
+                self.pane,
+                "session",
+                4,
+                (0, 2),
+                (2, 8),
+                self.active,
+                (self.accepted,),
+            )
+
+    def test_identity_revision_source_and_digest_mismatches_fail_closed(self):
+        stale_records = (
+            replace(self.accepted, session_name="other"),
+            replace(self.accepted, pane_id="%2"),
+            replace(self.accepted, cols=11),
+            replace(self.accepted, rows=4),
+            replace(self.accepted, layout_generation=5),
+            replace(self.accepted, source="terminal-extract"),
+            replace(self.accepted, row_digest="0" * 64),
+            replace(self.accepted, row_epoch=1),
+        )
+        for record in stale_records:
+            with self.subTest(record=record):
+                with self.assertRaises(RuntimeError):
+                    exact_provenance_selection(
+                        self.pane,
+                        "session",
+                        4,
+                        (0, 2),
+                        (2, 8),
+                        None,
+                        (record,),
+                    )
+
+    def test_non_command_output_remains_on_tmux_authority(self):
+        ordinary = snapshot(
+            cols=5,
+            authored_lines=["ordinarywrap"],
+            plain_physical_rows=["ordin", "arywr", "ap   "],
+            rows=3,
+        )
+        matched, text = exact_provenance_selection(
+            ordinary,
+            "session",
+            4,
+            (0, 0),
+            (2, 2),
+            None,
+            (),
+        )
+        self.assertFalse(matched)
+        self.assertIsNone(text)
+        self.assertEqual(extract_authoritative_selection(ordinary, 0, 0, 2, 2), "ordinarywrap")
+
+    def test_records_are_bounded_per_session_and_filtered_by_pane(self):
+        state = CommandProvenanceState()
+        for index in range(40):
+            state.remember(replace(self.accepted, pane_id=f"%{index % 2 + 1}", revision=index))
+        self.assertEqual(len(state.accepted_records), 24)
+        self.assertTrue(all(record.pane_id == "%1" for record in state.accepted("%1")))
+
+
+class SaturatedHistoryIdentityTest(unittest.TestCase):
+    def test_capped_history_scroll_advances_monotonic_row_origin(self):
+        tracker = PaneRowTracker()
+        before = snapshot(
+            cols=5,
+            authored_lines=["a", "b", "c", "d", "e"],
+            plain_physical_rows=["a    ", "b    ", "c    ", "d    ", "e    "],
+            rows=3,
+            history_limit=2,
+        )
+        after = snapshot(
+            cols=5,
+            authored_lines=["b", "c", "d", "e", "f"],
+            plain_physical_rows=["b    ", "c    ", "d    ", "e    ", "f    "],
+            rows=3,
+            history_limit=2,
+        )
+
+        first = tracker.observe(before, 10)
+        second = tracker.observe(after, 20)
+
+        self.assertEqual(before.history, after.history)
+        self.assertEqual(second.epoch, first.epoch)
+        self.assertEqual(second.first_row, first.first_row + 1)
+
+    def test_repeated_one_row_eviction_fences_instead_of_reusing_origin(self):
+        tracker = PaneRowTracker()
+        before = snapshot(
+            cols=5,
+            authored_lines=["a", "a", "a"],
+            plain_physical_rows=["a    ", "a    ", "a    "],
+            rows=2,
+            history_limit=1,
+        )
+        after = snapshot(
+            cols=5,
+            authored_lines=["a", "a", "b"],
+            plain_physical_rows=["a    ", "a    ", "b    "],
+            rows=2,
+            history_limit=1,
+        )
+
+        first = tracker.observe(before, 10)
+        second = tracker.observe(after, 20)
+
+        self.assertGreater(second.epoch, first.epoch)
+        self.assertEqual(second.first_row, 0)
+
+    def test_ambiguous_saturated_scroll_fences_stale_records_not_recent_ones(self):
+        tracker = PaneRowTracker()
+        ambiguous = snapshot(
+            cols=5,
+            authored_lines=["same", "same", "same"],
+            plain_physical_rows=["same ", "same ", "same "],
+            rows=2,
+            cursor_x=4,
+            cursor_y=1,
+            history_limit=1,
+        )
+        old_identity = tracker.observe(ambiguous, 10)
+        current_identity = tracker.observe(ambiguous, 20)
+        self.assertGreater(current_identity.epoch, old_identity.epoch)
+
+        current = snapshot(
+            cols=5,
+            authored_lines=["same", "cmd"],
+            plain_physical_rows=["same ", "cmd  "],
+            rows=2,
+            cursor_x=3,
+            cursor_y=1,
+        )
+        current_identity = tracker.observe(current, 20)
+        recent = AcceptedCommand(
+            session_name="session",
+            pane_id="%1",
+            cols=5,
+            rows=2,
+            layout_generation=4,
+            start_row=current_identity.first_row + 1,
+            start_x=0,
+            end_row=current_identity.first_row + 1,
+            end_x=3,
+            draft="cmd",
+            revision=2,
+            source="composer-sync",
+            row_digest=_command_row_digest(current, 1, 1),
+            row_epoch=current_identity.epoch,
+        )
+        stale = replace(recent, row_epoch=old_identity.epoch)
+        stale_digest = replace(recent, row_digest="0" * 64)
+        matched, text = exact_provenance_selection(
+            current,
+            "session",
+            4,
+            (recent.start_row, 0),
+            (recent.end_row, 3),
+            None,
+            (stale, stale_digest, recent),
+            current_identity,
+            "cmd",
+        )
+        self.assertTrue(matched)
+        self.assertEqual(text, "cmd")
+
+
+class ComposerProvenanceLifecycleTest(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_sync_tracks_only_monotonic_end_cursor_revisions(self):
+        app = object.__new__(AppServer)
+        app.mobile_composer_states = {}
+        app.command_provenance_states = {}
+        bridge = mock.Mock()
+        bridge.pane_id = "%1"
+        bridge.write = mock.AsyncMock()
+
+        async def start(_data, draft, revision, _generation):
+            active = CommandProvenance(
+                session_name="session",
+                pane_id="%1",
+                cols=20,
+                rows=6,
+                layout_generation=0,
+                start_row=3,
+                start_x=2,
+                draft=draft,
+                revision=revision,
+                source="composer-sync",
+                owner_id=id(bridge),
+            )
+            app.command_provenance_state("session").active = active
+            return active
+
+        async def continue_command(_data, active, draft, revision, _generation):
+            updated = replace(active, draft=draft, revision=revision)
+            app.command_provenance_state("session").active = updated
+            return updated
+
+        bridge.write_with_command_start = mock.AsyncMock(side_effect=start)
+        bridge.write_command_continuation = mock.AsyncMock(side_effect=continue_command)
+
+        with mock.patch("server.pane_in_mode", return_value=False):
+            await app.sync_mobile_composer(bridge, "session", "exact", 5, revision=1)
+            active = app.command_provenance_state("session").active
+            self.assertEqual(active.draft, "exact")
+            self.assertEqual(active.revision, 1)
+
+            await app.sync_mobile_composer(bridge, "session", "exact!", 6, revision=1)
+            self.assertIsNone(app.command_provenance_state("session").active)
+
+            app.reset_mobile_composer_tracking("session", allow_provenance_start=True)
+            await app.sync_mobile_composer(bridge, "session", "cursor", 2, revision=2)
+            self.assertIsNone(app.command_provenance_state("session").active)
+
+    async def test_semantic_sync_generic_input_and_layout_change_invalidate_active(self):
+        app = object.__new__(AppServer)
+        app.mobile_composer_states = {}
+        app.command_provenance_states = {}
+        app.scroll_states = {}
+        app.settle_scroll_history = mock.AsyncMock()
+        connection = mock.AsyncMock()
+        bridge = mock.Mock()
+        bridge.pane_id = "%1"
+        bridge.write = mock.AsyncMock()
+
+        async def start(_data, draft, revision, _generation):
+            active = self._active_for_layout(0)
+            active = replace(active, draft=draft, revision=revision, owner_id=id(bridge))
+            app.command_provenance_state("session").active = active
+            return active
+
+        bridge.write_with_command_start = mock.AsyncMock(side_effect=start)
+        bridge.write_command_continuation = mock.AsyncMock()
+
+        with mock.patch("server.pane_in_mode", return_value=False):
+            await app.sync_mobile_composer(bridge, "session", "exact", 5, revision=1)
+            await app.handle_command(
+                connection,
+                bridge,
+                {"session": "session"},
+                {
+                    "type": "composer-semantic-sync",
+                    "value": "rendered",
+                    "cursor": 8,
+                    "revision": 2,
+                    "source": "terminal-extract",
+                },
+            )
+            self.assertIsNone(app.command_provenance_state("session").active)
+            self.assertEqual(app.mobile_composer_state("session")["source"], "terminal-extract")
+
+            app.reset_mobile_composer_tracking("session", allow_provenance_start=True)
+            await app.sync_mobile_composer(bridge, "session", "again", 5, revision=3)
+            await app.handle_command(
+                connection,
+                bridge,
+                {"session": "session"},
+                {"type": "input", "data": "x", "revision": 4},
+            )
+            self.assertIsNone(app.command_provenance_state("session").active)
+
+        state = app.command_provenance_state("session")
+        state.active = self._active_for_layout(state.layout_generation)
+        state.invalidate_layout()
+        self.assertIsNone(state.active)
+
+    @staticmethod
+    def _active_for_layout(layout_generation):
+        return CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=20,
+            rows=6,
+            layout_generation=layout_generation,
+            start_row=0,
+            start_x=0,
+            draft="x",
+            revision=1,
+            source="composer-sync",
+            owner_id=1,
+        )
 
 
 class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
@@ -398,6 +805,390 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connection.messages, [])
         self.assertEqual(bridge.pane_id, "%1")
 
+    async def test_failed_open_terminates_process_cancels_reader_and_drops_owner(self):
+        class Process:
+            pid = 321
+            stdin = None
+
+            def __init__(self):
+                self.stdout = mock.Mock()
+                self.stdout.fileno.return_value = 9
+                self.alive = True
+                self.terminated = False
+                self.waited = False
+
+            def poll(self):
+                return None if self.alive else 0
+
+            def terminate(self):
+                self.terminated = True
+                self.alive = False
+
+            def wait(self):
+                self.waited = True
+                return 0
+
+            def kill(self):
+                self.alive = False
+
+        process = Process()
+        bridge = TmuxBridge(
+            RecordingConnection(),
+            "session",
+            "/bin/sh",
+            "/",
+            create_if_missing=False,
+        )
+        bridge.initial_block_seen.set()
+        reader_started = asyncio.Event()
+
+        async def read_forever():
+            reader_started.set()
+            await asyncio.Event().wait()
+
+        bridge.read_loop = read_forever
+        with (
+            mock.patch("server.subprocess.Popen", return_value=process),
+            mock.patch("server.os.set_blocking"),
+            mock.patch("server.pane_metadata", side_effect=RuntimeError("open failed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "open failed"):
+                await bridge.open()
+
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
+        self.assertTrue(bridge.closed)
+        self.assertNotIn(process.pid, bridge.provenance_state.owner_pids)
+        self.assertTrue(bridge.read_task.done())
+
+    async def test_closing_process_remains_owned_until_wait_completes(self):
+        class Process:
+            pid = 654
+
+            def __init__(self):
+                self.alive = True
+                self.wait_started = threading.Event()
+                self.release_wait = threading.Event()
+
+            def poll(self):
+                return None if self.alive else 0
+
+            def terminate(self):
+                pass
+
+            def wait(self):
+                self.wait_started.set()
+                self.release_wait.wait()
+                self.alive = False
+                return 0
+
+            def kill(self):
+                self.release_wait.set()
+
+        process = Process()
+        provenance = CommandProvenanceState(owner_pids={process.pid})
+        bridge = TmuxBridge(
+            RecordingConnection(),
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+        )
+        bridge.process = process
+        closing = asyncio.create_task(bridge.close())
+        try:
+            started = await asyncio.wait_for(
+                asyncio.to_thread(process.wait_started.wait),
+                timeout=1,
+            )
+            self.assertTrue(started)
+            self.assertIn(process.pid, provenance.owner_pids)
+        finally:
+            process.release_wait.set()
+        await closing
+
+        self.assertNotIn(process.pid, provenance.owner_pids)
+
+    async def test_concurrent_invalidation_cannot_reestablish_provenance_after_write(self):
+        provenance = CommandProvenanceState()
+        bridge = TmuxBridge(
+            RecordingConnection(),
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+        )
+        bridge.pane_id = "%1"
+        active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=20,
+            rows=6,
+            layout_generation=0,
+            start_row=0,
+            start_x=2,
+            draft="old",
+            revision=1,
+            source="composer-sync",
+            owner_id=id(bridge),
+        )
+        provenance.active = active
+        command_started = asyncio.Event()
+        release_command = asyncio.Event()
+
+        async def command(_value):
+            command_started.set()
+            await release_command.wait()
+            return []
+
+        bridge.command = command
+        update = asyncio.create_task(
+            bridge.write_command_continuation(
+                "x",
+                active,
+                "oldx",
+                2,
+                provenance.tracking_generation,
+            )
+        )
+        await command_started.wait()
+        provenance.invalidate_active()
+        release_command.set()
+
+        self.assertIsNone(await update)
+        self.assertIsNone(provenance.active)
+
+    async def test_unknown_tmux_client_attachment_invalidates_active_provenance(self):
+        provenance = CommandProvenanceState()
+        provenance.owner_pids.add(123)
+        bridge = TmuxBridge(
+            RecordingConnection(),
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+        )
+        active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=20,
+            rows=6,
+            layout_generation=0,
+            start_row=0,
+            start_x=2,
+            draft="exact",
+            revision=1,
+            source="composer-sync",
+            owner_id=id(bridge),
+        )
+        provenance.active = active
+
+        await bridge.control_line(b"%client-session-changed client-123 $1 session")
+        self.assertIs(provenance.active, active)
+
+        await bridge.control_line(b"%client-session-changed client-456 $1 session")
+        self.assertIsNone(provenance.active)
+
+    async def test_background_fence_binds_active_to_settled_terminal_revision(self):
+        bridge = TmuxBridge(RecordingConnection(), "session", "/bin/sh", "/")
+        bridge.pane_id = "%1"
+        bridge.offset = 7
+        bridge.quiet = mock.AsyncMock()
+        pane = snapshot(
+            cols=10,
+            authored_lines=["$ exact"],
+            plain_physical_rows=["$ exact   "],
+            rows=1,
+            cursor_x=7,
+            cursor_y=0,
+        )
+        active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=10,
+            rows=1,
+            layout_generation=0,
+            start_row=0,
+            start_x=2,
+            draft="exact",
+            revision=1,
+            source="composer-sync",
+            owner_id=id(bridge),
+        )
+        bridge.provenance_state.active = active
+
+        with (
+            mock.patch("server.asyncio.sleep", new=mock.AsyncMock()),
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.session_clients_are_owned", return_value=True),
+        ):
+            await bridge._capture_active_provenance_fence(active)
+
+        settled = bridge.provenance_state.active
+        self.assertEqual(settled.terminal_revision, 7)
+        self.assertEqual((settled.end_row, settled.end_x), (0, 7))
+
+    async def test_accepted_enter_captures_immutable_rows_before_sending_enter(self):
+        bridge = TmuxBridge(RecordingConnection(), "session", "/bin/sh", "/")
+        bridge.pane_id = "%1"
+        bridge.quiet = mock.AsyncMock()
+        bridge.command = mock.AsyncMock(return_value=[])
+        pane = snapshot(
+            cols=10,
+            authored_lines=["$ exact command"],
+            plain_physical_rows=["$ exact co", "mmand     "],
+            rows=2,
+            cursor_x=5,
+            cursor_y=1,
+        )
+        active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=10,
+            rows=2,
+            layout_generation=0,
+            start_row=0,
+            start_x=2,
+            draft="exact command",
+            revision=4,
+            source="composer-sync",
+            owner_id=id(bridge),
+            end_row=1,
+            end_x=5,
+            row_digest=_command_row_digest(pane, 0, 1),
+            terminal_revision=0,
+        )
+        bridge.provenance_state.active = active
+        metadata = (
+            "%1",
+            0,
+            10,
+            2,
+            0,
+            7,
+            1,
+            1,
+            1,
+            "default",
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            (),
+            2000,
+        )
+
+        with (
+            mock.patch("server.pane_metadata", return_value=metadata),
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.session_clients_are_owned", return_value=True),
+        ):
+            record = await bridge.write_accepted_enter(active, 5, 0)
+
+        self.assertEqual(record.draft, "exact command")
+        self.assertEqual((record.start_row, record.start_x), (0, 2))
+        self.assertEqual((record.end_row, record.end_x), (1, 5))
+        self.assertEqual(record.row_digest, _command_row_digest(pane, 0, 1))
+        bridge.command.assert_awaited_once_with("send-keys -t %1 -H 0d")
+
+    async def test_out_of_band_input_before_enter_does_not_create_accepted_override(self):
+        bridge = TmuxBridge(RecordingConnection(), "session", "/bin/sh", "/")
+        bridge.pane_id = "%1"
+        bridge.quiet = mock.AsyncMock()
+        bridge.command = mock.AsyncMock(return_value=[])
+        original = snapshot(
+            cols=10,
+            authored_lines=["$ exact command"],
+            plain_physical_rows=["$ exact co", "mmand     "],
+            rows=2,
+            cursor_x=5,
+            cursor_y=1,
+        )
+        pane = snapshot(
+            cols=10,
+            authored_lines=["$ exactXcommand"],
+            plain_physical_rows=["$ exactXco", "mmand     "],
+            rows=2,
+            cursor_x=5,
+            cursor_y=1,
+        )
+        active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=10,
+            rows=2,
+            layout_generation=0,
+            start_row=0,
+            start_x=2,
+            draft="exact command",
+            revision=4,
+            source="composer-sync",
+            owner_id=id(bridge),
+            end_row=1,
+            end_x=5,
+            row_digest=_command_row_digest(original, 0, 1),
+        )
+        bridge.provenance_state.active = active
+
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.session_clients_are_owned", return_value=True),
+        ):
+            record = await bridge.write_accepted_enter(active, 5, 0)
+
+        self.assertIsNone(record)
+        self.assertEqual(tuple(bridge.provenance_state.accepted_records), ())
+        bridge.command.assert_awaited_once_with("send-keys -t %1 -H 0d")
+
+    async def test_unowned_tmux_client_disables_accepted_override(self):
+        bridge = TmuxBridge(RecordingConnection(), "session", "/bin/sh", "/")
+        bridge.pane_id = "%1"
+        bridge.quiet = mock.AsyncMock()
+        bridge.command = mock.AsyncMock(return_value=[])
+        pane = snapshot(
+            cols=10,
+            authored_lines=["$ exact command"],
+            plain_physical_rows=["$ exact co", "mmand     "],
+            rows=2,
+            cursor_x=5,
+            cursor_y=1,
+        )
+        active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=10,
+            rows=2,
+            layout_generation=0,
+            start_row=0,
+            start_x=2,
+            draft="exact command",
+            revision=4,
+            source="composer-sync",
+            owner_id=id(bridge),
+            end_row=1,
+            end_x=5,
+            row_digest=_command_row_digest(pane, 0, 1),
+            terminal_revision=0,
+        )
+        bridge.provenance_state.active = active
+
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.session_clients_are_owned", return_value=False),
+        ):
+            record = await bridge.write_accepted_enter(active, 5, 0)
+
+        self.assertIsNone(record)
+        self.assertEqual(tuple(bridge.provenance_state.accepted_records), ())
+        bridge.command.assert_awaited_once_with("send-keys -t %1 -H 0d")
+
     async def test_failed_composer_enter_keeps_draft_and_history_state(self):
         app = object.__new__(AppServer)
         app.mobile_composer_states = {}
@@ -414,6 +1205,8 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         )
         before = copy.deepcopy(state)
         bridge = mock.Mock()
+        bridge.session_name = "session"
+        bridge.settle_active_provenance_fence = mock.AsyncMock()
         bridge.write = mock.AsyncMock(side_effect=RuntimeError("tmux closed"))
 
         with mock.patch("server.pane_in_mode", return_value=False):
@@ -495,6 +1288,357 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.phase, "forward")
         self.assertEqual(bridge.offset, len(b"post-cutoff"))
 
+    async def test_authoritative_selection_uses_exact_command_and_fails_partial_closed(self):
+        connection = RecordingConnection()
+        provenance = CommandProvenanceState(layout_generation=3)
+        bridge = TmuxBridge(
+            connection,
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+        )
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.quiet = mock.AsyncMock()
+        pane = snapshot(
+            cols=10,
+            authored_lines=["$ exact command"],
+            plain_physical_rows=["$ exact co", "mmand     "],
+            rows=2,
+            cursor_x=5,
+            cursor_y=1,
+        )
+        exact = "exact command"
+        provenance.active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=10,
+            rows=2,
+            layout_generation=3,
+            start_row=0,
+            start_x=2,
+            draft=exact,
+            revision=4,
+            source="composer-sync",
+            owner_id=id(bridge),
+            end_row=1,
+            end_x=5,
+            row_digest=_command_row_digest(pane, 0, 1),
+            terminal_revision=0,
+        )
+        payload = {
+            "requestId": "exact",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 10,
+            "rows": 2,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}},
+        }
+
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.session_clients_are_owned", return_value=True),
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+            self.assertEqual((text, error), (exact, None))
+
+            payload["requestId"] = "partial"
+            payload["selection"]["start"]["x"] = 3
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+
+        payload["requestId"] = "unowned-client"
+        payload["selection"] = {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}}
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.session_clients_are_owned", return_value=False),
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+
+        changed = snapshot(
+            cols=10,
+            authored_lines=["$ exactXcommand"],
+            plain_physical_rows=["$ exactXco", "mmand     "],
+            rows=2,
+            cursor_x=5,
+            cursor_y=1,
+        )
+        payload["requestId"] = "out-of-band"
+        payload["selection"] = {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}}
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=changed),
+            mock.patch("server.session_clients_are_owned", return_value=True),
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+
+    async def test_authoritative_selection_blocks_owned_writer_until_exact_copy_finishes(self):
+        connection = RecordingConnection()
+        provenance = CommandProvenanceState(layout_generation=3)
+        write_lock = asyncio.Lock()
+        bridge = TmuxBridge(
+            connection,
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+            write_lock=write_lock,
+        )
+        writer = TmuxBridge(
+            RecordingConnection(),
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+            write_lock=write_lock,
+        )
+        connection.bridge = bridge
+        bridge.pane_id = writer.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.quiet = mock.AsyncMock()
+        writer.command = mock.AsyncMock(return_value=[])
+        pane = snapshot(
+            cols=10,
+            authored_lines=["$ exact command"],
+            plain_physical_rows=["$ exact co", "mmand     "],
+            rows=2,
+            cursor_x=5,
+            cursor_y=1,
+        )
+        provenance.active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=10,
+            rows=2,
+            layout_generation=3,
+            start_row=0,
+            start_x=2,
+            draft="exact command",
+            revision=4,
+            source="composer-sync",
+            owner_id=id(bridge),
+            end_row=1,
+            end_x=5,
+            row_digest=_command_row_digest(pane, 0, 1),
+            terminal_revision=0,
+        )
+        payload = {
+            "requestId": "owned-writer",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 10,
+            "rows": 2,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}},
+        }
+        capture_started = asyncio.Event()
+        release_capture = asyncio.Event()
+
+        async def to_thread(function, *args, **kwargs):
+            if function is capture_pane_snapshot:
+                capture_started.set()
+                await release_capture.wait()
+                return pane
+            return function(*args, **kwargs)
+
+        with (
+            mock.patch("server.asyncio.to_thread", side_effect=to_thread),
+            mock.patch("server.session_clients_are_owned", return_value=True),
+        ):
+            copying = asyncio.create_task(bridge.authoritative_selection(payload))
+            await capture_started.wait()
+            writing = asyncio.create_task(writer.write("x"))
+            await asyncio.sleep(0)
+            writer.command.assert_not_awaited()
+            release_capture.set()
+            self.assertEqual(await copying, ("exact command", None))
+            await writing
+
+        writer.command.assert_awaited_once_with("send-keys -t %1 -H 78")
+
+    async def test_transient_unknown_client_edit_during_copy_fails_closed(self):
+        connection = RecordingConnection()
+        provenance = CommandProvenanceState(layout_generation=3)
+        bridge = TmuxBridge(
+            connection,
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+        )
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.quiet = mock.AsyncMock()
+        pane = snapshot(
+            cols=10,
+            authored_lines=["$ exact command"],
+            plain_physical_rows=["$ exact co", "mmand     "],
+            rows=2,
+            cursor_x=5,
+            cursor_y=1,
+        )
+        provenance.active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=10,
+            rows=2,
+            layout_generation=3,
+            start_row=0,
+            start_x=2,
+            draft="exact command",
+            revision=4,
+            source="composer-sync",
+            owner_id=id(bridge),
+            end_row=1,
+            end_x=5,
+            row_digest=_command_row_digest(pane, 0, 1),
+            terminal_revision=0,
+        )
+        payload = {
+            "requestId": "unknown-edit",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 10,
+            "rows": 2,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}},
+        }
+        def clients_owned(*_args):
+            bridge.offset += 1
+            return True
+
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.session_clients_are_owned", side_effect=clients_owned),
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+
+    async def test_identical_rendered_rows_after_terminal_revision_change_fail_closed(self):
+        connection = RecordingConnection()
+        provenance = CommandProvenanceState(layout_generation=3)
+        bridge = TmuxBridge(
+            connection,
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+        )
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.offset = 1
+        bridge.quiet = mock.AsyncMock()
+        pane = snapshot(
+            cols=10,
+            authored_lines=["$       "],
+            plain_physical_rows=["$         "],
+            rows=1,
+            cursor_x=8,
+            cursor_y=0,
+            tab_stops=(8,),
+        )
+        provenance.active = CommandProvenance(
+            session_name="session",
+            pane_id="%1",
+            cols=10,
+            rows=1,
+            layout_generation=3,
+            start_row=0,
+            start_x=2,
+            draft="\t",
+            revision=4,
+            source="composer-sync",
+            owner_id=id(bridge),
+            end_row=0,
+            end_x=8,
+            row_digest=_command_row_digest(pane, 0, 0),
+            terminal_revision=0,
+        )
+        payload = {
+            "requestId": "same-cells-new-revision",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 1,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 10,
+            "rows": 1,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {"start": {"x": 2, "y": 0}, "end": {"x": 8, "y": 0}},
+        }
+
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.session_clients_are_owned", return_value=True),
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+
+    async def test_selection_geometry_mismatch_returns_exact_stale_error(self):
+        connection = RecordingConnection()
+        bridge = TmuxBridge(connection, "session", "/bin/sh", "/")
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.quiet = mock.AsyncMock()
+        pane = snapshot(cols=5, authored_lines=["safe"], rows=1)
+        payload = {
+            "requestId": "geometry",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 6,
+            "rows": 1,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {"start": {"x": 0, "y": 0}, "end": {"x": 1, "y": 0}},
+        }
+
+        with mock.patch("server.capture_pane_snapshot", return_value=pane):
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+
     async def test_unverified_geometry_returns_the_exact_stale_selection_error(self):
         connection = RecordingConnection()
         bridge = TmuxBridge(connection, "session", "/bin/sh", "/")
@@ -547,6 +1691,309 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(text)
         self.assertEqual(error, "Terminal changed; select again.")
+
+
+class RenameProvenanceTransferTest(unittest.IsolatedAsyncioTestCase):
+    def make_app(self):
+        app = object.__new__(AppServer)
+        app.multi_tenant = False
+        app.mobile_composer_states = {"old": {"draft": "cmd"}}
+        app.command_provenance_states = {"old": CommandProvenanceState()}
+        app.terminal_write_locks = {"old": asyncio.Lock()}
+        app.live_terminal_connections = {}
+        app.terminal_sizes = {"old": (10, 2)}
+        app.scroll_states = {"old": {"pending": 0, "task": None, "paneId": "%1"}}
+        return app
+
+    async def test_rename_during_open_transfers_the_registered_opening_bridge(self):
+        app = self.make_app()
+        provenance = app.command_provenance_states["old"]
+        lock = app.terminal_write_locks["old"]
+        state = {"session": "old", "user": ""}
+        bridge = TmuxBridge(
+            RecordingConnection(),
+            "old",
+            "/bin/sh",
+            "/",
+            provenance_state=provenance,
+            write_lock=lock,
+        )
+        open_started = asyncio.Event()
+        release_open = asyncio.Event()
+
+        async def suspended_open():
+            open_started.set()
+            await release_open.wait()
+
+        bridge.open = mock.AsyncMock(side_effect=suspended_open)
+        bridge.close = mock.AsyncMock()
+        app.send_json = mock.AsyncMock()
+        app.send_tabs = mock.AsyncMock()
+        app.send_sessions = mock.AsyncMock()
+        opening = asyncio.create_task(app.open_live_terminal(bridge, state))
+        await open_started.wait()
+        self.assertEqual(app.live_terminal_connections["old"][0][0], bridge)
+
+        with (
+            mock.patch("server.session_exists", return_value=False),
+            mock.patch(
+                "server.tmux_capture",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+        ):
+            await app.handle_command(
+                RecordingConnection(),
+                bridge,
+                state,
+                {"type": "rename-tab", "session": "old", "name": "new"},
+            )
+
+        self.assertEqual(bridge.session_name, "new")
+        self.assertEqual(state["session"], "new")
+        self.assertNotIn("old", app.live_terminal_connections)
+        self.assertEqual(app.live_terminal_connections["new"][0][0], bridge)
+        release_open.set()
+        await opening
+
+    async def test_open_failure_closes_bridge_and_removes_registration(self):
+        app = self.make_app()
+        state = {"session": "old", "user": ""}
+        bridge = TmuxBridge(
+            RecordingConnection(),
+            "old",
+            "/bin/sh",
+            "/",
+            provenance_state=app.command_provenance_states["old"],
+            write_lock=app.terminal_write_locks["old"],
+        )
+        bridge.open = mock.AsyncMock(side_effect=RuntimeError("open failed"))
+        bridge.close = mock.AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, "open failed"):
+            await app.open_live_terminal(bridge, state)
+
+        bridge.close.assert_awaited_once()
+        self.assertNotIn("old", app.live_terminal_connections)
+
+    async def test_cancelled_open_closes_bridge_and_removes_registration(self):
+        app = self.make_app()
+        state = {"session": "old", "user": ""}
+        bridge = TmuxBridge(
+            RecordingConnection(),
+            "old",
+            "/bin/sh",
+            "/",
+            provenance_state=app.command_provenance_states["old"],
+            write_lock=app.terminal_write_locks["old"],
+        )
+        bridge.open = mock.AsyncMock(side_effect=asyncio.CancelledError())
+        bridge.close = mock.AsyncMock()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await app.open_live_terminal(bridge, state)
+
+        bridge.close.assert_awaited_once()
+        self.assertNotIn("old", app.live_terminal_connections)
+
+    async def test_rename_preserves_copy_state_and_reconnect_identity(self):
+        app = self.make_app()
+        pane = snapshot(
+            cols=10,
+            authored_lines=["$ cmd"],
+            plain_physical_rows=["$ cmd     ", "          "],
+            rows=2,
+        )
+        provenance = app.command_provenance_states["old"]
+        identity = provenance.row_tracker.observe(pane, 1)
+        record = AcceptedCommand(
+            session_name="old",
+            pane_id="%1",
+            cols=10,
+            rows=2,
+            layout_generation=0,
+            start_row=identity.first_row,
+            start_x=2,
+            end_row=identity.first_row,
+            end_x=5,
+            draft="cmd",
+            revision=2,
+            source="composer-sync",
+            row_digest=_command_row_digest(pane, 0, 0),
+            row_epoch=identity.epoch,
+        )
+        provenance.remember(record)
+        lock = app.terminal_write_locks["old"]
+        first_state = {"session": "old"}
+        second_state = {"session": "old"}
+        first = TmuxBridge(
+            RecordingConnection(), "old", "/bin/sh", "/", provenance_state=provenance, write_lock=lock
+        )
+        second = TmuxBridge(
+            RecordingConnection(), "old", "/bin/sh", "/", provenance_state=provenance, write_lock=lock
+        )
+        app.register_live_terminal("old", first, first_state)
+        app.register_live_terminal("old", second, second_state)
+        second.provenance_state = CommandProvenanceState()
+        second.write_lock = asyncio.Lock()
+
+        app.transfer_single_tenant_session_state("old", "new")
+
+        self.assertIs(app.command_provenance_state("new"), provenance)
+        self.assertIs(app.terminal_write_lock("new"), lock)
+        self.assertEqual((first.session_name, second.session_name), ("new", "new"))
+        self.assertEqual((first_state["session"], second_state["session"]), ("new", "new"))
+        self.assertIs(first.provenance_state, provenance)
+        self.assertIs(second.provenance_state, provenance)
+        self.assertIs(first.write_lock, lock)
+        self.assertIs(second.write_lock, lock)
+        reconnected = TmuxBridge(
+            RecordingConnection(),
+            "new",
+            "/bin/sh",
+            "/",
+            provenance_state=app.command_provenance_state("new"),
+            write_lock=app.terminal_write_lock("new"),
+        )
+        self.assertIs(reconnected.provenance_state, provenance)
+        self.assertIs(reconnected.write_lock, lock)
+        renamed = provenance.accepted("%1")[0]
+        self.assertEqual(renamed.session_name, "new")
+        matched, text = exact_provenance_selection(
+            pane,
+            "new",
+            0,
+            (renamed.start_row, 2),
+            (renamed.end_row, 5),
+            None,
+            (renamed,),
+            identity,
+            "cmd",
+        )
+        self.assertTrue(matched)
+        self.assertEqual(text, "cmd")
+
+    async def test_rename_waits_for_shared_write_and_future_writes_use_transferred_lock(self):
+        app = self.make_app()
+        provenance = app.command_provenance_states["old"]
+        lock = app.terminal_write_locks["old"]
+        first_state = {"session": "old", "user": ""}
+        second_state = {"session": "old", "user": ""}
+        first = TmuxBridge(
+            RecordingConnection(), "old", "/bin/sh", "/", provenance_state=provenance, write_lock=lock
+        )
+        second = TmuxBridge(
+            RecordingConnection(), "old", "/bin/sh", "/", provenance_state=provenance, write_lock=lock
+        )
+        first.pane_id = second.pane_id = "%1"
+        app.register_live_terminal("old", first, first_state)
+        app.register_live_terminal("old", second, second_state)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        commands = []
+
+        async def first_command(value):
+            commands.append(("first", value))
+            started.set()
+            await release.wait()
+            return []
+
+        async def second_command(value):
+            commands.append(("second", value))
+            return []
+
+        first.command = first_command
+        second.command = second_command
+        app.send_json = mock.AsyncMock()
+        app.send_tabs = mock.AsyncMock()
+        app.send_sessions = mock.AsyncMock()
+        write = asyncio.create_task(first.write("a"))
+        await started.wait()
+        renamed = asyncio.create_task(
+            app.handle_command(
+                RecordingConnection(),
+                second,
+                second_state,
+                {"type": "rename-tab", "session": "old", "name": "new"},
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(renamed.done())
+        release.set()
+        with (
+            mock.patch("server.session_exists", return_value=False),
+            mock.patch(
+                "server.tmux_capture",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+        ):
+            await asyncio.gather(write, renamed)
+        await second.write("b")
+
+        self.assertEqual([kind for kind, _ in commands], ["first", "second"])
+        self.assertIs(first.write_lock, app.terminal_write_lock("new"))
+        self.assertIs(second.write_lock, app.terminal_write_lock("new"))
+        self.assertEqual((first.session_name, second.session_name), ("new", "new"))
+
+    async def test_input_rereads_renamed_identity_after_scroll_settle(self):
+        app = self.make_app()
+        provenance = app.command_provenance_states["old"]
+        lock = app.terminal_write_locks["old"]
+        input_state = {"session": "old", "user": ""}
+        rename_state = {"session": "old", "user": ""}
+        input_bridge = TmuxBridge(
+            RecordingConnection(), "old", "/bin/sh", "/", provenance_state=provenance, write_lock=lock
+        )
+        rename_bridge = TmuxBridge(
+            RecordingConnection(), "old", "/bin/sh", "/", provenance_state=provenance, write_lock=lock
+        )
+        input_bridge.pane_id = rename_bridge.pane_id = "%1"
+        input_bridge.command = mock.AsyncMock(return_value=[])
+        app.register_live_terminal("old", input_bridge, input_state)
+        app.register_live_terminal("old", rename_bridge, rename_state)
+        settle_started = asyncio.Event()
+        release_settle = asyncio.Event()
+
+        async def settle(_session_name):
+            settle_started.set()
+            await release_settle.wait()
+
+        app.settle_scroll_history = settle
+        app.send_json = mock.AsyncMock()
+        app.send_tabs = mock.AsyncMock()
+        app.send_sessions = mock.AsyncMock()
+        pending_input = asyncio.create_task(
+            app.handle_command(
+                RecordingConnection(),
+                input_bridge,
+                input_state,
+                {"type": "input", "data": "x", "revision": 2},
+            )
+        )
+        await settle_started.wait()
+        with (
+            mock.patch("server.session_exists", return_value=False),
+            mock.patch("server.pane_in_mode", return_value=False),
+            mock.patch(
+                "server.tmux_capture",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+        ):
+            await app.handle_command(
+                RecordingConnection(),
+                rename_bridge,
+                rename_state,
+                {"type": "rename-tab", "session": "old", "name": "new"},
+            )
+            release_settle.set()
+            await pending_input
+
+        self.assertNotIn("old", app.mobile_composer_states)
+        self.assertNotIn("old", app.command_provenance_states)
+        self.assertNotIn("old", app.terminal_write_locks)
+        self.assertNotIn("old", app.scroll_states)
+        self.assertEqual(input_state["session"], "new")
+        self.assertEqual(app.mobile_composer_states["new"]["draft"], "")
+        input_bridge.command.assert_awaited_once_with("send-keys -t %1 -H 78")
 
 
 class ClientProtocolSourceTest(unittest.TestCase):
@@ -613,6 +2060,13 @@ class ClientProtocolSourceTest(unittest.TestCase):
         self.assertIn('type: "history-reseed"', history)
         self.assertNotIn("activePaneLocalScroll = false", history)
         self.assertNotIn("copy-mode", history)
+
+    def test_selection_contract_includes_client_geometry(self):
+        selection_start = self.source.index("  function terminalSelectionState()")
+        selection_end = self.source.index("  function sameTerminalSelectionState", selection_start)
+        selection = self.source[selection_start:selection_end]
+        self.assertIn("cols: term.cols", selection)
+        self.assertIn("rows: term.rows", selection)
 
     def test_empty_authoritative_text_is_a_successful_copy_result(self):
         copy_start = self.source.index("  async function copyTerminalSelection()")

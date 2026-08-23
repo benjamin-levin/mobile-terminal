@@ -1469,6 +1469,8 @@
       revision: terminalRevision,
       cutoff: terminalCutoff,
       layoutGeneration: terminalLayoutGeneration,
+      cols: term.cols,
+      rows: term.rows,
       baseY: term.buffer.active.baseY,
       bufferType: term.buffer.active.type,
     };

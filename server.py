@@ -18,7 +18,7 @@ import subprocess
 import time
 import unicodedata
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlsplit
@@ -77,6 +77,8 @@ COMPOSER_CAPTURE_LOGICAL_LINES = 48
 COMPOSER_CAPTURE_MAX_CHARS = 12000
 COMPOSER_REFRESH_DELAYS = (0.02, 0.05, 0.09, 0.14, 0.2, 0.28, 0.38, 0.5)
 MOBILE_COMPOSER_FORCE_CLEAR_BACKSPACES = 1024
+COMMAND_PROVENANCE_MAX_CHARS = 65536
+COMMAND_PROVENANCE_RECORDS_PER_SESSION = 24
 FILE_TREE_MAX_ENTRIES = 600
 FILE_READ_MAX_BYTES = 2_000_000
 FILE_WRITE_MAX_BYTES = 2_000_000
@@ -413,6 +415,185 @@ TMUX_INPUT_CHUNK_BYTES = 1024
 
 
 @dataclass(frozen=True)
+class CommandProvenance:
+    session_name: str
+    pane_id: str
+    cols: int
+    rows: int
+    layout_generation: int
+    start_row: int
+    start_x: int
+    draft: str
+    revision: int
+    source: str
+    owner_id: int
+    row_epoch: int = 0
+    end_row: int | None = None
+    end_x: int | None = None
+    row_digest: str = ""
+    terminal_revision: int | None = None
+
+
+@dataclass(frozen=True)
+class AcceptedCommand:
+    session_name: str
+    pane_id: str
+    cols: int
+    rows: int
+    layout_generation: int
+    start_row: int
+    start_x: int
+    end_row: int
+    end_x: int
+    draft: str
+    revision: int
+    source: str
+    row_digest: str
+    row_epoch: int = 0
+
+
+@dataclass(frozen=True)
+class SnapshotRowIdentity:
+    epoch: int
+    first_row: int
+
+
+@dataclass
+class PaneRowTracker:
+    epoch: int = 0
+    pane_id: str = ""
+    history: int = -1
+    history_limit: int = 0
+    first_absolute_row: int = 0
+    first_row: int = 0
+    revision: int = -1
+    plain_rows: tuple[str, ...] = ()
+
+    def invalidate(self) -> None:
+        self.epoch += 1
+        self.pane_id = ""
+        self.history = -1
+        self.history_limit = 0
+        self.revision = -1
+        self.plain_rows = ()
+
+    def observe(self, snapshot: "PaneSnapshot", revision: int) -> SnapshotRowIdentity:
+        first_absolute_row = snapshot.history - snapshot.seed_history
+        rows = tuple(snapshot.plain_physical_rows)
+        if not self.pane_id or self.pane_id != snapshot.pane_id:
+            if self.pane_id:
+                self.epoch += 1
+            first_row = 0
+        elif snapshot.history < self.history:
+            self.epoch += 1
+            first_row = 0
+        elif snapshot.history > self.history:
+            first_row = self.first_row + first_absolute_row - self.first_absolute_row
+        else:
+            expected_delta = first_absolute_row - self.first_absolute_row
+            delta = self._matching_delta(
+                rows,
+                expected_delta,
+                revision,
+                snapshot.history_limit,
+            )
+            if delta is None:
+                self.epoch += 1
+                first_row = 0
+            else:
+                first_row = self.first_row + delta
+        self.pane_id = snapshot.pane_id
+        self.history = snapshot.history
+        self.history_limit = snapshot.history_limit
+        self.first_absolute_row = first_absolute_row
+        self.first_row = first_row
+        self.revision = revision
+        self.plain_rows = rows
+        return SnapshotRowIdentity(self.epoch, first_row)
+
+    def _matching_delta(
+        self,
+        rows: tuple[str, ...],
+        expected_delta: int,
+        revision: int,
+        history_limit: int,
+    ) -> int | None:
+        if revision == self.revision:
+            return expected_delta
+        if rows == self.plain_rows:
+            return None
+        if (
+            self.history_limit > 0
+            and history_limit > 0
+            and self.history < self.history_limit
+            and self.history < history_limit
+        ):
+            return expected_delta
+        if not rows or not self.plain_rows:
+            return None
+
+        prefix = [0] * len(rows)
+        for index in range(1, len(rows)):
+            matched = prefix[index - 1]
+            while matched and rows[index] != rows[matched]:
+                matched = prefix[matched - 1]
+            if rows[index] == rows[matched]:
+                matched += 1
+            prefix[index] = matched
+
+        matched = 0
+        for row in self.plain_rows:
+            while matched and (matched == len(rows) or row != rows[matched]):
+                matched = prefix[matched - 1]
+            if row == rows[matched]:
+                matched += 1
+        deltas = []
+        while matched:
+            delta = len(self.plain_rows) - matched
+            if delta >= expected_delta:
+                deltas.append(delta)
+            matched = prefix[matched - 1]
+        if len(deltas) != 1:
+            return None
+        return deltas[0]
+
+
+@dataclass
+class CommandProvenanceState:
+    layout_generation: int = 0
+    tracking_generation: int = 0
+    row_tracker: PaneRowTracker = field(default_factory=PaneRowTracker)
+    active: CommandProvenance | None = None
+    accepted_records: deque[AcceptedCommand] = field(
+        default_factory=lambda: deque(maxlen=COMMAND_PROVENANCE_RECORDS_PER_SESSION)
+    )
+    owner_pids: set[int] = field(default_factory=set)
+    fence_task: asyncio.Task[None] | None = None
+
+    def cancel_fence(self) -> None:
+        task = self.fence_task
+        self.fence_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def invalidate_active(self) -> None:
+        self.cancel_fence()
+        self.tracking_generation += 1
+        self.active = None
+
+    def invalidate_layout(self) -> None:
+        self.layout_generation += 1
+        self.row_tracker.invalidate()
+        self.invalidate_active()
+
+    def remember(self, record: AcceptedCommand) -> None:
+        self.accepted_records.append(record)
+
+    def accepted(self, pane_id: str) -> tuple[AcceptedCommand, ...]:
+        return tuple(record for record in self.accepted_records if record.pane_id == pane_id)
+
+
+@dataclass(frozen=True)
 class PaneSnapshot:
     pane_id: str
     history: int
@@ -440,11 +621,13 @@ class PaneSnapshot:
     physical_rows: list[str]
     plain_physical_rows: list[str]
     authored_lines: list[str]
+    history_limit: int = 0
 
     def metadata(self) -> dict[str, Any]:
         return {
             "paneId": self.pane_id,
             "history": self.history,
+            "historyLimit": self.history_limit,
             "seedHistory": self.seed_history,
             "cols": self.cols,
             "rows": self.rows,
@@ -486,14 +669,17 @@ def pane_metadata(session_name: str, pane_id: str | None = None) -> tuple[Any, .
         "\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_blinking}\t#{cursor_shape}"
         "\t#{insert_flag}\t#{keypad_cursor_flag}\t#{keypad_flag}\t#{origin_flag}\t#{wrap_flag}"
         "\t#{mouse_standard_flag}\t#{mouse_button_flag}\t#{mouse_any_flag}\t#{mouse_sgr_flag}"
-        "\t#{scroll_region_upper}\t#{scroll_region_lower}\t#{pane_tabs}",
+        "\t#{scroll_region_upper}\t#{scroll_region_lower}\t#{pane_tabs}\t#{history_limit}",
         check=False,
     )
     fields = result.stdout.rstrip("\n").split("\t")
-    if result.returncode != 0 or len(fields) != 22 or not fields[0].startswith("%"):
+    if result.returncode != 0 or len(fields) != 23 or not fields[0].startswith("%"):
         raise RuntimeError("active tmux pane is unavailable")
     try:
-        numeric = {index: int(fields[index] or 0) for index in (*range(1, 9), *range(10, 21))}
+        numeric = {
+            index: int(fields[index] or 0)
+            for index in (*range(1, 9), *range(10, 21), 22)
+        }
         tab_stops = tuple(int(value) for value in fields[21].split(",") if value)
     except ValueError as exc:
         raise RuntimeError("tmux returned invalid pane metadata") from exc
@@ -503,6 +689,7 @@ def pane_metadata(session_name: str, pane_id: str | None = None) -> tuple[Any, .
         fields[9],
         *(numeric[index] for index in range(10, 21)),
         tab_stops,
+        numeric[22],
     )
 
 
@@ -535,6 +722,7 @@ def capture_pane_snapshot(
         scroll_upper,
         scroll_lower,
         tab_stops,
+        history_limit,
     ) = before
     seed_history = 0 if alternate else min(history, max(0, history_lines))
     start = str(-seed_history)
@@ -590,7 +778,158 @@ def capture_pane_snapshot(
         physical_rows=physical_rows,
         plain_physical_rows=plain_physical_rows,
         authored_lines=authored_lines,
+        history_limit=history_limit,
     )
+
+
+def _command_row_digest(
+    snapshot: PaneSnapshot,
+    start_row: int,
+    end_row: int,
+) -> str:
+    first_absolute_row = snapshot.history - snapshot.seed_history
+    first_index = start_row - first_absolute_row
+    last_index = end_row - first_absolute_row
+    if (
+        start_row > end_row
+        or first_index < 0
+        or last_index < first_index
+        or last_index >= len(snapshot.plain_physical_rows)
+    ):
+        raise RuntimeError("command rows are outside the authoritative snapshot")
+    digest = hashlib.sha256()
+    for row in snapshot.plain_physical_rows[first_index : last_index + 1]:
+        encoded = row.encode("utf-8", "surrogateescape")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _identity_row(
+    snapshot: PaneSnapshot,
+    identity: SnapshotRowIdentity,
+    absolute_row: int,
+) -> int:
+    return identity.first_row + absolute_row - (snapshot.history - snapshot.seed_history)
+
+
+def _absolute_row(
+    snapshot: PaneSnapshot,
+    identity: SnapshotRowIdentity,
+    identity_row: int,
+) -> int:
+    return snapshot.history - snapshot.seed_history + identity_row - identity.first_row
+
+
+def _coordinate_intersects(
+    selection_start: tuple[int, int],
+    selection_end: tuple[int, int],
+    command_start: tuple[int, int],
+    command_end: tuple[int, int],
+) -> bool:
+    return selection_start < command_end and command_start < selection_end
+
+
+def exact_provenance_selection(
+    snapshot: PaneSnapshot,
+    session_name: str,
+    layout_generation: int,
+    selection_start: tuple[int, int],
+    selection_end: tuple[int, int],
+    active: CommandProvenance | None,
+    accepted: tuple[AcceptedCommand, ...],
+    identity: SnapshotRowIdentity | None = None,
+    selected_text: str | None = None,
+    ownership_valid: bool = True,
+    terminal_revision: int | None = None,
+) -> tuple[bool, str | None]:
+    del selected_text
+    if identity is None:
+        identity = SnapshotRowIdentity(0, snapshot.history - snapshot.seed_history)
+    cursor_end = (
+        _identity_row(snapshot, identity, snapshot.history + snapshot.cursor_y),
+        snapshot.cursor_x,
+    )
+    candidates: list[tuple[Any, tuple[int, int], tuple[int, int]]] = []
+    stale_intersection = False
+    if active is not None and active.pane_id == snapshot.pane_id:
+        active_start = (active.start_row, active.start_x)
+        active_end = (
+            (active.end_row, active.end_x)
+            if active.end_row is not None and active.end_x is not None
+            else cursor_end
+        )
+        if _coordinate_intersects(selection_start, selection_end, active_start, active_end):
+            try:
+                absolute_start = _absolute_row(snapshot, identity, active.start_row)
+                absolute_end = _absolute_row(snapshot, identity, active_end[0])
+                valid_active = bool(
+                    ownership_valid
+                    and active.row_epoch == identity.epoch
+                    and active.session_name == session_name
+                    and active.cols == snapshot.cols
+                    and active.rows == snapshot.rows
+                    and active.layout_generation == layout_generation
+                    and active.source == "composer-sync"
+                    and len(active.draft) <= COMMAND_PROVENANCE_MAX_CHARS
+                    and active.end_row is not None
+                    and active.end_x is not None
+                    and active.row_digest
+                    and (
+                        terminal_revision is None
+                        or active.terminal_revision == terminal_revision
+                    )
+                    and active_end == cursor_end
+                    and _command_row_digest(snapshot, absolute_start, absolute_end)
+                    == active.row_digest
+                )
+            except RuntimeError:
+                valid_active = False
+            if valid_active:
+                candidates.append((active, active_start, active_end))
+            else:
+                stale_intersection = True
+    for record in accepted:
+        record_start = (record.start_row, record.start_x)
+        record_end = (record.end_row, record.end_x)
+        if record.row_epoch != identity.epoch:
+            if _coordinate_intersects(selection_start, selection_end, record_start, record_end):
+                stale_intersection = True
+            continue
+        if not _coordinate_intersects(selection_start, selection_end, record_start, record_end):
+            continue
+        try:
+            absolute_start = _absolute_row(snapshot, identity, record.start_row)
+            absolute_end = _absolute_row(snapshot, identity, record.end_row)
+            valid_record = bool(
+                ownership_valid
+                and record.session_name == session_name
+                and record.pane_id == snapshot.pane_id
+                and record.cols == snapshot.cols
+                and record.rows == snapshot.rows
+                and record.layout_generation == layout_generation
+                and record.source == "composer-sync"
+                and _command_row_digest(snapshot, absolute_start, absolute_end)
+                == record.row_digest
+            )
+        except RuntimeError:
+            valid_record = False
+        if valid_record:
+            candidates.append((record, record_start, record_end))
+        else:
+            stale_intersection = True
+
+    if not candidates:
+        if stale_intersection:
+            raise RuntimeError("visible command does not match tracked composer state")
+        return False, None
+    if len(candidates) != 1:
+        raise RuntimeError("selection intersects ambiguous command provenance")
+
+    record, command_start, command_end = candidates[0]
+    if selection_start != command_start or selection_end != command_end:
+        raise RuntimeError("selection only partially covers command provenance")
+    return True, record.draft
 
 
 GRAPHEME_RE = regex.compile(r"\X")
@@ -914,6 +1253,35 @@ def list_session_clients(session_name: str) -> list[dict[str, str]]:
     return clients
 
 
+def list_session_client_processes(session_name: str) -> list[tuple[int, bool]]:
+    result = tmux_capture(
+        "list-clients",
+        "-t",
+        session_name,
+        "-F",
+        "#{client_pid}\t#{client_control_mode}",
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+
+    clients: list[tuple[int, bool]] = []
+    for line in result.stdout.splitlines():
+        pid, separator, control_mode = line.partition("\t")
+        try:
+            clients.append((int(pid), separator == "\t" and control_mode == "1"))
+        except ValueError:
+            clients.append((-1, False))
+    return clients
+
+
+def session_clients_are_owned(session_name: str, owner_pids: set[int]) -> bool:
+    # Unknown attached clients can mutate ZLE without crossing the shared write
+    # lock, so exact composer provenance is deliberately unavailable while one exists.
+    clients = list_session_client_processes(session_name)
+    return bool(clients) and all(control_mode and pid in owner_pids for pid, control_mode in clients)
+
+
 def detach_other_clients(session_name: str, keep_pid: int | None = None) -> int:
     detached = 0
     keep_pid_str = str(keep_pid) if keep_pid else ""
@@ -1215,6 +1583,7 @@ def default_mobile_composer_state() -> dict[str, Any]:
         "tracked": False,
         "revision": 0,
         "source": "reset",
+        "provenanceStartAllowed": True,
     }
 
 
@@ -2058,6 +2427,8 @@ class TmuxBridge:
         initial_size: tuple[int, int] | None = None,
         epoch_state: dict[str, int] | None = None,
         profile_id: str = "",
+        provenance_state: CommandProvenanceState | None = None,
+        write_lock: asyncio.Lock | None = None,
     ) -> None:
         self.connection = connection
         self.session_name = session_name
@@ -2067,6 +2438,7 @@ class TmuxBridge:
         self.initial_size = initial_size
         self.profile_id = profile_id
         self.epoch_state = epoch_state if epoch_state is not None else {"epoch": 0, "layout": 0}
+        self.provenance_state = provenance_state or CommandProvenanceState()
         self.process: subprocess.Popen[bytes] | None = None
         self.pane_id = ""
         self.offset = 0
@@ -2080,7 +2452,7 @@ class TmuxBridge:
         self.read_task: asyncio.Task[Any] | None = None
         self.send_lock = asyncio.Lock()
         self.seed_lock = asyncio.Lock()
-        self.write_lock = asyncio.Lock()
+        self.write_lock = write_lock or asyncio.Lock()
         self.closing = False
         self.closed = False
         self.command_waiters: deque[asyncio.Future[list[bytes]]] = deque()
@@ -2110,30 +2482,35 @@ class TmuxBridge:
         return bytes(output)
 
     async def open(self) -> None:
-        if self.create_if_missing:
-            ensure_session(self.session_name, self.shell, self.cwd)
-        env = terminal_child_environment()
-        env["TERM"] = "xterm-256color"
-        env["COLORTERM"] = "truecolor"
-        self.process = subprocess.Popen(
-            ["tmux", "-C", "attach-session", "-t", self.session_name],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            cwd=self.cwd,
-            env=env,
-            start_new_session=True,
-            close_fds=True,
-        )
-        assert self.process.stdout is not None
-        os.set_blocking(self.process.stdout.fileno(), False)
-        self.read_task = asyncio.create_task(self.read_loop())
-        await asyncio.wait_for(self.initial_block_seen.wait(), timeout=3)
-        self.pane_id = str(pane_metadata(self.session_name)[0])
-        cols, rows = self.initial_size or (140, 40)
-        await self.set_size(cols, rows)
-        self.last_output_at = time.monotonic()
-        await self.quiet(0.1)
+        try:
+            if self.create_if_missing:
+                ensure_session(self.session_name, self.shell, self.cwd)
+            env = terminal_child_environment()
+            env["TERM"] = "xterm-256color"
+            env["COLORTERM"] = "truecolor"
+            self.process = subprocess.Popen(
+                ["tmux", "-C", "attach-session", "-t", self.session_name],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                cwd=self.cwd,
+                env=env,
+                start_new_session=True,
+                close_fds=True,
+            )
+            self.provenance_state.owner_pids.add(self.process.pid)
+            assert self.process.stdout is not None
+            os.set_blocking(self.process.stdout.fileno(), False)
+            self.read_task = asyncio.create_task(self.read_loop())
+            await asyncio.wait_for(self.initial_block_seen.wait(), timeout=3)
+            self.pane_id = str(pane_metadata(self.session_name)[0])
+            cols, rows = self.initial_size or (140, 40)
+            await self.set_size(cols, rows)
+            self.last_output_at = time.monotonic()
+            await self.quiet(0.1)
+        except BaseException:
+            await self.close()
+            raise
 
     async def command(self, command: str) -> list[bytes]:
         if not self.process or self.process.poll() is not None or self.process.stdin is None:
@@ -2144,7 +2521,14 @@ class TmuxBridge:
         self.process.stdin.flush()
         return await asyncio.wait_for(future, timeout=3)
 
-    async def set_size(self, cols: int, rows: int) -> None:
+    async def _set_size_locked(self, cols: int, rows: int) -> None:
+        try:
+            metadata = await asyncio.to_thread(pane_metadata, self.session_name, self.pane_id)
+            dimensions_changed = metadata[2:4] != (cols, rows)
+        except RuntimeError:
+            dimensions_changed = True
+        if dimensions_changed:
+            self.provenance_state.invalidate_layout()
         await self.command(f"refresh-client -C {cols},{rows}")
         await asyncio.to_thread(
             tmux_capture,
@@ -2157,6 +2541,10 @@ class TmuxBridge:
             str(rows),
             check=False,
         )
+
+    async def set_size(self, cols: int, rows: int) -> None:
+        async with self.write_lock:
+            await self._set_size_locked(cols, rows)
 
     async def resize(self, cols: int, rows: int) -> None:
         async def mutate() -> None:
@@ -2230,6 +2618,18 @@ class TmuxBridge:
             if separator and len(parts) >= 3:
                 await self.pane_bytes(parts[1].decode("ascii", "ignore"), self.unescape_control(value))
             return
+        if line.startswith(b"%client-session-changed "):
+            parts = line.split(b" ", 2)
+            client_name = parts[1].decode("ascii", "ignore") if len(parts) > 1 else ""
+            client_pid = -1
+            if client_name.startswith("client-"):
+                try:
+                    client_pid = int(client_name.removeprefix("client-"))
+                except ValueError:
+                    pass
+            if client_pid not in self.provenance_state.owner_pids:
+                self.provenance_state.invalidate_active()
+            return
         if line.startswith((b"%window-pane-changed ", b"%session-window-changed ")):
             self.pane_change.set()
             return
@@ -2267,6 +2667,14 @@ class TmuxBridge:
             await asyncio.sleep(0.015)
         raise RuntimeError("tmux pane output did not quiesce")
 
+    async def _write_locked(self, raw: bytes) -> None:
+        if self.closing or self.closed:
+            raise RuntimeError("tmux control client is closed")
+        target = self.pane_id or self.session_name
+        for offset in range(0, len(raw), TMUX_INPUT_CHUNK_BYTES):
+            chunk = raw[offset : offset + TMUX_INPUT_CHUNK_BYTES]
+            await self.command(f"send-keys -t {target} -H {chunk.hex(' ')}")
+
     async def write(self, data: str | bytes) -> None:
         if isinstance(data, bytes):
             raw = data
@@ -2278,12 +2686,291 @@ class TmuxBridge:
         if not raw:
             return
         async with self.write_lock:
-            if self.closing or self.closed:
-                raise RuntimeError("tmux control client is closed")
-            target = self.pane_id or self.session_name
-            for offset in range(0, len(raw), TMUX_INPUT_CHUNK_BYTES):
-                chunk = raw[offset : offset + TMUX_INPUT_CHUNK_BYTES]
-                await self.command(f"send-keys -t {target} -H {chunk.hex(' ')}")
+            await self._write_locked(raw)
+
+    async def settle_active_provenance_fence(self) -> None:
+        while True:
+            task = self.provenance_state.fence_task
+            if task is None:
+                return
+            try:
+                await asyncio.shield(task)
+            except RuntimeError:
+                pass
+            if self.provenance_state.fence_task in (None, task):
+                return
+
+    def schedule_active_provenance_fence(self, active: CommandProvenance) -> None:
+        self.provenance_state.cancel_fence()
+        task = asyncio.create_task(self._capture_active_provenance_fence(active))
+        self.provenance_state.fence_task = task
+
+        def clear(completed: asyncio.Task[None]) -> None:
+            if self.provenance_state.fence_task is completed:
+                self.provenance_state.fence_task = None
+
+        task.add_done_callback(clear)
+
+    async def _capture_active_provenance_fence(self, active: CommandProvenance) -> None:
+        try:
+            await asyncio.sleep(0.04)
+            await self.quiet(0.05, timeout=0.4)
+            async with self.seed_lock:
+                async with self.write_lock:
+                    stable_offset = self.offset
+                    if not await asyncio.to_thread(
+                        session_clients_are_owned,
+                        self.session_name,
+                        set(self.provenance_state.owner_pids),
+                    ):
+                        return
+                    snapshot = await asyncio.to_thread(
+                        capture_pane_snapshot,
+                        self.session_name,
+                        self.pane_id,
+                        CONNECT_HISTORY_LINES,
+                    )
+                    await self.quiet(0.02, timeout=0.15)
+                    ownership_valid = await asyncio.to_thread(
+                        session_clients_are_owned,
+                        self.session_name,
+                        set(self.provenance_state.owner_pids),
+                    )
+                    if (
+                        self.offset != stable_offset
+                        or self.provenance_state.active is not active
+                        or active.owner_id != id(self)
+                        or active.session_name != self.session_name
+                        or active.pane_id != snapshot.pane_id
+                        or active.cols != snapshot.cols
+                        or active.rows != snapshot.rows
+                        or active.layout_generation != self.provenance_state.layout_generation
+                        or not ownership_valid
+                    ):
+                        return
+                    identity = self.provenance_state.row_tracker.observe(snapshot, stable_offset)
+                    if active.row_epoch != identity.epoch:
+                        return
+                    end_absolute_row = snapshot.history + snapshot.cursor_y
+                    start_absolute_row = _absolute_row(snapshot, identity, active.start_row)
+                    if (end_absolute_row, snapshot.cursor_x) <= (start_absolute_row, active.start_x):
+                        return
+                    self.provenance_state.active = replace(
+                        active,
+                        end_row=_identity_row(snapshot, identity, end_absolute_row),
+                        end_x=snapshot.cursor_x,
+                        row_digest=_command_row_digest(snapshot, start_absolute_row, end_absolute_row),
+                        terminal_revision=stable_offset,
+                    )
+        except (asyncio.CancelledError, RuntimeError, asyncio.TimeoutError):
+            return
+
+    async def write_with_command_start(
+        self,
+        data: str,
+        draft: str,
+        revision: int,
+        tracking_generation: int,
+    ) -> CommandProvenance | None:
+        raw = data.encode("utf-8", "surrogateescape")
+        if not raw:
+            return None
+        async with self.seed_lock:
+            async with self.write_lock:
+                start: tuple[str, int, int, int, int, int, int] | None = None
+                try:
+                    if not await asyncio.to_thread(
+                        session_clients_are_owned,
+                        self.session_name,
+                        set(self.provenance_state.owner_pids),
+                    ):
+                        raise RuntimeError("tmux session has an unowned client")
+                    await self.quiet(0.03, timeout=0.12)
+                    stable_offset = self.offset
+                    snapshot = await asyncio.to_thread(
+                        capture_pane_snapshot,
+                        self.session_name,
+                        self.pane_id,
+                        CONNECT_HISTORY_LINES,
+                    )
+                    if self.offset == stable_offset and not snapshot.alternate:
+                        identity = self.provenance_state.row_tracker.observe(snapshot, stable_offset)
+                        start = (
+                            snapshot.pane_id,
+                            snapshot.cols,
+                            snapshot.rows,
+                            _identity_row(
+                                snapshot,
+                                identity,
+                                snapshot.history + snapshot.cursor_y,
+                            ),
+                            snapshot.cursor_x,
+                            self.provenance_state.layout_generation,
+                            identity.epoch,
+                        )
+                except RuntimeError:
+                    start = None
+                await self._write_locked(raw)
+                if (
+                    start is None
+                    or self.provenance_state.tracking_generation != tracking_generation
+                    or self.provenance_state.active is not None
+                ):
+                    return None
+                pane_id, cols, rows, start_row, start_x, layout_generation, row_epoch = start
+                active = CommandProvenance(
+                    session_name=self.session_name,
+                    pane_id=pane_id,
+                    cols=cols,
+                    rows=rows,
+                    layout_generation=layout_generation,
+                    start_row=start_row,
+                    start_x=start_x,
+                    draft=draft,
+                    revision=revision,
+                    source="composer-sync",
+                    owner_id=id(self),
+                    row_epoch=row_epoch,
+                )
+                self.provenance_state.active = active
+                return active
+
+    async def write_command_continuation(
+        self,
+        data: str,
+        active: CommandProvenance,
+        draft: str,
+        revision: int,
+        tracking_generation: int,
+    ) -> CommandProvenance | None:
+        raw = data.encode("utf-8", "surrogateescape")
+        self.provenance_state.cancel_fence()
+        async with self.write_lock:
+            if raw:
+                await self._write_locked(raw)
+            if (
+                self.provenance_state.tracking_generation != tracking_generation
+                or self.provenance_state.active is not active
+            ):
+                return None
+            updated = replace(
+                active,
+                draft=draft,
+                revision=revision,
+                end_row=None,
+                end_x=None,
+                row_digest="",
+                terminal_revision=None,
+            )
+            self.provenance_state.active = updated
+            return updated
+
+    async def write_accepted_enter(
+        self,
+        active: CommandProvenance | None,
+        revision: int,
+        tracking_generation: int,
+    ) -> AcceptedCommand | None:
+        async with self.seed_lock:
+            async with self.write_lock:
+                record: AcceptedCommand | None = None
+                if (
+                    active is not None
+                    and revision > active.revision
+                    and active.end_row is not None
+                    and active.end_x is not None
+                    and active.row_digest
+                ):
+                    try:
+                        await self.quiet(0.05, timeout=0.35)
+                        stable_offset = self.offset
+                        stable_epoch = self.epoch_state["epoch"]
+                        stable_layout = self.epoch_state["layout"]
+                        if not await asyncio.to_thread(
+                            session_clients_are_owned,
+                            self.session_name,
+                            set(self.provenance_state.owner_pids),
+                        ):
+                            raise RuntimeError("tmux session has an unowned client")
+                        snapshot = await asyncio.to_thread(
+                            capture_pane_snapshot,
+                            self.session_name,
+                            self.pane_id,
+                            MAX_HISTORY_SEED_LINES,
+                        )
+                        await self.quiet(0.03, timeout=0.15)
+                        identity = self.provenance_state.row_tracker.observe(snapshot, stable_offset)
+                        start_absolute_row = _absolute_row(snapshot, identity, active.start_row)
+                        end_absolute_row = _absolute_row(snapshot, identity, active.end_row)
+                        row_digest = _command_row_digest(
+                            snapshot,
+                            start_absolute_row,
+                            end_absolute_row,
+                        )
+                        cursor_end = (
+                            _identity_row(
+                                snapshot,
+                                identity,
+                                snapshot.history + snapshot.cursor_y,
+                            ),
+                            snapshot.cursor_x,
+                        )
+                        ownership_valid = await asyncio.to_thread(
+                            session_clients_are_owned,
+                            self.session_name,
+                            set(self.provenance_state.owner_pids),
+                        )
+                        if (
+                            self.offset == stable_offset
+                            and self.epoch_state["epoch"] == stable_epoch
+                            and self.epoch_state["layout"] == stable_layout
+                            and active.terminal_revision == stable_offset
+                            and self.provenance_state.tracking_generation
+                            == tracking_generation
+                            and self.provenance_state.active is active
+                            and active.session_name == self.session_name
+                            and active.owner_id == id(self)
+                            and active.pane_id == snapshot.pane_id
+                            and active.cols == snapshot.cols
+                            and active.rows == snapshot.rows
+                            and active.layout_generation
+                            == self.provenance_state.layout_generation
+                            and active.source == "composer-sync"
+                            and active.row_epoch == identity.epoch
+                            and cursor_end == (active.end_row, active.end_x)
+                            and row_digest == active.row_digest
+                            and ownership_valid
+                        ):
+                            record = AcceptedCommand(
+                                session_name=active.session_name,
+                                pane_id=active.pane_id,
+                                cols=active.cols,
+                                rows=active.rows,
+                                layout_generation=active.layout_generation,
+                                start_row=active.start_row,
+                                start_x=active.start_x,
+                                end_row=active.end_row,
+                                end_x=active.end_x,
+                                draft=active.draft,
+                                revision=revision,
+                                source=active.source,
+                                row_digest=row_digest,
+                                row_epoch=identity.epoch,
+                            )
+                    except (RuntimeError, asyncio.TimeoutError):
+                        record = None
+                await self._write_locked(b"\r")
+                if (
+                    record is not None
+                    and self.provenance_state.tracking_generation == tracking_generation
+                    and self.provenance_state.active is active
+                ):
+                    self.provenance_state.remember(record)
+                else:
+                    record = None
+                if self.provenance_state.active is active:
+                    self.provenance_state.active = None
+                return record
 
     def acknowledge(self, payload: dict[str, Any]) -> bool:
         message_type = payload.get("type")
@@ -2372,6 +3059,10 @@ class TmuxBridge:
         async with self.seed_lock:
             if self.closing or self.closed:
                 return
+            if reason == "pane-change":
+                self.provenance_state.invalidate_layout()
+            elif reason in ("history", "initial", "session-switch"):
+                self.provenance_state.invalidate_active()
             async with self.send_lock:
                 self.phase = "hold"
                 self.held = []
@@ -2468,6 +3159,8 @@ class TmuxBridge:
             revision = int(payload.get("revision", -1))
             cutoff = int(payload.get("cutoff", -1))
             layout_generation = int(payload.get("layoutGeneration", -1))
+            client_cols = int(payload.get("cols", -1))
+            client_rows = int(payload.get("rows", -1))
             base_y = int(payload.get("baseY", -1))
             start = payload["selection"]["start"]
             end = payload["selection"]["end"]
@@ -2485,75 +3178,136 @@ class TmuxBridge:
         ):
             return None, stale_message
 
+        await self.settle_active_provenance_fence()
         async with self.seed_lock:
-            async with self.send_lock:
-                if self.phase != "forward" or revision != self.offset:
-                    return None, stale_message
-                self.phase = "hold"
-                self.held = []
-                stable_offset = self.offset
-                event = asyncio.Event()
-                ack_payload: dict[str, Any] = {}
-                self.selection_acks[request_id] = (event, ack_payload)
-                await self._send_json({"type": "selection-check", "requestId": request_id})
-            try:
-                await asyncio.wait_for(event.wait(), timeout=5)
-                if ack_payload.get("unchanged") is not True:
-                    return None, stale_message
-                self.last_output_at = time.monotonic()
-                await self.quiet(0.1)
-                if self.offset != stable_offset:
-                    return None, stale_message
-                snapshot = await asyncio.to_thread(
-                    capture_pane_snapshot,
-                    self.session_name,
-                    self.pane_id,
-                    max(base_y, self.seed_history, CONNECT_HISTORY_LINES),
-                )
-                self.last_output_at = time.monotonic()
-                await self.quiet(0.05)
-                if self.offset != stable_offset:
-                    return None, stale_message
-                if snapshot.alternate != (payload.get("bufferType") == "alternate"):
-                    return None, stale_message
-                expected_base = 0 if snapshot.alternate else snapshot.seed_history
-                if base_y != expected_base:
-                    return None, stale_message
-                return (
-                    extract_authoritative_selection(
+            async with self.write_lock:
+                async with self.send_lock:
+                    if (
+                        self.phase != "forward"
+                        or revision != self.offset
+                        or epoch != self.epoch_state["epoch"]
+                        or cutoff != self.cutoff
+                        or layout_generation != self.epoch_state["layout"]
+                    ):
+                        return None, stale_message
+                    self.phase = "hold"
+                    self.held = []
+                    stable_offset = self.offset
+                    stable_epoch = self.epoch_state["epoch"]
+                    stable_layout = self.epoch_state["layout"]
+                    event = asyncio.Event()
+                    ack_payload: dict[str, Any] = {}
+                    self.selection_acks[request_id] = (event, ack_payload)
+                    await self._send_json({"type": "selection-check", "requestId": request_id})
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=5)
+                    if ack_payload.get("unchanged") is not True:
+                        return None, stale_message
+                    self.last_output_at = time.monotonic()
+                    await self.quiet(0.1)
+                    if self.offset != stable_offset:
+                        return None, stale_message
+                    snapshot = await asyncio.to_thread(
+                        capture_pane_snapshot,
+                        self.session_name,
+                        self.pane_id,
+                        max(base_y, self.seed_history, CONNECT_HISTORY_LINES),
+                    )
+                    self.last_output_at = time.monotonic()
+                    await self.quiet(0.05)
+                    if self.offset != stable_offset:
+                        return None, stale_message
+                    if snapshot.cols != client_cols or snapshot.rows != client_rows:
+                        return None, stale_message
+                    if snapshot.alternate != (payload.get("bufferType") == "alternate"):
+                        return None, stale_message
+                    expected_base = 0 if snapshot.alternate else snapshot.seed_history
+                    if base_y != expected_base:
+                        return None, stale_message
+                    relative_start_row = start_y - base_y
+                    relative_end_row = end_y - base_y
+                    selected_text = extract_authoritative_selection(
                         snapshot,
                         start_x,
-                        start_y - base_y,
+                        relative_start_row,
                         end_x,
-                        end_y - base_y,
-                    ),
-                    None,
-                )
-            except (RuntimeError, ValueError, asyncio.TimeoutError):
-                return None, stale_message
-            finally:
-                self.selection_acks.pop(request_id, None)
-                await self._flush_selection_hold()
+                        relative_end_row,
+                    )
+                    identity = self.provenance_state.row_tracker.observe(snapshot, stable_offset)
+                    absolute_start_row = snapshot.history + relative_start_row
+                    absolute_end_row = snapshot.history + relative_end_row
+                    accepted = self.provenance_state.accepted(self.pane_id)
+                    active = self.provenance_state.active
+                    ownership_valid = True
+                    if active is not None or accepted:
+                        ownership_valid = await asyncio.to_thread(
+                            session_clients_are_owned,
+                            self.session_name,
+                            set(self.provenance_state.owner_pids),
+                        )
+                    if (
+                        self.offset != stable_offset
+                        or self.epoch_state["epoch"] != stable_epoch
+                        or self.epoch_state["layout"] != stable_layout
+                        or self.session_name != payload.get("session")
+                        or self.pane_id != snapshot.pane_id
+                    ):
+                        return None, stale_message
+                    matched, exact_text = exact_provenance_selection(
+                        snapshot,
+                        self.session_name,
+                        self.provenance_state.layout_generation,
+                        (_identity_row(snapshot, identity, absolute_start_row), start_x),
+                        (_identity_row(snapshot, identity, absolute_end_row), end_x),
+                        active,
+                        accepted,
+                        identity,
+                        selected_text,
+                        ownership_valid,
+                        stable_offset,
+                    )
+                    if matched:
+                        return exact_text or "", None
+                    return selected_text, None
+                except (RuntimeError, ValueError, asyncio.TimeoutError):
+                    return None, stale_message
+                finally:
+                    self.selection_acks.pop(request_id, None)
+                    await self._flush_selection_hold()
 
     async def close(self) -> None:
         self.closing = True
+        if (
+            self.provenance_state.active is not None
+            and self.provenance_state.active.owner_id == id(self)
+        ):
+            self.provenance_state.invalidate_active()
         async with self.seed_lock:
             async with self.write_lock:
                 if self.closed:
                     return
                 self.closed = True
-                if self.process and self.process.poll() is None:
-                    self.process.terminate()
+                process = self.process
+                owner_pid = process.pid if process else None
+                try:
                     try:
-                        await asyncio.wait_for(asyncio.to_thread(self.process.wait), timeout=1)
-                    except asyncio.TimeoutError:
-                        self.process.kill()
-                if self.read_task:
-                    self.read_task.cancel()
-                    try:
-                        await self.read_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                        if process and process.poll() is None:
+                            process.terminate()
+                            try:
+                                await asyncio.wait_for(asyncio.to_thread(process.wait), timeout=1)
+                            except asyncio.TimeoutError:
+                                process.kill()
+                                await asyncio.to_thread(process.wait)
+                    finally:
+                        if self.read_task:
+                            self.read_task.cancel()
+                            try:
+                                await self.read_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                finally:
+                    if owner_pid is not None:
+                        self.provenance_state.owner_pids.discard(owner_pid)
 
 
 class AppServer:
@@ -2593,6 +3347,11 @@ class AppServer:
             migrate_to_multitenant(self.owner)
         self.settings = load_settings()
         self.mobile_composer_states: dict[str, dict[str, Any]] = {}
+        self.command_provenance_states: dict[str, CommandProvenanceState] = {}
+        self.terminal_write_locks: dict[str, asyncio.Lock] = {}
+        self.live_terminal_connections: dict[
+            str, list[tuple[TmuxBridge, dict[str, Any]]]
+        ] = {}
         self.usage = load_usage()
         self.active_sessions = 0
         self.scroll_states: dict[str, dict[str, Any]] = {}
@@ -3259,6 +4018,86 @@ class AppServer:
             {"type": "devices", "devices": devices, "multiTenant": self.multi_tenant},
         )
 
+    def command_provenance_state(self, session_name: str) -> CommandProvenanceState:
+        if not hasattr(self, "command_provenance_states"):
+            self.command_provenance_states = {}
+        state = self.command_provenance_states.get(session_name)
+        if state is None:
+            state = CommandProvenanceState()
+            self.command_provenance_states[session_name] = state
+        return state
+
+    def terminal_write_lock(self, session_name: str) -> asyncio.Lock:
+        if not hasattr(self, "terminal_write_locks"):
+            self.terminal_write_locks = {}
+        lock = self.terminal_write_locks.get(session_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.terminal_write_locks[session_name] = lock
+        return lock
+
+    def register_live_terminal(
+        self,
+        session_name: str,
+        bridge: TmuxBridge,
+        state: dict[str, Any],
+    ) -> None:
+        if not hasattr(self, "live_terminal_connections"):
+            self.live_terminal_connections = {}
+        self.live_terminal_connections.setdefault(session_name, []).append((bridge, state))
+
+    def unregister_live_terminal(self, session_name: str, bridge: TmuxBridge) -> None:
+        if not hasattr(self, "live_terminal_connections"):
+            return
+        connections = self.live_terminal_connections.get(session_name, [])
+        connections = [entry for entry in connections if entry[0] is not bridge]
+        if connections:
+            self.live_terminal_connections[session_name] = connections
+        else:
+            self.live_terminal_connections.pop(session_name, None)
+
+    async def open_live_terminal(self, bridge: TmuxBridge, state: dict[str, Any]) -> None:
+        session_name = getattr(bridge, "session_name", state["session"])
+        self.register_live_terminal(session_name, bridge, state)
+        try:
+            await bridge.open()
+        except BaseException:
+            session_name = getattr(bridge, "session_name", state["session"])
+            self.unregister_live_terminal(session_name, bridge)
+            await bridge.close()
+            raise
+
+    def transfer_single_tenant_session_state(self, old_name: str, new_name: str) -> None:
+        for mapping_name in ("mobile_composer_states", "terminal_sizes", "scroll_states"):
+            mapping = getattr(self, mapping_name, None)
+            if mapping is not None and old_name in mapping:
+                mapping[new_name] = mapping.pop(old_name)
+        provenance = self.command_provenance_states.pop(old_name, None)
+        if provenance is not None:
+            if provenance.active is not None:
+                provenance.active = replace(provenance.active, session_name=new_name)
+            provenance.accepted_records = deque(
+                (replace(record, session_name=new_name) for record in provenance.accepted_records),
+                maxlen=COMMAND_PROVENANCE_RECORDS_PER_SESSION,
+            )
+            self.command_provenance_states[new_name] = provenance
+        lock = self.terminal_write_locks.pop(old_name, None)
+        if lock is not None:
+            self.terminal_write_locks[new_name] = lock
+        connections = self.live_terminal_connections.pop(old_name, [])
+        if connections:
+            self.live_terminal_connections.setdefault(new_name, []).extend(connections)
+            for live_bridge, live_state in connections:
+                live_bridge.session_name = new_name
+                if provenance is not None:
+                    live_bridge.provenance_state = provenance
+                if lock is not None:
+                    live_bridge.write_lock = lock
+                live_state["session"] = new_name
+
+    def invalidate_command_provenance(self, session_name: str) -> None:
+        self.command_provenance_state(session_name).invalidate_active()
+
     def mobile_composer_state(self, session_name: str) -> dict[str, Any]:
         state = self.mobile_composer_states.get(session_name)
         if state is None:
@@ -3280,7 +4119,13 @@ class AppServer:
             },
         )
 
-    def reset_mobile_composer_tracking(self, session_name: str) -> None:
+    def reset_mobile_composer_tracking(
+        self,
+        session_name: str,
+        *,
+        allow_provenance_start: bool = False,
+    ) -> None:
+        self.invalidate_command_provenance(session_name)
         state = self.mobile_composer_state(session_name)
         state["draft"] = ""
         state["cursor"] = 0
@@ -3288,6 +4133,7 @@ class AppServer:
         state["pendingDraft"] = ""
         state["tracked"] = False
         state["source"] = "reset"
+        state["provenanceStartAllowed"] = allow_provenance_start
 
     async def force_clear_mobile_composer(
         self,
@@ -3297,9 +4143,10 @@ class AppServer:
     ) -> None:
         if pane_in_mode(session_name):
             tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
+        self.invalidate_command_provenance(session_name)
         sequence = CTRL_E + ("\u007f" * MOBILE_COMPOSER_FORCE_CLEAR_BACKSPACES) + CTRL_U
         await bridge.write(sequence)
-        self.reset_mobile_composer_tracking(session_name)
+        self.reset_mobile_composer_tracking(session_name, allow_provenance_start=True)
         state = self.mobile_composer_state(session_name)
         if revision is not None:
             state["revision"] = max(state["revision"], revision)
@@ -3314,8 +4161,10 @@ class AppServer:
         *,
         revision: int | None = None,
         reset_history_index: bool = True,
+        direct_provenance: bool = True,
     ) -> dict[str, Any]:
         state = self.mobile_composer_state(session_name)
+        provenance_state = self.command_provenance_state(session_name)
         next_value = value.replace("\r\n", "\n").replace("\r", "\n")
         sequence, next_cursor = build_composer_sync_sequence(
             state["draft"],
@@ -3323,10 +4172,68 @@ class AppServer:
             next_value,
             cursor,
         )
+        active = provenance_state.active
+        can_continue = bool(
+            direct_provenance
+            and active is not None
+            and active.owner_id == id(bridge)
+            and active.session_name == session_name
+            and active.pane_id == bridge.pane_id
+            and active.layout_generation == provenance_state.layout_generation
+            and active.draft == state["draft"]
+            and active.revision == state["revision"]
+            and state["tracked"]
+            and state["source"] == "composer-sync"
+            and state["cursor"] == len(state["draft"])
+            and revision is not None
+            and revision > active.revision
+            and next_cursor == len(next_value)
+            and len(next_value) <= COMMAND_PROVENANCE_MAX_CHARS
+        )
+        can_start = bool(
+            direct_provenance
+            and active is None
+            and state.get("provenanceStartAllowed") is True
+            and not state["tracked"]
+            and state["draft"] == ""
+            and state["cursor"] == 0
+            and sequence
+            and revision is not None
+            and revision > 0
+            and next_cursor == len(next_value)
+            and 0 < len(next_value) <= COMMAND_PROVENANCE_MAX_CHARS
+        )
+        if not can_continue and not can_start:
+            provenance_state.invalidate_active()
+
+        tracking_generation = provenance_state.tracking_generation
+        updated_active: CommandProvenance | None = None
         if pane_in_mode(session_name):
             tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
-        if sequence:
-            await bridge.write(sequence)
+        try:
+            if can_start:
+                updated_active = await bridge.write_with_command_start(
+                    sequence,
+                    next_value,
+                    revision or 0,
+                    tracking_generation,
+                )
+            elif can_continue:
+                updated_active = await bridge.write_command_continuation(
+                    sequence,
+                    active,
+                    next_value,
+                    revision or 0,
+                    tracking_generation,
+                )
+            elif sequence:
+                await bridge.write(sequence)
+        except (asyncio.CancelledError, Exception):
+            provenance_state.invalidate_active()
+            raise
+        if updated_active is not None:
+            bridge.schedule_active_provenance_fence(updated_active)
+
         state["draft"] = next_value
         state["cursor"] = next_cursor
         if revision is not None:
@@ -3336,6 +4243,7 @@ class AppServer:
             state["pendingDraft"] = next_value
         state["tracked"] = True
         state["source"] = "composer-sync"
+        state["provenanceStartAllowed"] = False
         return state
 
     async def commit_mobile_composer(
@@ -3344,11 +4252,40 @@ class AppServer:
         session_name: str,
         revision: int | None = None,
     ) -> None:
+        await bridge.settle_active_provenance_fence()
+        session_name = bridge.session_name
         state = self.mobile_composer_state(session_name)
+        provenance_state = self.command_provenance_state(session_name)
         line = state["draft"]
+        active = provenance_state.active
+        if not (
+            active is not None
+            and active.owner_id == id(bridge)
+            and active.draft == line
+            and active.revision == state["revision"]
+            and state["tracked"]
+            and state["source"] == "composer-sync"
+            and state["cursor"] == len(line)
+            and revision is not None
+            and revision > active.revision
+        ):
+            active = None
+            provenance_state.invalidate_active()
         if pane_in_mode(session_name):
             tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
-        await bridge.write("\r")
+        try:
+            if active is None:
+                await bridge.write("\r")
+                record = None
+            else:
+                record = await bridge.write_accepted_enter(
+                    active,
+                    revision or 0,
+                    provenance_state.tracking_generation,
+                )
+        except (asyncio.CancelledError, Exception):
+            provenance_state.invalidate_active()
+            raise
         if line:
             history = state["history"]
             history.append(line)
@@ -3356,7 +4293,7 @@ class AppServer:
                 del history[:-MOBILE_COMPOSER_HISTORY_LIMIT]
         if revision is not None:
             state["revision"] = max(state["revision"], revision)
-        self.reset_mobile_composer_tracking(session_name)
+        self.reset_mobile_composer_tracking(session_name, allow_provenance_start=True)
 
     async def fallback_mobile_composer_history(
         self,
@@ -3395,6 +4332,7 @@ class AppServer:
             len(next_value),
             revision=revision,
             reset_history_index=False,
+            direct_provenance=False,
         )
         next_state["historyIndex"] = history_index
         next_state["source"] = "history-fallback"
@@ -3501,6 +4439,7 @@ class AppServer:
         session_name: str,
         revision: int | None = None,
     ) -> dict[str, Any] | None:
+        self.invalidate_command_provenance(session_name)
         state = self.mobile_composer_state(session_name)
         baseline_draft = state["draft"]
         previous_delay = 0.0
@@ -3519,6 +4458,7 @@ class AppServer:
             if revision is not None:
                 state["revision"] = max(state["revision"], revision)
             state["source"] = source
+            state["provenanceStartAllowed"] = False
             return state
         return None
 
@@ -3533,6 +4473,7 @@ class AppServer:
         if not arrow:
             return None
 
+        self.invalidate_command_provenance(session_name)
         state = self.mobile_composer_state(session_name)
         save_pending_draft = direction == "up" and state["historyIndex"] is None
         await bridge.write(arrow)
@@ -3628,6 +4569,7 @@ class AppServer:
             # would silently drop in-flight scrolling.
             if message_type != "input" or input_is_user_keystroke(input_data):
                 await self.settle_scroll_history(session_name)
+            session_name = state["session"]
         if message_type == "composer-sync":
             await self.sync_mobile_composer(
                 bridge,
@@ -3639,6 +4581,7 @@ class AppServer:
             return
 
         if message_type == "composer-semantic-sync":
+            self.invalidate_command_provenance(session_name)
             composer_state = self.mobile_composer_state(session_name)
             composer_state["revision"] = max(composer_state["revision"], revision)
             source = str(payload.get("source", "semantic-osc133") or "semantic-osc133")
@@ -3658,6 +4601,7 @@ class AppServer:
             composer_state["pendingDraft"] = next_value
             composer_state["tracked"] = True
             composer_state["source"] = source
+            composer_state["provenanceStartAllowed"] = False
             await self.send_composer_state(connection, session_name)
             return
 
@@ -3736,14 +4680,19 @@ class AppServer:
             user_keystroke = input_is_user_keystroke(data)
             if user_keystroke and pane_in_mode(session_name):
                 tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
-            await bridge.write(data)
+            if data:
+                self.invalidate_command_provenance(session_name)
             if data and user_keystroke:
                 self.reset_mobile_composer_tracking(session_name)
+            await bridge.write(data)
+            if data:
+                self.invalidate_command_provenance(session_name)
             return
 
         if message_type == "resize":
             cols = max(20, int(payload.get("cols", 80)))
             rows = max(6, int(payload.get("rows", 24)))
+            self.invalidate_command_provenance(session_name)
             self.terminal_sizes[session_name] = (cols, rows)
             await bridge.resize(cols, rows)
             return
@@ -4021,21 +4970,25 @@ class AppServer:
                 await self.send_sessions(connection, user, state["session"])
                 return
             if name:
-                if target_name != name and session_exists(name):
-                    await self.send_json(
-                        connection,
-                        {"type": "notice", "message": f"Session '{name}' already exists."},
+                rename_lock = self.terminal_write_lock(target_name)
+                async with rename_lock:
+                    if target_name != name and session_exists(name):
+                        await self.send_json(
+                            connection,
+                            {"type": "notice", "message": f"Session '{name}' already exists."},
+                        )
+                        return
+                    renamed = tmux_capture(
+                        "rename-session", "-t", target_name, name, check=False
                     )
-                    return
-                tmux_capture("rename-session", "-t", target_name, name, check=False)
-                if target_name in self.mobile_composer_states:
-                    self.mobile_composer_states[name] = self.mobile_composer_states.pop(target_name)
-                if target_name in self.terminal_sizes:
-                    self.terminal_sizes[name] = self.terminal_sizes.pop(target_name)
-                if target_name in self.scroll_states:
-                    self.scroll_states[name] = self.scroll_states.pop(target_name)
-                if target_name == session_name:
-                    state["session"] = name
+                    if renamed.returncode != 0:
+                        await self.send_json(
+                            connection,
+                            {"type": "notice", "message": f"Session '{target_name}' could not be renamed."},
+                        )
+                        return
+                    if target_name != name:
+                        self.transfer_single_tenant_session_state(target_name, name)
                 await self.send_json(
                     connection,
                     {"type": "session-renamed", "oldSession": target_name, "session": name},
@@ -4093,6 +5046,8 @@ class AppServer:
             self.mobile_composer_states.pop(target_name, None)
             self.terminal_sizes.pop(target_name, None)
             self.scroll_states.pop(target_name, None)
+            self.command_provenance_states.pop(target_name, None)
+            self.terminal_write_locks.pop(target_name, None)
             self.release_session(user, target_name)
             if target_name == session_name:
                 await connection.close(code=1012, reason="session killed")
@@ -4364,8 +5319,11 @@ class AppServer:
             initial_size=self.terminal_sizes.get(session_name),
             epoch_state=epoch_state,
             profile_id=profile_id,
+            provenance_state=self.command_provenance_state(session_name),
+            write_lock=self.terminal_write_lock(session_name),
         )
-        await bridge.open()
+        await self.open_live_terminal(bridge, state)
+        session_name = getattr(bridge, "session_name", state["session"])
         if pane_scrolls_locally(session_name) and pane_in_mode(session_name):
             tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
 
@@ -4448,6 +5406,9 @@ class AppServer:
                 return
             state["switching"] = True
             try:
+                self.invalidate_command_provenance(state["session"])
+                self.invalidate_command_provenance(new_session)
+                self.unregister_live_terminal(bridge.session_name, bridge)
                 await bridge.close()
                 session_summary["bytesOut"] += bridge.bytes_out
                 bridge = TmuxBridge(
@@ -4459,8 +5420,12 @@ class AppServer:
                     initial_size=self.terminal_sizes.get(new_session),
                     epoch_state=epoch_state,
                     profile_id=profile_id,
+                    provenance_state=self.command_provenance_state(new_session),
+                    write_lock=self.terminal_write_lock(new_session),
                 )
-                await bridge.open()
+                state["session"] = new_session
+                await self.open_live_terminal(bridge, state)
+                new_session = getattr(bridge, "session_name", state["session"])
                 state["session"] = new_session
                 await send_ready()
                 if pane_scrolls_locally(new_session) and pane_in_mode(new_session):
@@ -4526,6 +5491,7 @@ class AppServer:
                     await task
                 except (asyncio.CancelledError, ConnectionClosed, Exception):
                     pass
+            self.unregister_live_terminal(state["session"], bridge)
             await bridge.close()
             session_summary["bytesOut"] += bridge.bytes_out
             session_summary["durationSeconds"] = int(time.monotonic() - session_start)
