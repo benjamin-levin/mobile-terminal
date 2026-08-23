@@ -631,8 +631,9 @@
   // The tab the user was on before the current one — used by the selection's
   // "To tab" chip to send a command to the most recent *other* tab.
   let previousSessionName = "";
-  // When the "To tab" chip switches sessions, the paste is deferred until that
-  // session's `ready` arrives: { session, text }.
+  // When the "To tab" chip switches sessions, the paste is deferred until the
+  // destination is ready: { session, text, ready }. Mobile composer delivery
+  // waits for that session's composer-state so an existing draft is preserved.
   let pendingPasteAfterSwitch = null;
   let fileRequestCounter = 0;
   let pendingFileRequests = new Map();
@@ -1590,7 +1591,11 @@
   }
 
   function sendDirectPtyPaste(text) {
-    sendMessage({ type: "input", data: normalizeDirectPtyPasteText(text) });
+    const normalizedText = normalizeDirectPtyPasteText(text);
+    if (!normalizedText) {
+      return false;
+    }
+    return sendMessage({ type: "input", data: normalizedText });
   }
 
   async function copyTerminalSelection() {
@@ -1652,9 +1657,79 @@
       showToast("No other tab to send to.");
       return;
     }
-    pendingPasteAfterSwitch = { session: target, text: normalizeTerminalCopyText(raw) };
+    pendingPasteAfterSwitch = {
+      session: target,
+      text: normalizeTerminalCopyText(raw),
+      ready: false,
+    };
     dismissTerminalSelection();
     switchSession(target);
+  }
+
+  function handlePendingPasteReady() {
+    const pending = pendingPasteAfterSwitch;
+    if (!pending || pending.session !== activeSessionName) {
+      return false;
+    }
+    if (isBtopSession(activeSessionName) || (mobileComposerMode && composerInput.disabled)) {
+      pendingPasteAfterSwitch = null;
+      showToast("This tab doesn't accept pasted text.");
+      return false;
+    }
+    if (mobileComposerMode) {
+      pending.ready = true;
+      return false;
+    }
+    const normalizedText = normalizeDirectPtyPasteText(pending.text);
+    if (!normalizedText) {
+      pendingPasteAfterSwitch = null;
+      return false;
+    }
+    resetSpeechInputState();
+    if (!sendDirectPtyPaste(normalizedText)) {
+      return false;
+    }
+    pendingPasteAfterSwitch = null;
+    showToast("Pasted into this tab.");
+    return true;
+  }
+
+  function deliverPendingPasteToComposer(revision) {
+    const pending = pendingPasteAfterSwitch;
+    if (
+      !pending ||
+      !pending.ready ||
+      pending.session !== activeSessionName ||
+      !mobileComposerMode
+    ) {
+      return false;
+    }
+    if (isBtopSession(activeSessionName) || composerInput.disabled) {
+      pendingPasteAfterSwitch = null;
+      showToast("This tab doesn't accept pasted text.");
+      return false;
+    }
+    composerRevision = Math.max(composerRevision, revision);
+    openComposer(true);
+    composerInput.setRangeText(
+      pending.text,
+      composerInput.selectionStart,
+      composerInput.selectionEnd,
+      "end",
+    );
+    autoSizeComposer();
+    const queued = sendMessage({
+      type: "composer-sync",
+      value: composerInput.value,
+      cursor: composerInput.selectionEnd ?? composerInput.value.length,
+      revision: nextComposerRevision(),
+    });
+    if (!queued) {
+      return false;
+    }
+    pendingPasteAfterSwitch = null;
+    showToast("Pasted into this tab.");
+    return true;
   }
 
   // --- Touch text selection (press-and-hold, then drag the handles) ---------
@@ -4230,12 +4305,13 @@
 
   function sendMessage(payload) {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return;
+      return false;
     }
     if (payload && (payload.type === "input" || payload.type === "composer-sync" || payload.type === "composer-enter")) {
       followOutput = true;
     }
     socket.send(JSON.stringify(payload));
+    return true;
   }
 
   function scheduleLayoutRefresh({ preserveTerminalCols = false } = {}) {
@@ -7175,21 +7251,10 @@
         focusTerminal();
         performLayoutNow();
       }
-      // A "To tab" send switched us here; drop the command into this tab's
-      // prompt now that it's ready (not executed — the user reviews and sends).
-      if (pendingPasteAfterSwitch && pendingPasteAfterSwitch.session === activeSessionName) {
-        const { text } = pendingPasteAfterSwitch;
-        pendingPasteAfterSwitch = null;
-        if (mobileComposerMode) {
-          insertComposerText(text, true);
-        } else {
-          resetSpeechInputState();
-          sendDirectPtyPaste(text);
-        }
-        showToast("Pasted into this tab.");
-      } else {
-        pendingPasteAfterSwitch = null;
-      }
+      // A "To tab" send switched us here. Direct PTY destinations can receive
+      // the paste now; mobile composer destinations wait for composer-state so
+      // their existing draft and cursor are applied before insertion.
+      handlePendingPasteReady();
       return;
     }
     if (payload.type === "tabs") {
@@ -7225,7 +7290,7 @@
       return;
     }
     if (payload.type === "composer-state") {
-      if (mobileComposerMode) {
+      if (mobileComposerMode && !isBtopSession(activeSessionName) && !composerInput.disabled) {
         if (
           semanticTrackingActive() &&
           payload.source !== "semantic-osc133" &&
@@ -7240,6 +7305,7 @@
         }
         latestAppliedComposerRevision = revision;
         setComposerValue(payload.value || "", payload.cursor);
+        deliverPendingPasteToComposer(revision);
       }
       return;
     }

@@ -236,17 +236,22 @@ assert.deepEqual(sent, [{ type: "input", data: "foo bar baz" }]);
             "  // --- Touch text selection",
         )
         self.assertIn(
-            "pendingPasteAfterSwitch = { session: target, text: normalizeTerminalCopyText(raw) };",
+            "text: normalizeTerminalCopyText(raw),",
             pending,
         )
+        self.assertIn("ready: false,", pending)
 
     def test_composer_and_direct_pty_paste_boundaries_are_preserved(self):
         deferred = app_section(
-            '      // A "To tab" send switched us here;',
+            '      // A "To tab" send switched us here.',
             "      return;\n    }\n    if (payload.type === \"tabs\")",
         )
-        self.assertIn("insertComposerText(text, true);", deferred)
-        self.assertIn("resetSpeechInputState();\n          sendDirectPtyPaste(text);", deferred)
+        self.assertIn("handlePendingPasteReady();", deferred)
+        direct_delivery = extract_function("handlePendingPasteReady")
+        self.assertIn("resetSpeechInputState();\n    if (!sendDirectPtyPaste(normalizedText))", direct_delivery)
+        composer_delivery = extract_function("deliverPendingPasteToComposer")
+        self.assertIn('type: "composer-sync",', composer_delivery)
+        self.assertIn("revision: nextComposerRevision(),", composer_delivery)
 
         clipboard_api = app_section(
             "  async function pasteFromClipboard(",
