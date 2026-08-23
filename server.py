@@ -36,6 +36,7 @@ from mobile_terminal_config import (
     normalize_authentication_realms,
     normalize_authentication_settings,
 )
+from provider_authority import provider_selection
 from webauthn_auth import (
     PendingDeviceEnrollment,
     PasskeyAuth,
@@ -3264,13 +3265,6 @@ class TmuxBridge:
                         return None, stale_message
                     relative_start_row = start_y - base_y
                     relative_end_row = end_y - base_y
-                    selected_text = extract_authoritative_selection(
-                        snapshot,
-                        start_x,
-                        relative_start_row,
-                        end_x,
-                        relative_end_row,
-                    )
                     identity = self.provenance_state.row_tracker.observe(snapshot, stable_offset)
                     absolute_start_row = snapshot.history + relative_start_row
                     absolute_end_row = snapshot.history + relative_end_row
@@ -3293,11 +3287,42 @@ class TmuxBridge:
                         active,
                         accepted,
                         identity,
-                        selected_text,
-                        stable_offset,
+                        terminal_revision=stable_offset,
                     )
                     if matched:
                         return exact_text or "", None
+                    provider = await asyncio.to_thread(
+                        provider_selection,
+                        snapshot,
+                        start_x,
+                        relative_start_row,
+                        end_x,
+                        relative_end_row,
+                    )
+                    verification_snapshot = await asyncio.to_thread(
+                        capture_pane_snapshot,
+                        self.session_name,
+                        self.pane_id,
+                        max(base_y, self.seed_history, CONNECT_HISTORY_LINES),
+                    )
+                    if (
+                        verification_snapshot != snapshot
+                        or self.offset != stable_offset
+                        or self.epoch_state["epoch"] != stable_epoch
+                        or self.epoch_state["layout"] != stable_layout
+                        or self.session_name != payload.get("session")
+                        or self.pane_id != snapshot.pane_id
+                    ):
+                        return None, stale_message
+                    if provider.owned:
+                        return provider.text or "", None
+                    selected_text = extract_authoritative_selection(
+                        snapshot,
+                        start_x,
+                        relative_start_row,
+                        end_x,
+                        relative_end_row,
+                    )
                     return selected_text, None
                 except (RuntimeError, ValueError, asyncio.TimeoutError):
                     return None, stale_message

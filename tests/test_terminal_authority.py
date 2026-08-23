@@ -1719,7 +1719,13 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
             "selection": {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}},
         }
 
-        with mock.patch("server.capture_pane_snapshot", return_value=pane):
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch(
+                "server.provider_selection",
+                side_effect=AssertionError("provider authority ran before composer authority"),
+            ),
+        ):
             text, error = await bridge.authoritative_selection(payload)
             self.assertEqual((text, error), (exact, None))
 
@@ -1747,6 +1753,89 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         payload["requestId"] = "out-of-band"
         payload["selection"] = {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}}
         with mock.patch("server.capture_pane_snapshot", return_value=changed):
+            text, error = await bridge.authoritative_selection(payload)
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+
+    async def test_authoritative_selection_never_falls_back_inside_provider_ownership(self):
+        connection = RecordingConnection()
+        bridge = TmuxBridge(
+            connection,
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=CommandProvenanceState(),
+        )
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.quiet = mock.AsyncMock()
+        pane = snapshot(
+            cols=12,
+            authored_lines=["provider"],
+            plain_physical_rows=["provider    "],
+            rows=1,
+        )
+        payload = {
+            "requestId": "provider",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 12,
+            "rows": 1,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {"start": {"x": 0, "y": 0}, "end": {"x": 8, "y": 0}},
+        }
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch(
+                "server.provider_selection",
+                return_value=mock.Mock(owned=True, text="exact provider source"),
+            ),
+            mock.patch(
+                "server.extract_authoritative_selection",
+                side_effect=AssertionError("provider selection fell through to tmux"),
+            ),
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+        self.assertEqual((text, error), ("exact provider source", None))
+
+        payload["requestId"] = "provider-failure"
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.provider_selection", side_effect=RuntimeError("unsupported")),
+            mock.patch(
+                "server.extract_authoritative_selection",
+                side_effect=AssertionError("provider failure fell through to tmux"),
+            ),
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+
+        payload["requestId"] = "provider-terminal-mutation"
+        changed = snapshot(
+            cols=12,
+            authored_lines=["changed"],
+            plain_physical_rows=["changed     "],
+            rows=1,
+        )
+        with (
+            mock.patch("server.capture_pane_snapshot", side_effect=(pane, changed)),
+            mock.patch(
+                "server.provider_selection",
+                return_value=mock.Mock(owned=True, text="stale provider source"),
+            ),
+            mock.patch(
+                "server.extract_authoritative_selection",
+                side_effect=AssertionError("changed provider selection fell through to tmux"),
+            ),
+        ):
             text, error = await bridge.authoritative_selection(payload)
         self.assertIsNone(text)
         self.assertEqual(error, "Terminal changed; select again.")
