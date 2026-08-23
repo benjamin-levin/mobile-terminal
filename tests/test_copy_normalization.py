@@ -10,7 +10,7 @@ APP_JS = (ROOT / "static" / "app.js").read_text()
 
 def extract_function(name):
     match = re.search(
-        rf"^  function {re.escape(name)}\([^)]*\) \{{.*?^  \}}$",
+        rf"^  (?:async )?function {re.escape(name)}\([^)]*\) \{{.*?^  \}}$",
         APP_JS,
         re.MULTILINE | re.DOTALL,
     )
@@ -55,118 +55,223 @@ assert.equal(normalizeTerminalCopyText("crlf\r\nlone-cr\rfinal\r\n"),
 ''',
         )
 
-    def test_buffer_selection_preserves_wraps_hard_lines_and_whitespace(self):
+    def test_rendered_xterm_cells_are_never_textual_authority(self):
+        self.assertNotIn("staleVisualContinuationText", APP_JS)
+        self.assertNotIn("extractTerminalSelectionText", APP_JS)
+        self.assertNotIn("terminalSelectionText", APP_JS)
+        self.assertNotIn("term.getSelection()", APP_JS)
+
+        request = extract_function("requestAuthoritativeSelection")
+        for field in (
+            'profile: activeProfileId || ""',
+            "session: activeSessionName",
+            "paneId: terminalPaneId",
+            "epoch: terminalEpoch",
+            "revision: terminalRevision",
+            "cutoff: terminalCutoff",
+            "layoutGeneration: terminalLayoutGeneration",
+            "baseY: term.buffer.active.baseY",
+            "bufferType: term.buffer.active.type",
+        ):
+            self.assertIn(field, APP_JS)
+        self.assertIn('type: "selection-request"', request)
+        self.assertIn("selection: {", APP_JS)
+
+    def test_copy_to_tab_and_native_copy_share_authoritative_request(self):
+        copy = app_section(
+            "  async function copyTerminalSelection()",
+            "  // The most recent tab other than the current one.",
+        )
+        self.assertIn("selectionPromise = Promise.resolve(requestAuthoritativeSelection());", copy)
+        self.assertIn("beginAuthoritativeClipboardWrite(selectionPromise)", copy)
+        self.assertIn("result = await selectionPromise;", copy)
+        self.assertIn("const text = normalizeTerminalCopyText(result.text);", copy)
+        self.assertIn("if (result.error)", copy)
+        self.assertNotIn("if (!result.text)", copy)
+
+        pending = app_section(
+            "  async function pasteSelectionToRecentTab()",
+            "  // --- Touch text selection",
+        )
+        self.assertIn("const result = await requestAuthoritativeSelection();", pending)
+        self.assertIn("text: normalizeTerminalCopyText(result.text),", pending)
+        self.assertIn("if (result.error)", pending)
+        self.assertNotIn("if (!result.text)", pending)
+
+        native_copy = app_section(
+            "  function isTerminalCopyTarget(target)",
+            "  function handleImagePaste(file)",
+        )
+        self.assertIn("copyTerminalSelection().catch", native_copy)
+        self.assertIn("event.stopPropagation();", native_copy)
+        self.assertIn('document.addEventListener("copy", handleNativeTerminalCopy, true);', native_copy)
+        self.assertNotIn("clipboardData.setData", native_copy)
+        self.assertNotIn("getSelection", native_copy)
+
+    def test_promised_clipboard_write_starts_before_authority_and_uses_exact_text(self):
         self.run_node(
-            [
-                "staleVisualContinuationText",
-                "extractTerminalSelectionText",
-            ],
+            ["normalizeTerminalCopyText", "beginAuthoritativeClipboardWrite"],
             r'''
-function makeLine(text, { length = text.length, isWrapped = false } = {}) {
-  const cells = Array.from(text);
-  while (cells.length < length) cells.push(null);
-  return {
-    isWrapped,
-    length,
-    translateToString(trimRight = false, start = 0, end = length) {
-      const selected = cells.slice(start, Math.min(end, length));
-      if (trimRight) {
-        while (selected.length && selected[selected.length - 1] === null) selected.pop();
-      }
-      return selected.map((cell) => cell === null ? " " : cell).join("");
-    },
-  };
-}
-function makeBuffer(lines, type = "normal") {
-  return { type, getLine(row) { return lines[row]; } };
-}
-function extract(lines, cols, start, end, type = "normal") {
-  return extractTerminalSelectionText(makeBuffer(lines, type), cols, { start, end });
-}
-
-assert.equal(extract([
-  makeLine("soft "),
-  makeLine("wrap", { length: 5, isWrapped: true }),
-], 5, { x: 0, y: 0 }, { x: 4, y: 1 }), "soft wrap");
-
-assert.equal(extract([
-  makeLine("12345"),
-  makeLine("abcde"),
-], 5, { x: 0, y: 0 }, { x: 5, y: 1 }), "12345\nabcde");
-
-assert.equal(extract([
-  makeLine("first  ", { length: 12 }),
-  makeLine("", { length: 12 }),
-  makeLine("  indented", { length: 12 }),
-  makeLine("last\t value", { length: 12 }),
-], 12, { x: 0, y: 0 }, { x: 11, y: 3 }), "first  \n\n  indented\nlast\t value");
-
-assert.equal(extract([
-  makeLine(" \t edge  ", { length: 10 }),
-], 10, { x: 0, y: 0 }, { x: 9, y: 0 }), " \t edge  ");
+(async () => {
+  const writes = [];
+  class MockClipboardItem {
+    constructor(data) { this.data = data; }
+  }
+  Object.defineProperty(global, "ClipboardItem", { value: MockClipboardItem, configurable: true });
+  Object.defineProperty(global, "navigator", {
+    value: { clipboard: { write(items) { writes.push(items); return Promise.resolve(); } } },
+    configurable: true,
+  });
+  let resolveSelection;
+  const selectionPromise = new Promise((resolve) => { resolveSelection = resolve; });
+  const writePromise = beginAuthoritativeClipboardWrite(selectionPromise);
+  assert.equal(writes.length, 1, "clipboard.write must start synchronously");
+  assert.ok(writePromise instanceof Promise);
+  resolveSelection({ text: "  exact authoritative text\n\t" });
+  const blob = await writes[0][0].data["text/plain"];
+  assert.equal(blob.type, "text/plain");
+  assert.equal(await blob.text(), "  exact authoritative text\n\t");
+  await writePromise;
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 ''',
         )
 
-    def test_stale_alternate_rows_are_clipped_and_visual_continuations_are_narrowly_joined(self):
+    def test_empty_authoritative_text_succeeds_through_promised_clipboard(self):
         self.run_node(
             [
-                "staleVisualContinuationText",
-                "extractTerminalSelectionText",
+                "normalizeTerminalCopyText",
+                "beginAuthoritativeClipboardWrite",
+                "copyTextWithFallback",
+                "copyClipboardTextWithFallback",
+                "copyTerminalSelection",
             ],
             r'''
-function makeLine(text, { length = text.length, isWrapped = false } = {}) {
-  const cells = Array.from(text);
-  while (cells.length < length) cells.push(null);
+(async () => {
+  let capturedBlob = null;
+  const toasts = [];
+  class MockClipboardItem {
+    constructor(data) { this.data = data; }
+  }
+  Object.defineProperty(global, "ClipboardItem", { value: MockClipboardItem, configurable: true });
+  Object.defineProperty(global, "navigator", {
+    value: { clipboard: {
+      async write(items) { capturedBlob = await items[0].data["text/plain"]; },
+      async writeText() { throw new Error("must not fall back"); },
+    } },
+    configurable: true,
+  });
+  global.requestAuthoritativeSelection = () => Promise.resolve({ text: "" });
+  global.showToast = (message) => { toasts.push(message); };
+  await copyTerminalSelection();
+  assert.ok(capturedBlob instanceof Blob);
+  assert.equal(await capturedBlob.text(), "");
+  assert.deepEqual(toasts, ["Copied terminal selection."]);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+''',
+        )
+
+    def test_authority_error_wins_over_clipboard_failure_and_fallback_remains(self):
+        self.run_node(
+            [
+                "normalizeTerminalCopyText",
+                "beginAuthoritativeClipboardWrite",
+                "copyTextWithFallback",
+                "copyClipboardTextWithFallback",
+                "copyTerminalSelection",
+            ],
+            r'''
+(async () => {
+  class MockClipboardItem {
+    constructor(data) { this.data = data; }
+  }
+  Object.defineProperty(global, "ClipboardItem", { value: MockClipboardItem, configurable: true });
+  const toasts = [];
+  let writeTextCalls = 0;
+  Object.defineProperty(global, "navigator", {
+    value: { clipboard: {
+      write(items) { return items[0].data["text/plain"]; },
+      async writeText() { writeTextCalls += 1; },
+    } },
+    configurable: true,
+  });
+  global.showToast = (message) => { toasts.push(message); };
+  global.requestAuthoritativeSelection = () => Promise.resolve({ error: "Exact server selection error." });
+  await copyTerminalSelection();
+  assert.deepEqual(toasts, ["Exact server selection error."]);
+  assert.equal(writeTextCalls, 0);
+
+  toasts.length = 0;
+  navigator.clipboard.write = () => Promise.reject(new Error("permission denied"));
+  global.requestAuthoritativeSelection = () => Promise.resolve({ text: "fallback text" });
+  await copyTerminalSelection();
+  assert.equal(writeTextCalls, 1);
+  assert.deepEqual(toasts, ["Copied terminal selection."]);
+
+  toasts.length = 0;
+  Object.defineProperty(global, "ClipboardItem", { value: undefined, configurable: true });
+  navigator.clipboard.writeText = async () => { throw new Error("permission denied"); };
+  let execCalls = 0;
+  const textarea = {
+    style: {},
+    setAttribute() {},
+    select() {},
+    remove() {},
+  };
+  global.document = {
+    createElement() { return textarea; },
+    body: { appendChild() {} },
+    execCommand(command) { execCalls += 1; assert.equal(command, "copy"); return true; },
+  };
+  global.requestAuthoritativeSelection = () => Promise.resolve({ text: "legacy fallback" });
+  await copyTerminalSelection();
+  assert.equal(execCalls, 1);
+  assert.equal(textarea.value, "legacy fallback");
+  assert.deepEqual(toasts, ["Copied terminal selection."]);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+''',
+        )
+
+    def test_native_capture_blocks_xterm_helper_but_preserves_other_copying(self):
+        self.run_node(
+            ["isTerminalCopyTarget", "handleNativeTerminalCopy"],
+            r'''
+const helper = { editable: true };
+const ordinaryInput = { editable: true };
+const terminalElement = {
+  contains(target) { return target === helper; },
+};
+let selected = true;
+let copyCalls = 0;
+function terminalHasSelection() { return selected; }
+function copyTerminalSelection() { copyCalls += 1; return Promise.resolve(); }
+function showToast() {}
+function copyEvent(target) {
   return {
-    isWrapped,
-    length,
-    translateToString(trimRight = false, start = 0, end = length) {
-      const selected = cells.slice(start, Math.min(end, length));
-      if (trimRight) {
-        while (selected.length && selected[selected.length - 1] === null) selected.pop();
-      }
-      return selected.map((cell) => cell === null ? " " : cell).join("");
-    },
+    target,
+    prevented: 0,
+    stopped: 0,
+    preventDefault() { this.prevented += 1; },
+    stopPropagation() { this.stopped += 1; },
   };
 }
-function extract(lines, cols, start, end, type = "alternate") {
-  const buffer = { type, getLine(row) { return lines[row]; } };
-  return extractTerminalSelectionText(buffer, cols, { start, end });
-}
+const terminalCopy = copyEvent(helper);
+handleNativeTerminalCopy(terminalCopy);
+assert.equal(terminalCopy.prevented, 1);
+assert.equal(terminalCopy.stopped, 1);
+assert.equal(copyCalls, 1);
 
-assert.equal(extract([
-  makeLine("helloSECRET"),
-], 5, { x: 0, y: 0 }, { x: 5, y: 0 }), "hello");
-assert.equal(extract([
-  makeLine("helloSECRET"),
-], 5, { x: 1, y: 0 }, { x: 4, y: 0 }), "ell");
+const ordinaryCopy = copyEvent(ordinaryInput);
+handleNativeTerminalCopy(ordinaryCopy);
+assert.equal(ordinaryCopy.prevented, 0);
+assert.equal(ordinaryCopy.stopped, 0);
+assert.equal(copyCalls, 1);
 
-const visualRows = [
-  makeLine("Tabbed line", { length: 11 }),
-  makeLine("  line", { length: 11 }),
-];
-assert.equal(extract(visualRows, 6, { x: 0, y: 0 }, { x: 6, y: 1 }), "Tabbed line");
-assert.equal(extract(visualRows, 6, { x: 2, y: 0 }, { x: 4, y: 1 }), "bbed li");
-assert.equal(extract(visualRows, 6, { x: 0, y: 0 }, { x: 2, y: 1 }), "Tabbed ");
-
-const twoSpaceRows = [
-  makeLine("Tabbed  line", { length: 12 }),
-  makeLine("  line", { length: 12 }),
-];
-assert.equal(extract(twoSpaceRows, 6, { x: 0, y: 0 }, { x: 6, y: 1 }), "Tabbed  line");
-assert.equal(extract(twoSpaceRows, 6, { x: 0, y: 0 }, { x: 3, y: 1 }), "Tabbed  l");
-
-assert.equal(extract([
-  makeLine("123456"),
-  makeLine("abcdef"),
-], 6, { x: 0, y: 0 }, { x: 6, y: 1 }), "123456\nabcdef");
-
-assert.equal(extract([
-  makeLine("alpha OTHER", { length: 11 }),
-  makeLine("  beta", { length: 11 }),
-], 6, { x: 0, y: 0 }, { x: 6, y: 1 }), "alpha \n  beta");
-assert.equal(extract(visualRows, 6, { x: 0, y: 0 }, { x: 6, y: 1 }, "normal"),
-  "Tabbed\n  line");
+selected = false;
+const noSelectionCopy = copyEvent(helper);
+handleNativeTerminalCopy(noSelectionCopy);
+assert.equal(noSelectionCopy.prevented, 0);
+assert.equal(noSelectionCopy.stopped, 0);
+assert.equal(copyCalls, 1);
 ''',
         )
 
@@ -207,40 +312,6 @@ assert.deepEqual(sent, [{ type: "input", data: "foo bar baz" }]);
         self.assertNotIn("resetSpeechInputState", helper)
         self.assertNotIn("resetComposerTracking", helper)
 
-    def test_copy_and_pending_text_use_fidelity_normalization(self):
-        selection = extract_function("terminalSelectionText")
-        self.assertIn("term.getSelectionPosition()", selection)
-        self.assertIn("extractTerminalSelectionText(term.buffer.active, term.cols, selection)", selection)
-        self.assertIn("extracted === null ? term.getSelection() : extracted", selection)
-
-        copy = app_section(
-            "  async function copyTerminalSelection()",
-            "  // The most recent tab other than the current one.",
-        )
-        self.assertIn("const text = normalizeTerminalCopyText(raw);", copy)
-        self.assertEqual(copy.count('showToast("Copied terminal selection.");'), 2)
-        self.assertNotIn("flattened", copy)
-        self.assertNotIn("line breaks removed", APP_JS)
-
-        native_copy = app_section(
-            '  document.addEventListener("copy", (event) => {',
-            "  function handleImagePaste(file)",
-        )
-        self.assertIn(
-            'event.clipboardData.setData("text/plain", normalizeTerminalCopyText(text));',
-            native_copy,
-        )
-
-        pending = app_section(
-            "  async function pasteSelectionToRecentTab()",
-            "  // --- Touch text selection",
-        )
-        self.assertIn(
-            "text: normalizeTerminalCopyText(raw),",
-            pending,
-        )
-        self.assertIn("ready: false,", pending)
-
     def test_composer_and_direct_pty_paste_boundaries_are_preserved(self):
         deferred = app_section(
             '      // A "To tab" send switched us here.',
@@ -255,7 +326,7 @@ assert.deepEqual(sent, [{ type: "input", data: "foo bar baz" }]);
 
         clipboard_api = app_section(
             "  async function pasteFromClipboard(",
-            '  document.addEventListener("copy", (event) => {',
+            "  function isTerminalCopyTarget(target)",
         )
         self.assertIn("insertComposerText(text, true);", clipboard_api)
         self.assertIn("resetComposerTracking(true);\n            sendDirectPtyPaste(text);", clipboard_api)

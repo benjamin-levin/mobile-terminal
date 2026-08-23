@@ -3,6 +3,8 @@
 websockets>=12.0
 cryptography>=42.0
 pillow>=10.0
+wcwidth>=0.2
+regex>=2024.11.6,<2027
 
 # server.py imports this directly
 webauthn>=3.0

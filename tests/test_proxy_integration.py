@@ -14,7 +14,7 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
 from mobile_terminal_config import AuthRealmConfig, ProfileConfig, ProxyConfig
-from proxy import INTERNAL_TOKEN_HEADER, PRINCIPAL_HEADER, ProxyServer
+from proxy import INTERNAL_TOKEN_HEADER, PRINCIPAL_HEADER, PROFILE_HEADER, ProxyServer
 from webauthn_auth import (
     PasskeyAuth,
     PasskeyVerificationError,
@@ -920,6 +920,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_profile_relay_internal_headers_and_down_stub(self):
         backend_requests = []
+        backend_messages = []
 
         async def backend_handler(connection):
             backend_requests.append(connection.request)
@@ -937,6 +938,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                 if not isinstance(message, str):
                     continue
                 payload = json.loads(message)
+                backend_messages.append(payload)
                 if payload.get("type") == "request-sessions":
                     await connection.send(
                         json.dumps(
@@ -1032,6 +1034,28 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                             "powerhouse-internal-secret",
                         )
                         self.assertEqual(backend_requests[0].headers[PRINCIPAL_HEADER], "ben")
+                        self.assertEqual(backend_requests[0].headers[PROFILE_HEADER], "powerhouse")
+
+                        await client.send(
+                            json.dumps(
+                                {
+                                    "type": "selection-request",
+                                    "requestId": "wrong-profile",
+                                    "profile": "behuman",
+                                }
+                            )
+                        )
+                        rejected = await self.receive_json(client)
+                        self.assertEqual(
+                            rejected,
+                            {
+                                "type": "selection-result",
+                                "requestId": "wrong-profile",
+                                "error": "Terminal changed; select again.",
+                            },
+                        )
+                        await asyncio.sleep(0.02)
+                        self.assertNotIn("selection-request", [item.get("type") for item in backend_messages])
 
                         await client.send(json.dumps({"type": "switch-profile", "profile": "behuman"}))
                         profiles = await self.receive_json(client)

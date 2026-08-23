@@ -3,7 +3,6 @@ import argparse
 import asyncio
 import base64
 import datetime
-import fcntl
 import gzip
 import hashlib
 import hmac
@@ -15,13 +14,17 @@ import re
 import secrets
 import signal
 import shlex
-import struct
 import subprocess
-import termios
 import time
+import unicodedata
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlsplit
+
+import regex
+from wcwidth import wcwidth
 
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
@@ -188,6 +191,7 @@ except Exception as exc:
 
 
 INTERNAL_TOKEN_ENV_NAME = "MOBILE_TERMINAL_INTERNAL_TOKEN"
+INTERNAL_PROFILE_HEADER = "X-Mobile-Terminal-Profile"
 
 
 def internal_token_environment_names() -> tuple[str, ...]:
@@ -216,6 +220,32 @@ def tmux_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[
         check=check,
         text=True,
         env=terminal_child_environment(),
+    )
+
+
+def send_pane_bytes(target: str, data: bytes) -> None:
+    if not data:
+        return
+    buffer_name = f"mobile-terminal-{os.getpid()}-{time.time_ns()}"
+    loaded = subprocess.run(
+        ["tmux", "load-buffer", "-b", buffer_name, "-"],
+        cwd=ROOT,
+        input=data,
+        capture_output=True,
+        check=False,
+        env=terminal_child_environment(),
+    )
+    if loaded.returncode != 0:
+        return
+    tmux_capture(
+        "paste-buffer",
+        "-r",
+        "-d",
+        "-b",
+        buffer_name,
+        "-t",
+        target,
+        check=False,
     )
 
 
@@ -374,28 +404,393 @@ def current_path(session_name: str, fallback: str) -> str:
     return path or fallback
 
 
-# Lines of scrollback sent on connect. Normal-buffer panes scroll this locally
-# in the client's xterm buffer (no round-trip), so we send enough to cover the
-# full tmux history range. It's gzip-compressed over the socket, and xterm paints
-# the visible screen immediately, so first paint stays fast.
+# Lines of authoritative scrollback sent in the initial seed. Older normal
+# history is fetched by a larger reseed only when the local xterm reaches the
+# top of its current window.
 CONNECT_HISTORY_LINES = 2000
+MAX_HISTORY_SEED_LINES = 20000
+TMUX_INPUT_CHUNK_BYTES = 1024
 
 
-def capture_history(session_name: str, lines: int = 2000) -> str:
+@dataclass(frozen=True)
+class PaneSnapshot:
+    pane_id: str
+    history: int
+    seed_history: int
+    cols: int
+    rows: int
+    alternate: bool
+    cursor_x: int
+    cursor_y: int
+    cursor_flag: bool
+    cursor_blinking: bool
+    cursor_shape: str
+    insert: bool
+    keypad_cursor: bool
+    keypad: bool
+    origin: bool
+    wrap: bool
+    mouse_standard: bool
+    mouse_button: bool
+    mouse_any: bool
+    mouse_sgr: bool
+    scroll_upper: int
+    scroll_lower: int
+    tab_stops: tuple[int, ...]
+    physical_rows: list[str]
+    plain_physical_rows: list[str]
+    authored_lines: list[str]
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "paneId": self.pane_id,
+            "history": self.history,
+            "seedHistory": self.seed_history,
+            "cols": self.cols,
+            "rows": self.rows,
+            "alternate": self.alternate,
+            "cursorX": self.cursor_x,
+            "cursorY": self.cursor_y,
+            "cursorFlag": self.cursor_flag,
+            "cursorBlinking": self.cursor_blinking,
+            "cursorShape": self.cursor_shape,
+            "insert": self.insert,
+            "keypadCursor": self.keypad_cursor,
+            "keypad": self.keypad,
+            "origin": self.origin,
+            "wrap": self.wrap,
+            "mouseStandard": self.mouse_standard,
+            "mouseButton": self.mouse_button,
+            "mouseAny": self.mouse_any,
+            "mouseSgr": self.mouse_sgr,
+            "scrollUpper": self.scroll_upper,
+            "scrollLower": self.scroll_lower,
+            "tabStops": list(self.tab_stops),
+        }
+
+
+def _capture_lines(output: str) -> list[str]:
+    if not output.endswith("\n"):
+        raise RuntimeError("tmux capture-pane returned an unframed snapshot")
+    return output[:-1].split("\n")
+
+
+def pane_metadata(session_name: str, pane_id: str | None = None) -> tuple[Any, ...]:
+    target = pane_id or session_name
     result = tmux_capture(
-        "capture-pane",
-        "-e",
-        "-J",
+        "display-message",
         "-p",
-        "-S",
-        f"-{max(0, lines)}",
         "-t",
-        session_name,
+        target,
+        "#{pane_id}\t#{history_size}\t#{pane_width}\t#{pane_height}\t#{alternate_on}"
+        "\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_blinking}\t#{cursor_shape}"
+        "\t#{insert_flag}\t#{keypad_cursor_flag}\t#{keypad_flag}\t#{origin_flag}\t#{wrap_flag}"
+        "\t#{mouse_standard_flag}\t#{mouse_button_flag}\t#{mouse_any_flag}\t#{mouse_sgr_flag}"
+        "\t#{scroll_region_upper}\t#{scroll_region_lower}\t#{pane_tabs}",
         check=False,
     )
-    if result.returncode != 0:
+    fields = result.stdout.rstrip("\n").split("\t")
+    if result.returncode != 0 or len(fields) != 22 or not fields[0].startswith("%"):
+        raise RuntimeError("active tmux pane is unavailable")
+    try:
+        numeric = {index: int(fields[index] or 0) for index in (*range(1, 9), *range(10, 21))}
+        tab_stops = tuple(int(value) for value in fields[21].split(",") if value)
+    except ValueError as exc:
+        raise RuntimeError("tmux returned invalid pane metadata") from exc
+    return (
+        fields[0],
+        *(numeric[index] for index in range(1, 9)),
+        fields[9],
+        *(numeric[index] for index in range(10, 21)),
+        tab_stops,
+    )
+
+
+def capture_pane_snapshot(
+    session_name: str,
+    pane_id: str | None = None,
+    history_lines: int = CONNECT_HISTORY_LINES,
+) -> PaneSnapshot:
+    before = pane_metadata(session_name, pane_id)
+    (
+        active_pane,
+        history,
+        cols,
+        rows,
+        alternate,
+        cursor_x,
+        cursor_y,
+        cursor_flag,
+        cursor_blinking,
+        cursor_shape,
+        insert,
+        keypad_cursor,
+        keypad,
+        origin,
+        wrap,
+        mouse_standard,
+        mouse_button,
+        mouse_any,
+        mouse_sgr,
+        scroll_upper,
+        scroll_lower,
+        tab_stops,
+    ) = before
+    seed_history = 0 if alternate else min(history, max(0, history_lines))
+    start = str(-seed_history)
+    end = str(rows - 1)
+    styled_physical = tmux_capture(
+        "capture-pane", "-p", "-e", "-N", "-S", start, "-E", end, "-t", active_pane, check=False
+    )
+    plain_physical = tmux_capture(
+        "capture-pane", "-p", "-N", "-S", start, "-E", end, "-t", active_pane, check=False
+    )
+    authored = tmux_capture(
+        "capture-pane", "-p", "-J", "-S", start, "-E", end, "-t", active_pane, check=False
+    )
+    after = pane_metadata(session_name, active_pane)
+    if (
+        styled_physical.returncode != 0
+        or plain_physical.returncode != 0
+        or authored.returncode != 0
+        or before != after
+    ):
+        raise RuntimeError("tmux pane changed during capture")
+    physical_rows = _capture_lines(styled_physical.stdout)
+    plain_physical_rows = _capture_lines(plain_physical.stdout)
+    authored_lines = _capture_lines(authored.stdout)
+    if len(physical_rows) != len(plain_physical_rows):
+        raise RuntimeError("tmux physical-row captures have inconsistent geometry")
+    if len(physical_rows) != seed_history + rows:
+        raise RuntimeError("tmux physical-row capture has inconsistent geometry")
+    return PaneSnapshot(
+        pane_id=active_pane,
+        history=history,
+        seed_history=seed_history,
+        cols=cols,
+        rows=rows,
+        alternate=bool(alternate),
+        cursor_x=cursor_x,
+        cursor_y=cursor_y,
+        cursor_flag=bool(cursor_flag),
+        cursor_blinking=bool(cursor_blinking),
+        cursor_shape=cursor_shape,
+        insert=bool(insert),
+        keypad_cursor=bool(keypad_cursor),
+        keypad=bool(keypad),
+        origin=bool(origin),
+        wrap=bool(wrap),
+        mouse_standard=bool(mouse_standard),
+        mouse_button=bool(mouse_button),
+        mouse_any=bool(mouse_any),
+        mouse_sgr=bool(mouse_sgr),
+        scroll_upper=scroll_upper,
+        scroll_lower=scroll_lower,
+        tab_stops=tab_stops,
+        physical_rows=physical_rows,
+        plain_physical_rows=plain_physical_rows,
+        authored_lines=authored_lines,
+    )
+
+
+GRAPHEME_RE = regex.compile(r"\X")
+REGIONAL_INDICATOR_RE = regex.compile(r"\A\p{Regional_Indicator}\Z")
+EXTENDED_PICTOGRAPHIC_RE = regex.compile(r"\p{Extended_Pictographic}")
+EMOJI_MODIFIER_RE = regex.compile(r"\p{Emoji_Modifier}")
+
+# These are conservative tmux/xterm agreement classes. wcwidth is used only
+# to validate the base and combining marks inside an otherwise allowed class.
+
+
+def _is_verified_cjk_base(character: str) -> bool:
+    value = ord(character)
+    return (
+        0x3000 <= value <= 0x30FF
+        or 0x3400 <= value <= 0x4DBF
+        or 0x4E00 <= value <= 0x9FFF
+        or 0xAC00 <= value <= 0xD7A3
+        or 0xF900 <= value <= 0xFAFF
+        or 0xFF01 <= value <= 0xFF60
+        or 0xFFE0 <= value <= 0xFFE6
+    )
+
+
+def _verified_grapheme_width(grapheme: str) -> int:
+    if grapheme == "♥︎":
+        return 1
+    if all(REGIONAL_INDICATOR_RE.fullmatch(character) for character in grapheme):
+        if len(grapheme) == 2:
+            return 2
+        raise RuntimeError("terminal grapheme geometry is not renderer-proven")
+    if any(REGIONAL_INDICATOR_RE.fullmatch(character) for character in grapheme):
+        raise RuntimeError("terminal grapheme geometry is not renderer-proven")
+    if (
+        "‍" in grapheme
+        or "️" in grapheme
+        or "⃣" in grapheme
+        or any(0xFE00 <= ord(character) <= 0xFE0F for character in grapheme)
+        or any(0xE0100 <= ord(character) <= 0xE01EF for character in grapheme)
+        or EXTENDED_PICTOGRAPHIC_RE.search(grapheme)
+        or EMOJI_MODIFIER_RE.search(grapheme)
+    ):
+        raise RuntimeError("terminal grapheme geometry is not renderer-proven")
+
+    widths = [wcwidth(character) for character in grapheme]
+    base = grapheme[0]
+    if widths[0] <= 0 or unicodedata.category(base)[0] in "CM":
+        raise RuntimeError("terminal grapheme geometry is not renderer-proven")
+    if any(
+        width != 0 or unicodedata.category(character)[0] != "M"
+        for character, width in zip(grapheme[1:], widths[1:])
+    ):
+        raise RuntimeError("terminal grapheme geometry is not renderer-proven")
+
+    value = ord(base)
+    if 0x20 <= value <= 0x7E:
+        return 1
+    east_asian_width = unicodedata.east_asian_width(base)
+    if east_asian_width == "A":
+        raise RuntimeError("terminal grapheme geometry is not renderer-proven")
+    if east_asian_width in ("W", "F") and _is_verified_cjk_base(base):
+        return 2
+    if east_asian_width in ("N", "Na", "H") and unicodedata.category(base)[0] in "LNP":
+        return 1
+    raise RuntimeError("terminal grapheme geometry is not renderer-proven")
+
+
+def _display_token_width(
+    value: str,
+    column: int,
+    tab_stops: tuple[int, ...] | None,
+    cols: int | None,
+) -> int:
+    if value != "\t":
+        return _verified_grapheme_width(value)
+    if tab_stops is None:
+        destination = ((column // 8) + 1) * 8
+    else:
+        destination = next((stop for stop in tab_stops if stop > column), cols - 1 if cols else column)
+    if cols is not None:
+        destination = min(destination, cols - 1)
+    return max(0, destination - column)
+
+
+def _display_tokens(
+    text: str,
+    tab_stops: tuple[int, ...] | None = None,
+    cols: int | None = None,
+) -> tuple[list[tuple[str, int, int]], int]:
+    tokens: list[tuple[str, int, int]] = []
+    column = 0
+    for value in GRAPHEME_RE.findall(text):
+        width = _display_token_width(value, column, tab_stops, cols)
+        if width:
+            tokens.append((value, column, column + width))
+            column += width
+    return tokens, column
+
+
+def _authored_physical_map(snapshot: PaneSnapshot) -> list[tuple[int, str]]:
+    if len(snapshot.physical_rows) != len(snapshot.plain_physical_rows):
+        raise RuntimeError("tmux physical-row captures have inconsistent geometry")
+    mapping: list[tuple[int, str]] = []
+    physical_index = 0
+    for logical_index, line in enumerate(snapshot.authored_lines):
+        remainder = line
+        consumed_row = False
+        while remainder or not consumed_row:
+            if physical_index >= len(snapshot.plain_physical_rows):
+                raise RuntimeError("tmux authored text does not map to its physical geometry")
+            physical_row = snapshot.plain_physical_rows[physical_index]
+            prefix_length = min(len(remainder), len(physical_row))
+            while prefix_length >= 0:
+                if (
+                    physical_row[:prefix_length] == remainder[:prefix_length]
+                    and not physical_row[prefix_length:].strip(" ")
+                ):
+                    break
+                prefix_length -= 1
+            if prefix_length < 0:
+                raise RuntimeError("tmux authored text does not map to its physical geometry")
+            segment = remainder[:prefix_length]
+            mapping.append((logical_index, segment))
+            remainder = remainder[prefix_length:]
+            physical_index += 1
+            consumed_row = True
+    if physical_index != len(snapshot.plain_physical_rows):
+        raise RuntimeError("tmux authored text does not map to its physical geometry")
+    return mapping
+
+
+def _slice_display_cells(
+    text: str,
+    start: int,
+    end: int,
+    tab_stops: tuple[int, ...] | None = None,
+    cols: int | None = None,
+) -> str:
+    if end <= start:
         return ""
-    return result.stdout
+    selected: list[str] = []
+    column = 0
+    for value in GRAPHEME_RE.findall(text):
+        if column >= end:
+            break
+        width = _display_token_width(value, column, tab_stops, cols)
+        token_start = column
+        token_end = column + width
+        column = token_end
+        overlap_start = max(start, token_start)
+        overlap_end = min(end, token_end)
+        if overlap_end <= overlap_start:
+            continue
+        if value == "\t" and (overlap_start != token_start or overlap_end != token_end):
+            selected.append(" " * (overlap_end - overlap_start))
+        else:
+            selected.append(value)
+    return "".join(selected)
+
+
+def extract_authoritative_selection(
+    snapshot: PaneSnapshot,
+    start_x: int,
+    start_row: int,
+    end_x: int,
+    end_row: int,
+) -> str:
+    minimum_row = -snapshot.seed_history
+    maximum_row = snapshot.rows - 1
+    if (
+        start_row < minimum_row
+        or start_row > maximum_row
+        or end_row < minimum_row
+        or end_row > maximum_row
+        or (end_row, end_x) < (start_row, start_x)
+        or not 0 <= start_x <= snapshot.cols
+        or not 0 <= end_x <= snapshot.cols
+    ):
+        raise ValueError("selection coordinates are outside the authoritative snapshot")
+
+    mapping = _authored_physical_map(snapshot)
+    first_index = start_row + snapshot.seed_history
+    last_index = end_row + snapshot.seed_history
+    pieces: list[str] = []
+    for physical_index in range(first_index, last_index + 1):
+        logical_index, row_segment = mapping[physical_index]
+        row_start = start_x if physical_index == first_index else 0
+        row_end = end_x if physical_index == last_index else snapshot.cols
+        pieces.append(
+            _slice_display_cells(
+                row_segment,
+                row_start,
+                row_end,
+                snapshot.tab_stops,
+                snapshot.cols,
+            )
+        )
+        if physical_index < last_index and mapping[physical_index + 1][0] != logical_index:
+            pieces.append("\n")
+    return "".join(pieces)
 
 
 # Sequences xterm.js emits on its own, without a user keystroke: SGR mouse
@@ -437,7 +832,7 @@ def pane_scrolls_locally(session_name: str) -> bool:
     alternate screen and not mouse-tracking. Such panes keep their transcript in
     the client's xterm buffer, so the client can scroll it locally with no server
     round-trip. Alt-screen / mouse-tracking TUIs (claude, pagers) redraw their own
-    viewport, so those still scroll via the server (copy-mode / wheel / arrows)."""
+    viewport, so those still scroll via exact wheel or application-arrow input."""
     result = tmux_capture(
         "display-message",
         "-p",
@@ -455,7 +850,7 @@ def pane_scrolls_locally(session_name: str) -> bool:
 MAX_SCROLL_EVENTS_PER_CALL = 200
 
 
-def scroll_session_history(session_name: str, lines: int) -> None:
+def scroll_session_history(pane_id: str, lines: int) -> None:
     count = min(abs(int(lines)), MAX_SCROLL_EVENTS_PER_CALL)
     if count == 0:
         return
@@ -463,7 +858,7 @@ def scroll_session_history(session_name: str, lines: int) -> None:
         "display-message",
         "-p",
         "-t",
-        session_name,
+        pane_id,
         "#{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{pane_in_mode} #{pane_width} #{pane_height}",
         check=False,
     )
@@ -480,44 +875,21 @@ def scroll_session_history(session_name: str, lines: int) -> None:
     except (IndexError, ValueError):
         pane_width, pane_height = 80, 24
 
-    if (mouse_tracking or alternate_on) and in_mode:
-        # A pane stuck in copy-mode (entered before scrolling switched to key
-        # forwarding) would swallow forwarded keys as copy-mode commands.
-        tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
-
     if mouse_tracking:
-        # Mouse-enabled TUIs (claude, codex) keep their transcript in-app: it
-        # never enters tmux history, so copy-mode has almost nothing to scroll
-        # into and paints stale pre-launch shell output over a frozen frame.
-        # Do what a real terminal does instead: forward SGR wheel events so the
-        # app scrolls its own buffer, one event per line delta (apps applying
-        # their own lines-per-event multiplier just make flicks travel
-        # farther). Coordinates land mid-pane; embedded semicolons are safe in
-        # a send-keys -l argument (only a trailing one would be parsed as a
-        # command separator).
+        # Mouse-enabled TUIs own their transcript. Route exactly the SGR wheel
+        # report a terminal would send; never enter tmux copy mode.
         x = max(1, pane_width // 2)
         y = max(1, pane_height // 2)
         button = 64 if lines > 0 else 65
         sequence = f"\x1b[<{button};{x};{y}M" * count
-        tmux_capture("send-keys", "-t", session_name, "-l", sequence, check=False)
+        send_pane_bytes(pane_id, sequence.encode("utf-8"))
         return
 
     if alternate_on:
-        # Alternate screen without mouse tracking (pagers, etc.): tmux history
-        # is unreachable and copy-mode would show pre-launch content, so fall
-        # back to arrow keys the app can interpret as scrolling.
+        # Alternate-screen applications without mouse tracking receive
+        # application arrows. Their history is not a tmux normal-history view.
         key = "Up" if lines > 0 else "Down"
-        tmux_capture("send-keys", "-t", session_name, "-N", str(count), key, check=False)
-        return
-
-    command = "scroll-up" if lines > 0 else "scroll-down"
-    # Enter copy-mode only if we're not already in it. Re-entering on every scroll
-    # message resets the scroll position to the bottom, so a drag could never get
-    # more than one message's worth of rows from the bottom. -e makes copy-mode
-    # exit automatically once scrolled back to the bottom (returns to live output).
-    if not in_mode:
-        tmux_capture("copy-mode", "-e", "-t", session_name, check=False)
-    tmux_capture("send-keys", "-t", session_name, "-X", "-N", str(count), command, check=False)
+        tmux_capture("send-keys", "-t", pane_id, "-N", str(count), key, check=False)
 
 
 def list_session_clients(session_name: str) -> list[dict[str, str]]:
@@ -1678,83 +2050,510 @@ async def process_request(connection: ServerConnection, request: Request) -> Res
 class TmuxBridge:
     def __init__(
         self,
+        connection: ServerConnection,
         session_name: str,
         shell: str,
         cwd: str,
         create_if_missing: bool = True,
         initial_size: tuple[int, int] | None = None,
+        epoch_state: dict[str, int] | None = None,
+        profile_id: str = "",
     ) -> None:
+        self.connection = connection
         self.session_name = session_name
         self.shell = shell
         self.cwd = cwd
         self.create_if_missing = create_if_missing
         self.initial_size = initial_size
-        self.master_fd: int | None = None
+        self.profile_id = profile_id
+        self.epoch_state = epoch_state if epoch_state is not None else {"epoch": 0, "layout": 0}
         self.process: subprocess.Popen[bytes] | None = None
+        self.pane_id = ""
+        self.offset = 0
+        self.bytes_out = 0
+        self.cutoff = 0
+        self.seed_history = 0
+        self.phase = "hold"
+        self.held: list[dict[str, Any]] = []
+        self.last_output_at = time.monotonic()
+        self.line_buffer = b""
+        self.read_task: asyncio.Task[Any] | None = None
+        self.send_lock = asyncio.Lock()
+        self.seed_lock = asyncio.Lock()
+        self.write_lock = asyncio.Lock()
+        self.closing = False
+        self.closed = False
+        self.command_waiters: deque[asyncio.Future[list[bytes]]] = deque()
+        self.command_block: tuple[asyncio.Future[list[bytes]] | None, list[bytes]] | None = None
+        self.initial_block_seen = asyncio.Event()
+        self.pane_change = asyncio.Event()
+        self.seed_start_acks: dict[int, tuple[asyncio.Event, dict[str, Any]]] = {}
+        self.seed_acks: dict[int, asyncio.Event] = {}
+        self.flush_acks: dict[tuple[int, int], asyncio.Event] = {}
+        self.selection_acks: dict[str, tuple[asyncio.Event, dict[str, Any]]] = {}
 
-    def open(self) -> None:
+    @staticmethod
+    def unescape_control(value: bytes) -> bytes:
+        output = bytearray()
+        index = 0
+        while index < len(value):
+            if (
+                value[index] == 0x5C
+                and index + 3 < len(value)
+                and all(0x30 <= character <= 0x37 for character in value[index + 1 : index + 4])
+            ):
+                output.append(int(value[index + 1 : index + 4], 8))
+                index += 4
+            else:
+                output.append(value[index])
+                index += 1
+        return bytes(output)
+
+    async def open(self) -> None:
         if self.create_if_missing:
             ensure_session(self.session_name, self.shell, self.cwd)
-        master_fd, slave_fd = os.openpty()
-        self.master_fd = master_fd
         env = terminal_child_environment()
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         self.process = subprocess.Popen(
-            ["tmux", "attach-session", "-t", self.session_name],
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
+            ["tmux", "-C", "attach-session", "-t", self.session_name],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             cwd=self.cwd,
             env=env,
             start_new_session=True,
             close_fds=True,
         )
-        os.close(slave_fd)
-        # A wrong-size attach flaps the tmux window width (window-size=latest),
-        # which rewraps the pane and can destroy its history; prefer the last
-        # size this session's client reported over the generic default.
+        assert self.process.stdout is not None
+        os.set_blocking(self.process.stdout.fileno(), False)
+        self.read_task = asyncio.create_task(self.read_loop())
+        await asyncio.wait_for(self.initial_block_seen.wait(), timeout=3)
+        self.pane_id = str(pane_metadata(self.session_name)[0])
         cols, rows = self.initial_size or (140, 40)
-        self.resize(cols, rows)
+        await self.set_size(cols, rows)
+        self.last_output_at = time.monotonic()
+        await self.quiet(0.1)
 
-    def resize(self, cols: int, rows: int) -> None:
-        if self.master_fd is None:
+    async def command(self, command: str) -> list[bytes]:
+        if not self.process or self.process.poll() is not None or self.process.stdin is None:
+            raise RuntimeError("tmux control client is closed")
+        future: asyncio.Future[list[bytes]] = asyncio.get_running_loop().create_future()
+        self.command_waiters.append(future)
+        self.process.stdin.write(command.encode("utf-8") + b"\n")
+        self.process.stdin.flush()
+        return await asyncio.wait_for(future, timeout=3)
+
+    async def set_size(self, cols: int, rows: int) -> None:
+        await self.command(f"refresh-client -C {cols},{rows}")
+        await asyncio.to_thread(
+            tmux_capture,
+            "resize-window",
+            "-t",
+            self.pane_id,
+            "-x",
+            str(cols),
+            "-y",
+            str(rows),
+            check=False,
+        )
+
+    async def resize(self, cols: int, rows: int) -> None:
+        async def mutate() -> None:
+            await self.set_size(cols, rows)
+
+        await self.reseed("resize", mutate=mutate)
+
+    async def _send_json(self, payload: dict[str, Any]) -> None:
+        await self.connection.send(json.dumps(payload, ensure_ascii=False))
+
+    async def _send_output(self, record: dict[str, Any], kind: str) -> None:
+        await self._send_json(
+            {
+                "type": "terminal-output",
+                "paneId": self.pane_id,
+                "epoch": self.epoch_state["epoch"],
+                "start": record["start"],
+                "end": record["end"],
+                "kind": kind,
+            }
+        )
+        await self.connection.send(record["data"])
+        self.bytes_out += record["end"] - record["start"]
+
+    async def pane_bytes(self, pane_id: str, data: bytes) -> None:
+        if not data or pane_id != self.pane_id:
             return
-        packed = struct.pack("HHHH", rows, cols, 0, 0)
-        fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, packed)
-        if self.process and self.process.poll() is None:
-            self.process.send_signal(signal.SIGWINCH)
+        async with self.send_lock:
+            record = {"start": self.offset, "end": self.offset + len(data), "data": data}
+            self.offset = record["end"]
+            self.last_output_at = time.monotonic()
+            if self.phase == "hold":
+                self.held.append(record)
+            else:
+                await self._send_output(record, "live")
 
-    async def read(self) -> bytes:
-        if self.master_fd is None:
-            return b""
-
-        def _read() -> bytes:
-            try:
-                return os.read(self.master_fd, 65536)
-            except OSError:
-                return b""
-
-        return await asyncio.to_thread(_read)
-
-    def write(self, data: str) -> None:
-        if self.master_fd is None:
+    def _finish_command_block(self, failed: bool) -> None:
+        if self.command_block is None:
+            self.initial_block_seen.set()
             return
-        os.write(self.master_fd, data.encode("utf-8", "surrogateescape"))
+        future, output = self.command_block
+        self.command_block = None
+        if future is None or future.done():
+            self.initial_block_seen.set()
+        elif failed:
+            future.set_exception(RuntimeError(b"\n".join(output).decode("utf-8", "replace")))
+        else:
+            future.set_result(output)
 
-    def close(self) -> None:
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
+    async def control_line(self, line: bytes) -> None:
+        if self.command_block is not None:
+            if line.startswith(b"%end "):
+                self._finish_command_block(False)
+            elif line.startswith(b"%error "):
+                self._finish_command_block(True)
+            else:
+                self.command_block[1].append(line)
+            return
+        if line.startswith(b"%begin "):
+            future = self.command_waiters.popleft() if self.command_waiters else None
+            self.command_block = (future, [])
+            return
+        if line.startswith(b"%output "):
+            parts = line.split(b" ", 2)
+            if len(parts) == 3:
+                await self.pane_bytes(parts[1].decode("ascii", "ignore"), self.unescape_control(parts[2]))
+            return
+        if line.startswith(b"%extended-output "):
+            prefix, separator, value = line.partition(b" : ")
+            parts = prefix.split()
+            if separator and len(parts) >= 3:
+                await self.pane_bytes(parts[1].decode("ascii", "ignore"), self.unescape_control(value))
+            return
+        if line.startswith((b"%window-pane-changed ", b"%session-window-changed ")):
+            self.pane_change.set()
+            return
+        if line.startswith(b"%pause "):
+            pane_id = line.split(b" ", 1)[1].decode("ascii", "ignore")
+            asyncio.create_task(self.command(f"refresh-client -A {pane_id}:continue"))
+
+    async def read_loop(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        descriptor = self.process.stdout.fileno()
+        while self.process.poll() is None:
+            read_any = False
+            while True:
+                try:
+                    data = os.read(descriptor, 65536)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    return
+                if not data:
+                    return
+                read_any = True
+                self.line_buffer += data
+                while b"\n" in self.line_buffer:
+                    line, self.line_buffer = self.line_buffer.split(b"\n", 1)
+                    await self.control_line(line.rstrip(b"\r"))
+            if not read_any:
+                await asyncio.sleep(0.004)
+
+    async def quiet(self, duration: float = 0.14, timeout: float = 3.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if time.monotonic() - self.last_output_at >= duration:
+                return
+            await asyncio.sleep(0.015)
+        raise RuntimeError("tmux pane output did not quiesce")
+
+    async def write(self, data: str | bytes) -> None:
+        if isinstance(data, bytes):
+            raw = data
+        else:
             try:
-                self.process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-        if self.master_fd is not None:
+                raw = data.encode("utf-8", "surrogateescape")
+            except UnicodeEncodeError as exc:
+                raise ValueError("terminal input contains invalid Unicode") from exc
+        if not raw:
+            return
+        async with self.write_lock:
+            if self.closing or self.closed:
+                raise RuntimeError("tmux control client is closed")
+            target = self.pane_id or self.session_name
+            for offset in range(0, len(raw), TMUX_INPUT_CHUNK_BYTES):
+                chunk = raw[offset : offset + TMUX_INPUT_CHUNK_BYTES]
+                await self.command(f"send-keys -t {target} -H {chunk.hex(' ')}")
+
+    def acknowledge(self, payload: dict[str, Any]) -> bool:
+        message_type = payload.get("type")
+        try:
+            epoch = int(payload.get("epoch", -1))
+        except (TypeError, ValueError):
+            return False
+        if message_type == "seed-start-ack":
+            pending = self.seed_start_acks.get(epoch)
+            if pending:
+                pending[1].update(payload)
+                pending[0].set()
+            return True
+        if message_type == "seed-ack":
+            event = self.seed_acks.get(epoch)
+            if event:
+                event.set()
+            return True
+        if message_type == "post-flush-ack":
             try:
-                os.close(self.master_fd)
-            except OSError:
-                pass
-            self.master_fd = None
+                cycle = int(payload.get("cycle", -1))
+            except (TypeError, ValueError):
+                return True
+            event = self.flush_acks.get((epoch, cycle))
+            if event:
+                event.set()
+            return True
+        if message_type == "selection-check-ack":
+            request_id = str(payload.get("requestId", ""))
+            pending = self.selection_acks.get(request_id)
+            if pending:
+                pending[1].update(payload)
+                pending[0].set()
+            return True
+        return False
+
+    async def _flush_seed_output(self, epoch: int, cutoff: int) -> None:
+        cycle = 0
+        while True:
+            pending = [record for record in self.held if record["start"] >= cutoff]
+            self.held = [record for record in self.held if record["start"] < cutoff]
+            for record in pending:
+                await self._send_output(record, "postseed")
+            cycle += 1
+            event = asyncio.Event()
+            self.flush_acks[(epoch, cycle)] = event
+            through = pending[-1]["end"] if pending else cutoff
+            await self._send_json(
+                {
+                    "type": "post-flush",
+                    "epoch": epoch,
+                    "cycle": cycle,
+                    "through": through,
+                    "bytes": sum(record["end"] - record["start"] for record in pending),
+                }
+            )
+            await asyncio.wait_for(event.wait(), timeout=5)
+            self.flush_acks.pop((epoch, cycle), None)
+            self.last_output_at = time.monotonic()
+            await self.quiet(0.1)
+            async with self.send_lock:
+                if not any(record["start"] >= cutoff for record in self.held):
+                    self.held.clear()
+                    self.phase = "forward"
+                    break
+        await self._send_json(
+            {
+                "type": "seed-open",
+                "epoch": epoch,
+                "session": self.session_name,
+                "paneId": self.pane_id,
+                "cutoff": cutoff,
+                "layoutGeneration": self.epoch_state["layout"],
+            }
+        )
+
+    async def reseed(
+        self,
+        reason: str,
+        *,
+        mutate: Callable[[], Awaitable[None]] | None = None,
+        history_lines: int | None = None,
+        scroll_target: int | None = None,
+        next_pane_id: str | None = None,
+    ) -> None:
+        async with self.seed_lock:
+            if self.closing or self.closed:
+                return
+            async with self.send_lock:
+                self.phase = "hold"
+                self.held = []
+                if next_pane_id:
+                    self.pane_id = next_pane_id
+                self.epoch_state["epoch"] += 1
+                self.epoch_state["layout"] += 1
+                epoch = self.epoch_state["epoch"]
+                start_event = asyncio.Event()
+                start_payload: dict[str, Any] = {}
+                self.seed_start_acks[epoch] = (start_event, start_payload)
+                await self._send_json(
+                    {
+                        "type": "seed-start",
+                        "epoch": epoch,
+                        "reason": reason,
+                        "session": self.session_name,
+                        "paneId": self.pane_id,
+                        "invalidFrom": self.offset,
+                    }
+                )
+            await asyncio.wait_for(start_event.wait(), timeout=5)
+            self.seed_start_acks.pop(epoch, None)
+            if mutate is not None:
+                await mutate()
+            elif reason == "initial":
+                try:
+                    cols = int(start_payload.get("cols", 0))
+                    rows = int(start_payload.get("rows", 0))
+                except (TypeError, ValueError):
+                    cols, rows = 0, 0
+                if cols > 0 and rows > 0:
+                    await self.set_size(max(20, cols), max(6, rows))
+            requested_history = history_lines if history_lines is not None else CONNECT_HISTORY_LINES
+            snapshot: PaneSnapshot | None = None
+            cutoff = self.offset
+            for _attempt in range(3):
+                self.last_output_at = time.monotonic()
+                await self.quiet()
+                cutoff = self.offset
+                candidate = await asyncio.to_thread(
+                    capture_pane_snapshot,
+                    self.session_name,
+                    self.pane_id,
+                    requested_history,
+                )
+                self.last_output_at = time.monotonic()
+                await self.quiet(0.05)
+                if self.offset == cutoff:
+                    snapshot = candidate
+                    break
+            if snapshot is None:
+                raise RuntimeError("tmux pane did not remain stable for capture")
+            self.pane_id = snapshot.pane_id
+            self.cutoff = cutoff
+            self.seed_history = snapshot.seed_history
+            self.held = [record for record in self.held if record["start"] >= cutoff]
+            await self._send_json(
+                {
+                    "type": "seed-data",
+                    "epoch": epoch,
+                    "session": self.session_name,
+                    "paneId": self.pane_id,
+                    "cutoff": cutoff,
+                    "layoutGeneration": self.epoch_state["layout"],
+                    "meta": snapshot.metadata(),
+                    "physicalRows": snapshot.physical_rows,
+                    "scrollTarget": scroll_target,
+                }
+            )
+            seed_event = asyncio.Event()
+            self.seed_acks[epoch] = seed_event
+            await self._send_json({"type": "seed-end", "epoch": epoch, "cutoff": cutoff})
+            await asyncio.wait_for(seed_event.wait(), timeout=5)
+            self.seed_acks.pop(epoch, None)
+            await self._flush_seed_output(epoch, cutoff)
+
+    async def _flush_selection_hold(self) -> None:
+        while True:
+            async with self.send_lock:
+                pending = self.held
+                self.held = []
+                if not pending:
+                    self.phase = "forward"
+                    return
+            for record in pending:
+                await self._send_output(record, "selection-held")
+
+    async def authoritative_selection(self, payload: dict[str, Any]) -> tuple[str | None, str | None]:
+        request_id = str(payload.get("requestId", ""))
+        stale_message = "Terminal changed; select again."
+        try:
+            epoch = int(payload.get("epoch", -1))
+            revision = int(payload.get("revision", -1))
+            cutoff = int(payload.get("cutoff", -1))
+            layout_generation = int(payload.get("layoutGeneration", -1))
+            base_y = int(payload.get("baseY", -1))
+            start = payload["selection"]["start"]
+            end = payload["selection"]["end"]
+            start_x, start_y = int(start["x"]), int(start["y"])
+            end_x, end_y = int(end["x"]), int(end["y"])
+        except (KeyError, TypeError, ValueError):
+            return None, stale_message
+        if (
+            payload.get("session") != self.session_name
+            or payload.get("profile", "") != self.profile_id
+            or payload.get("paneId") != self.pane_id
+            or epoch != self.epoch_state["epoch"]
+            or cutoff != self.cutoff
+            or layout_generation != self.epoch_state["layout"]
+        ):
+            return None, stale_message
+
+        async with self.seed_lock:
+            async with self.send_lock:
+                if self.phase != "forward" or revision != self.offset:
+                    return None, stale_message
+                self.phase = "hold"
+                self.held = []
+                stable_offset = self.offset
+                event = asyncio.Event()
+                ack_payload: dict[str, Any] = {}
+                self.selection_acks[request_id] = (event, ack_payload)
+                await self._send_json({"type": "selection-check", "requestId": request_id})
+            try:
+                await asyncio.wait_for(event.wait(), timeout=5)
+                if ack_payload.get("unchanged") is not True:
+                    return None, stale_message
+                self.last_output_at = time.monotonic()
+                await self.quiet(0.1)
+                if self.offset != stable_offset:
+                    return None, stale_message
+                snapshot = await asyncio.to_thread(
+                    capture_pane_snapshot,
+                    self.session_name,
+                    self.pane_id,
+                    max(base_y, self.seed_history, CONNECT_HISTORY_LINES),
+                )
+                self.last_output_at = time.monotonic()
+                await self.quiet(0.05)
+                if self.offset != stable_offset:
+                    return None, stale_message
+                if snapshot.alternate != (payload.get("bufferType") == "alternate"):
+                    return None, stale_message
+                expected_base = 0 if snapshot.alternate else snapshot.seed_history
+                if base_y != expected_base:
+                    return None, stale_message
+                return (
+                    extract_authoritative_selection(
+                        snapshot,
+                        start_x,
+                        start_y - base_y,
+                        end_x,
+                        end_y - base_y,
+                    ),
+                    None,
+                )
+            except (RuntimeError, ValueError, asyncio.TimeoutError):
+                return None, stale_message
+            finally:
+                self.selection_acks.pop(request_id, None)
+                await self._flush_selection_hold()
+
+    async def close(self) -> None:
+        self.closing = True
+        async with self.seed_lock:
+            async with self.write_lock:
+                if self.closed:
+                    return
+                self.closed = True
+                if self.process and self.process.poll() is None:
+                    self.process.terminate()
+                    try:
+                        await asyncio.wait_for(asyncio.to_thread(self.process.wait), timeout=1)
+                    except asyncio.TimeoutError:
+                        self.process.kill()
+                if self.read_task:
+                    self.read_task.cancel()
+                    try:
+                        await self.read_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
 
 class AppServer:
@@ -1818,10 +2617,16 @@ class AppServer:
             self.btop_reachable = reachable
             await asyncio.sleep(interval)
 
-    def queue_scroll_history(self, session_name: str, lines: int) -> None:
+    def queue_scroll_history(self, session_name: str, pane_id: str, lines: int) -> None:
         if lines == 0:
             return
-        state = self.scroll_states.setdefault(session_name, {"pending": 0, "task": None})
+        state = self.scroll_states.setdefault(
+            session_name,
+            {"pending": 0, "task": None, "paneId": pane_id},
+        )
+        if state["paneId"] != pane_id:
+            state["pending"] = 0
+            state["paneId"] = pane_id
         state["pending"] += lines
         task = state["task"]
         if task is None or task.done():
@@ -1838,13 +2643,11 @@ class AppServer:
             # a burst-merged flick is deferred to the next iteration, not lost.
             take = max(-MAX_SCROLL_EVENTS_PER_CALL, min(MAX_SCROLL_EVENTS_PER_CALL, lines))
             state["pending"] = lines - take
-            await asyncio.to_thread(scroll_session_history, session_name, take)
+            await asyncio.to_thread(scroll_session_history, state["paneId"], take)
 
     async def settle_scroll_history(self, session_name: str) -> None:
-        # Scroll commands execute out-of-band; before any handler cancels
-        # copy-mode and writes keys to the pane, drop queued deltas and wait
-        # out the in-flight tmux call so a stale scroll can't re-enter
-        # copy-mode and swallow the keystrokes.
+        # Scroll commands execute out-of-band; before writing user input to the
+        # pane, drop queued deltas and wait out the in-flight tmux call.
         state = self.scroll_states.get(session_name)
         if state is None:
             return
@@ -1892,6 +2695,11 @@ class AppServer:
             return None
         principal = connection.request.headers.get("X-Mobile-Terminal-Principal", "").strip()
         return principal or "proxy"
+
+    def internal_request_profile(self, connection: ServerConnection) -> str:
+        if self.internal_request_principal(connection) is None:
+            return ""
+        return connection.request.headers.get(INTERNAL_PROFILE_HEADER, "").strip()[:80]
 
     def request_is_public(self, connection: ServerConnection) -> bool:
         """True when the request arrived over Tailscale Funnel (public internet)
@@ -2481,18 +3289,23 @@ class AppServer:
         state["tracked"] = False
         state["source"] = "reset"
 
-    def force_clear_mobile_composer(self, bridge: TmuxBridge, session_name: str, revision: int | None = None) -> None:
+    async def force_clear_mobile_composer(
+        self,
+        bridge: TmuxBridge,
+        session_name: str,
+        revision: int | None = None,
+    ) -> None:
         if pane_in_mode(session_name):
             tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
         sequence = CTRL_E + ("\u007f" * MOBILE_COMPOSER_FORCE_CLEAR_BACKSPACES) + CTRL_U
-        bridge.write(sequence)
+        await bridge.write(sequence)
         self.reset_mobile_composer_tracking(session_name)
         state = self.mobile_composer_state(session_name)
         if revision is not None:
             state["revision"] = max(state["revision"], revision)
         state["source"] = "force-clear"
 
-    def sync_mobile_composer(
+    async def sync_mobile_composer(
         self,
         bridge: TmuxBridge,
         session_name: str,
@@ -2513,7 +3326,7 @@ class AppServer:
         if pane_in_mode(session_name):
             tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
         if sequence:
-            bridge.write(sequence)
+            await bridge.write(sequence)
         state["draft"] = next_value
         state["cursor"] = next_cursor
         if revision is not None:
@@ -2525,9 +3338,17 @@ class AppServer:
         state["source"] = "composer-sync"
         return state
 
-    def commit_mobile_composer(self, bridge: TmuxBridge, session_name: str, revision: int | None = None) -> None:
+    async def commit_mobile_composer(
+        self,
+        bridge: TmuxBridge,
+        session_name: str,
+        revision: int | None = None,
+    ) -> None:
         state = self.mobile_composer_state(session_name)
         line = state["draft"]
+        if pane_in_mode(session_name):
+            tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
+        await bridge.write("\r")
         if line:
             history = state["history"]
             history.append(line)
@@ -2536,11 +3357,8 @@ class AppServer:
         if revision is not None:
             state["revision"] = max(state["revision"], revision)
         self.reset_mobile_composer_tracking(session_name)
-        if pane_in_mode(session_name):
-            tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
-        bridge.write("\r")
 
-    def fallback_mobile_composer_history(
+    async def fallback_mobile_composer_history(
         self,
         bridge: TmuxBridge,
         session_name: str,
@@ -2570,7 +3388,7 @@ class AppServer:
             return None
 
         next_value = state["pendingDraft"] if history_index is None else history[history_index]
-        next_state = self.sync_mobile_composer(
+        next_state = await self.sync_mobile_composer(
             bridge,
             session_name,
             next_value,
@@ -2716,15 +3534,16 @@ class AppServer:
             return None
 
         state = self.mobile_composer_state(session_name)
-        if direction == "up" and state["historyIndex"] is None:
+        save_pending_draft = direction == "up" and state["historyIndex"] is None
+        await bridge.write(arrow)
+        if save_pending_draft:
             state["pendingDraft"] = state["draft"]
-        bridge.write(arrow)
         next_state = await self.refresh_mobile_composer_from_terminal(session_name, revision=revision)
         if next_state is not None:
             next_state["historyIndex"] = None
             return next_state
 
-        return self.fallback_mobile_composer_history(
+        return await self.fallback_mobile_composer_history(
             bridge,
             session_name,
             direction,
@@ -2777,12 +3596,22 @@ class AppServer:
         self,
         connection: ServerConnection,
         bridge: TmuxBridge,
-        state: dict[str, str],
+        state: dict[str, Any],
         payload: dict[str, Any],
     ) -> None:
         session_name = state["session"]
         user = state.get("user", "")
         message_type = payload.get("type")
+        input_data = ""
+        if message_type == "input":
+            candidate = payload.get("data", "")
+            if not isinstance(candidate, str):
+                return
+            try:
+                candidate.encode("utf-8", "surrogateescape")
+            except UnicodeEncodeError:
+                return
+            input_data = candidate
         try:
             revision = int(payload.get("revision", 0))
         except (TypeError, ValueError):
@@ -2797,10 +3626,10 @@ class AppServer:
             # Auto-emitted terminal replies (mouse reports, DA/OSC/DCS query
             # responses) are not user intent; letting them settle the queue
             # would silently drop in-flight scrolling.
-            if message_type != "input" or input_is_user_keystroke(str(payload.get("data", ""))):
+            if message_type != "input" or input_is_user_keystroke(input_data):
                 await self.settle_scroll_history(session_name)
         if message_type == "composer-sync":
-            self.sync_mobile_composer(
+            await self.sync_mobile_composer(
                 bridge,
                 session_name,
                 str(payload.get("value", "")),
@@ -2833,7 +3662,7 @@ class AppServer:
             return
 
         if message_type == "composer-enter":
-            self.commit_mobile_composer(bridge, session_name, revision=revision)
+            await self.commit_mobile_composer(bridge, session_name, revision=revision)
             await self.send_composer_state(connection, session_name)
             return
 
@@ -2869,16 +3698,45 @@ class AppServer:
             return
 
         if message_type == "composer-force-clear":
-            self.force_clear_mobile_composer(bridge, session_name, revision=revision)
+            await self.force_clear_mobile_composer(bridge, session_name, revision=revision)
             await self.send_composer_state(connection, session_name)
             return
 
+        if message_type == "selection-request":
+            text, error = await bridge.authoritative_selection(payload)
+            response: dict[str, Any] = {
+                "type": "selection-result",
+                "requestId": str(payload.get("requestId", "")),
+            }
+            if error:
+                response["error"] = error
+            else:
+                response["text"] = text or ""
+            await self.send_json(connection, response)
+            return
+
+        if message_type == "history-reseed":
+            try:
+                requested = max(
+                    CONNECT_HISTORY_LINES,
+                    min(MAX_HISTORY_SEED_LINES, int(payload.get("historyLines", CONNECT_HISTORY_LINES))),
+                )
+                scroll_target = int(payload.get("scrollTarget", 0))
+            except (TypeError, ValueError):
+                return
+            await bridge.reseed(
+                "history",
+                history_lines=requested,
+                scroll_target=scroll_target,
+            )
+            return
+
         if message_type == "input":
-            data = str(payload.get("data", ""))
+            data = input_data
             user_keystroke = input_is_user_keystroke(data)
             if user_keystroke and pane_in_mode(session_name):
                 tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
-            bridge.write(payload.get("data", ""))
+            await bridge.write(data)
             if data and user_keystroke:
                 self.reset_mobile_composer_tracking(session_name)
             return
@@ -2887,12 +3745,12 @@ class AppServer:
             cols = max(20, int(payload.get("cols", 80)))
             rows = max(6, int(payload.get("rows", 24)))
             self.terminal_sizes[session_name] = (cols, rows)
-            bridge.resize(cols, rows)
+            await bridge.resize(cols, rows)
             return
 
         if message_type == "scroll-history":
             lines = int(payload.get("lines", 0))
-            self.queue_scroll_history(session_name, lines)
+            self.queue_scroll_history(session_name, bridge.pane_id, lines)
             return
 
         if message_type == "request-tabs":
@@ -3480,37 +4338,36 @@ class AppServer:
             self.register_device(user, device_id, device_label(connection.request.headers.get("User-Agent", "")))
 
         requested_session = parse_qs(request_url.query).get("session", [""])[0].strip()
-        skip_history = parse_qs(request_url.query).get("skip_history", [""])[0].strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
         session_name, created = self.resolve_user_session(user, requested_session)
-        create_if_missing = created
         requested_session_missing = bool(requested_session) and requested_session != session_name
+        profile_id = self.internal_request_profile(connection)
 
         state = {
             "session": session_name,
             "user": user,
             "principal": forwarded_principal,
+            "profile": profile_id,
+            "switching": False,
             "deviceId": device_id,
             # Enrollment context for the post-ready device-key exchange.
             "authMethod": auth_method,
             "needsEnroll": needs_enroll,
             "enrollment": None,
         }
+        epoch_state = {"epoch": 0, "layout": 0}
         bridge = TmuxBridge(
+            connection,
             session_name,
             self.shell,
             self.cwd,
-            create_if_missing=create_if_missing,
+            create_if_missing=created,
             initial_size=self.terminal_sizes.get(session_name),
+            epoch_state=epoch_state,
+            profile_id=profile_id,
         )
-        bridge.open()
+        await bridge.open()
         if pane_scrolls_locally(session_name) and pane_in_mode(session_name):
-            # Don't attach into a stranded copy-mode view on a local-scroll pane.
             tmux_capture("send-keys", "-t", session_name, "-X", "cancel", check=False)
-        history = "" if skip_history else capture_history(state["session"], CONNECT_HISTORY_LINES)
 
         session_summary: dict[str, int] = {
             "sessions": 1,
@@ -3523,114 +4380,103 @@ class AppServer:
         session_start = time.monotonic()
         session_start_at = datetime.datetime.now()
         self.active_sessions += 1
+        incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
-        async def relay_output() -> None:
-            while True:
-                chunk = await bridge.read()
-                if not chunk:
-                    break
-                session_summary["bytesOut"] += len(chunk)
-                await connection.send(chunk)
+        async def receive_messages() -> None:
+            async for raw_message in connection:
+                if not isinstance(raw_message, str):
+                    continue
+                session_summary["bytesIn"] += len(raw_message)
+                try:
+                    payload = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    continue
+                if bridge.acknowledge(payload):
+                    continue
+                await incoming.put(payload)
 
         async def watch_tabs() -> None:
             previous = ""
             prev_local = None
             while True:
+                if state.get("switching"):
+                    await asyncio.sleep(0.05)
+                    continue
                 tabs = self.tabs_for_user(state["user"], state["session"])
                 snapshot = json.dumps(tabs, sort_keys=True)
                 if snapshot != previous:
                     previous = snapshot
                     await self.send_json(connection, {"type": "tabs", "tabs": tabs})
-                # Tell the client whether the active pane can scroll locally
-                # (normal buffer) or must scroll via the server (alt-screen/mouse).
-                # (No copy-mode auto-cancel here: the client may deliberately be in
-                # copy-mode as its scroll fallback for panes with no xterm
-                # scrollback; cancelling every second would fight it. Copy-mode is
-                # still cleared on attach/switch and on the next keystroke.)
                 local = pane_scrolls_locally(state["session"])
                 if local != prev_local:
                     prev_local = local
                     await self.send_json(connection, {"type": "pane-scroll", "local": local})
-                await asyncio.sleep(1)
+                try:
+                    current_pane = str(pane_metadata(state["session"])[0])
+                except RuntimeError:
+                    current_pane = bridge.pane_id
+                if current_pane != bridge.pane_id:
+                    await bridge.reseed("pane-change", next_pane_id=current_pane)
+                bridge.pane_change.clear()
+                try:
+                    await asyncio.wait_for(bridge.pane_change.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    pass
 
-        output_task = asyncio.create_task(relay_output())
-        tab_task = asyncio.create_task(watch_tabs())
+        async def send_ready(*, initial: bool = False) -> None:
+            payload: dict[str, Any] = {
+                "type": "ready",
+                "session": state["session"],
+                "shell": self.shell,
+                "cwd": self.cwd,
+                "requireToken": self.token_required_for(trusted_client),
+                "tailscaleMode": self.tailscale_mode,
+                "allowedClients": self.allowed_clients,
+                "multiTenant": self.multi_tenant,
+                "user": user if self.multi_tenant else None,
+                "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
+                "principal": forwarded_principal,
+            }
+            if initial:
+                payload["openTabs"] = self.open_tabs_for(user)
+            await self.send_json(connection, payload)
 
-        async def switch_session(target: str, skip: bool) -> None:
-            # Re-attach to a different session on the SAME connection (no WS
-            # reconnect / handshake), so switching tabs costs ~1 round-trip.
-            nonlocal bridge, output_task
-            new_session, created = self.resolve_user_session(state["user"], str(target).strip())
+        async def switch_session(target: str) -> None:
+            nonlocal bridge
+            new_session, new_created = self.resolve_user_session(state["user"], str(target).strip())
             if new_session == state["session"]:
                 return
-            output_task.cancel()
+            state["switching"] = True
             try:
-                await output_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            bridge.close()
-            bridge = TmuxBridge(
-                new_session,
-                self.shell,
-                self.cwd,
-                create_if_missing=created,
-                initial_size=self.terminal_sizes.get(new_session),
-            )
-            bridge.open()
-            state["session"] = new_session
-            output_task = asyncio.create_task(relay_output())
-            await self.send_json(
-                connection,
-                {
-                    "type": "ready",
-                    "session": new_session,
-                    "shell": self.shell,
-                    "cwd": self.cwd,
-                    "requireToken": self.token_required_for(trusted_client),
-                    "tailscaleMode": self.tailscale_mode,
-                    "allowedClients": self.allowed_clients,
-                    "multiTenant": self.multi_tenant,
-                    "user": user if self.multi_tenant else None,
-                    "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
-                    "principal": forwarded_principal,
-                },
-            )
-            # No scrollback push on switch: the client instantly shows its cached
-            # snapshot of this tab, and tmux redraws the live screen over it on
-            # attach — so the switch is seamless (no reset/repaint flash). Local
-            # scroll uses the snapshot's scrollback; panes with none (e.g. codex)
-            # fall back to the server copy-mode scroll on demand.
-            del skip
-            if pane_scrolls_locally(new_session) and pane_in_mode(new_session):
-                # A local-scroll pane stranded in tmux copy-mode is frozen; cancel
-                # it so we stream the live pane, not a stuck scrollback view.
-                tmux_capture("send-keys", "-t", new_session, "-X", "cancel", check=False)
-            await self.send_tabs(connection, state["user"], new_session)
-            await self.send_sessions(connection, state["user"], new_session)
-            await self.send_composer_state(connection, new_session)
+                await bridge.close()
+                session_summary["bytesOut"] += bridge.bytes_out
+                bridge = TmuxBridge(
+                    connection,
+                    new_session,
+                    self.shell,
+                    self.cwd,
+                    create_if_missing=new_created,
+                    initial_size=self.terminal_sizes.get(new_session),
+                    epoch_state=epoch_state,
+                    profile_id=profile_id,
+                )
+                await bridge.open()
+                state["session"] = new_session
+                await send_ready()
+                if pane_scrolls_locally(new_session) and pane_in_mode(new_session):
+                    tmux_capture("send-keys", "-t", new_session, "-X", "cancel", check=False)
+                await bridge.reseed("session-switch")
+                await self.send_tabs(connection, state["user"], new_session)
+                await self.send_sessions(connection, state["user"], new_session)
+                await self.send_composer_state(connection, new_session)
+            finally:
+                state["switching"] = False
 
+        receive_task = asyncio.create_task(receive_messages())
+        tab_task = asyncio.create_task(watch_tabs())
         try:
-            await self.send_json(
-                connection,
-                {
-                    "type": "ready",
-                    "session": state["session"],
-                    "shell": self.shell,
-                    "cwd": self.cwd,
-                    "requireToken": self.token_required_for(trusted_client),
-                    "tailscaleMode": self.tailscale_mode,
-                    "allowedClients": self.allowed_clients,
-                    "multiTenant": self.multi_tenant,
-                    "user": user if self.multi_tenant else None,
-                    "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
-                    "principal": forwarded_principal,
-                    # Only the first ready of a connection carries the persisted
-                    # open-tab set; the client adopts it, then owns the state.
-                    "openTabs": self.open_tabs_for(user),
-                },
-            )
-            if history:
-                await connection.send(history.encode("utf-8", "surrogateescape"))
+            await send_ready(initial=True)
+            await bridge.reseed("initial")
             if requested_session_missing:
                 await self.send_json(
                     connection,
@@ -3645,17 +4491,21 @@ class AppServer:
             await self.send_composer_state(connection, state["session"])
             await self.maybe_enroll_device(connection, state)
 
-            async for raw_message in connection:
-                if not isinstance(raw_message, str):
-                    continue
-                session_summary["bytesIn"] += len(raw_message)
-                try:
-                    payload = json.loads(raw_message)
-                except json.JSONDecodeError:
-                    continue
+            while True:
+                command_task = asyncio.create_task(incoming.get())
+                done, _ = await asyncio.wait((command_task, receive_task), return_when=asyncio.FIRST_COMPLETED)
+                if receive_task in done:
+                    command_task.cancel()
+                    try:
+                        await command_task
+                    except asyncio.CancelledError:
+                        pass
+                    await receive_task
+                    break
+                payload = command_task.result()
                 msg_type = payload.get("type")
                 if msg_type == "switch-session":
-                    await switch_session(payload.get("session", ""), bool(payload.get("skipHistory", True)))
+                    await switch_session(payload.get("session", ""))
                     continue
                 if msg_type and msg_type != "request-stats":
                     session_summary["inputEvents"] += 1
@@ -3669,9 +4519,15 @@ class AppServer:
         except ConnectionClosed:
             pass
         finally:
-            output_task.cancel()
+            receive_task.cancel()
             tab_task.cancel()
-            bridge.close()
+            for task in (receive_task, tab_task):
+                try:
+                    await task
+                except (asyncio.CancelledError, ConnectionClosed, Exception):
+                    pass
+            await bridge.close()
+            session_summary["bytesOut"] += bridge.bytes_out
             session_summary["durationSeconds"] = int(time.monotonic() - session_start)
             self.active_sessions = max(0, self.active_sessions - 1)
             self.record_session(session_summary, session_start_at, datetime.datetime.now())

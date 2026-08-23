@@ -406,7 +406,11 @@ assert.deepEqual(
         ready = app_section('    if (payload.type === "ready") {', '    if (payload.type === "tabs") {')
         selection_change = app_section("    term.onSelectionChange(() => {", "    wheelTarget.addEventListener(")
         self.assertIn("dismissTerminalSelection();", to_tab)
-        self.assertIn("clearTerminalSelectionUI();\n    resetComposerTracking(true);\n    term.reset();", switch_profile)
+        self.assertIn(
+            "clearTerminalSelectionUI();\n    terminalAuthoritative = false;\n"
+            "    resetComposerTracking(true);\n    term.reset();",
+            switch_profile,
+        )
         self.assertIn("clearTerminalSelectionUI();", switch_session)
         self.assertIn("clearTerminalSelectionUI();", ready)
         self.assertIn("clearTerminalSelectionUI();", selection_change)

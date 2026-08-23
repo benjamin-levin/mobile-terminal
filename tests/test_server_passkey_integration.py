@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import unittest
@@ -82,18 +83,24 @@ class StubPasskeys:
 class FakeBridge:
     def __init__(self, *args, **kwargs):
         self.process = None
+        self.pane_id = "%1"
+        self.bytes_out = 0
+        self.pane_change = asyncio.Event()
 
-    def open(self):
+    async def open(self):
         pass
 
-    async def read(self):
-        return b""
-
-    def close(self):
+    async def close(self):
         pass
 
-    def resize(self, cols, rows):
+    async def reseed(self, *args, **kwargs):
         pass
+
+    async def resize(self, cols, rows):
+        pass
+
+    def acknowledge(self, payload):
+        return False
 
 
 class StandalonePasskeyIntegrationTest(unittest.IsolatedAsyncioTestCase):
@@ -127,7 +134,6 @@ class StandalonePasskeyIntegrationTest(unittest.IsolatedAsyncioTestCase):
             mock.patch("server.verify_device_signature", return_value=signature_valid) as verify,
             mock.patch("server.TmuxBridge", FakeBridge),
             mock.patch("server.pane_scrolls_locally", return_value=False),
-            mock.patch("server.capture_history", return_value=""),
         ):
             await app.websocket_handler(connection)
         return verify
@@ -255,7 +261,7 @@ class StandalonePasskeyIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     message_types.index("webauthn-register-options"),
                     message_types.index("ready"),
                 )
-                self.assertEqual(message_types[-1], "enroll-key")
+                self.assertIn("enroll-key", message_types)
                 self.assertIsNone(connection.closed)
 
     async def test_public_private_trusted_and_identity_silent_key_matrix(self):

@@ -39,7 +39,7 @@
   const EDITOR_TAB_PREFIX = "editor:";
   const FILE_REQUEST_TIMEOUT_MS = 8000;
   const FILE_BOOKMARK_LIMIT = 40;
-  const decoder = new TextDecoder();
+  let decoder = new TextDecoder();
   const defaultShortcuts = [
     { label: "Esc", sequence: "{ESC}", visible: true },
     { label: "📋", sequence: "{PASTE}", visible: true },
@@ -600,6 +600,21 @@
   installSemanticPromptHandlers();
 
   let socket = null;
+  let socketMessageChain = Promise.resolve();
+  let pendingTerminalOutput = null;
+  let pendingTerminalSeed = null;
+  let terminalEpoch = 0;
+  let terminalPaneId = "";
+  let terminalCutoff = 0;
+  let terminalRevision = 0;
+  let terminalLayoutGeneration = 0;
+  let terminalSeedHistory = 0;
+  let terminalHistory = 0;
+  let terminalAuthoritative = false;
+  let historyReseedPending = false;
+  let pendingSeedScrollTarget = null;
+  let selectionRequestCounter = 0;
+  const pendingSelectionRequests = new Map();
   let reconnectTimer = null;
   let resumeProbeTimer = null;
   let socketConnectStartedAt = 0;
@@ -645,14 +660,10 @@
   let bottomPinUntil = 0;
   // When true, the active pane is a normal-buffer app (shell, codex, ...) whose
   // transcript lives in xterm's own buffer, so we scroll locally with no server
-  // round-trip. Set from the server's "pane-scroll" message; false = scroll via
-  // the server (alt-screen/mouse TUIs). Default TRUE so scroll never hits the
-  // server's copy-mode path before we've learned the pane type (which stranded
-  // panes like codex-over-ssh in copy-mode); server-scroll is used only once the
-  // server confirms an alt-screen/mouse pane.
+  // round-trip. Default true until the server reports that the active pane owns
+  // scrolling through mouse tracking or an alternate screen.
   let activePaneLocalScroll = true;
   let reconnectForSessionSwitch = false;
-  let skipHistoryOnNextConnect = false;
   let authConfigPollTimer = 0;
   let hostSettingsReady = false;
   let sessionMenuOpen = false;
@@ -1434,129 +1445,69 @@
     });
   }
 
-  function staleVisualContinuationText(buffer, previousLine, line, cols, previousText, endColumn) {
-    if (
-      buffer.type !== "alternate" ||
-      line.isWrapped ||
-      previousLine.length <= cols ||
-      line.length <= cols ||
-      !previousText.trim()
-    ) {
-      return null;
-    }
-
-    const hiddenText = previousLine.translateToString(true, cols, previousLine.length);
-    const visibleText = line.translateToString(true, 0, cols);
-    if (!/^[\x20-\x7e\t]*$/.test(hiddenText) || !/^[\x20-\x7e\t]*$/.test(visibleText)) {
-      return null;
-    }
-    const hiddenContentStart = hiddenText.search(/[^ \t]/);
-    const visibleContentStart = visibleText.search(/[^ \t]/);
-    if (hiddenContentStart < 0 || visibleContentStart < 0) {
-      return null;
-    }
-    const hiddenContent = hiddenText.slice(hiddenContentStart).replace(/[ \t]+$/, "");
-    const visibleContent = visibleText.slice(visibleContentStart).replace(/[ \t]+$/, "");
-    if (hiddenContent.length < 2 || visibleContent.length < 2) {
-      return null;
-    }
-
-    let visibleMatchStart = visibleContentStart;
-    if (hiddenContent.startsWith(visibleContent)) {
-      visibleMatchStart = visibleContentStart;
-    } else if (visibleContent.endsWith(hiddenContent)) {
-      visibleMatchStart += visibleContent.length - hiddenContent.length;
-    } else {
-      return null;
-    }
-
-    const hiddenVisualStart = visibleMatchStart - hiddenContentStart;
-    const hiddenSelectionStart = Math.max(0, -hiddenVisualStart);
-    const hiddenSelectionEnd = Math.min(hiddenText.length, endColumn - hiddenVisualStart);
-    if (hiddenSelectionEnd <= hiddenSelectionStart) {
-      return "";
-    }
-    return hiddenText.slice(hiddenSelectionStart, hiddenSelectionEnd);
+  function terminalHasSelection() {
+    return Boolean(
+      typeof term.getSelectionPosition === "function" && term.getSelectionPosition(),
+    );
   }
 
-  function extractTerminalSelectionText(buffer, cols, selection) {
-    if (
-      !buffer ||
-      !Number.isInteger(cols) ||
-      cols <= 0 ||
-      !selection?.start ||
-      !selection?.end ||
-      selection.start.y > selection.end.y
-    ) {
+  function terminalSelectionState() {
+    const selection =
+      typeof term.getSelectionPosition === "function" ? term.getSelectionPosition() : null;
+    if (!selection || !term.buffer?.active) {
       return null;
     }
-
-    let text = "";
-    let previousLine = null;
-    let previousLineText = "";
-    for (let row = selection.start.y; row <= selection.end.y; row += 1) {
-      const line = buffer.getLine(row);
-      if (!line || typeof line.translateToString !== "function") {
-        return null;
-      }
-      const startColumn = Math.max(0, Math.min(cols, row === selection.start.y ? selection.start.x : 0));
-      const endColumn = Math.max(0, Math.min(cols, row === selection.end.y ? selection.end.x : cols));
-      const lineText = line.translateToString(true, startColumn, Math.min(endColumn, line.length));
-
-      if (row === selection.start.y) {
-        text = lineText;
-      } else if (line.isWrapped) {
-        text += lineText;
-      } else {
-        const staleContinuation = staleVisualContinuationText(
-          buffer,
-          previousLine,
-          line,
-          cols,
-          previousLineText,
-          endColumn,
-        );
-        if (staleContinuation !== null) {
-          // Alternate-screen rows do not reflow when xterm shrinks. tmux redraws
-          // a visual continuation with cursor moves, so isWrapped can be false.
-          // Reuse the matching hidden suffix because it is the only canonical
-          // source for boundary whitespace. ASCII-only alignment avoids guessing
-          // at multi-column character boundaries; a coincidental match remains
-          // fundamentally indistinguishable.
-          text += staleContinuation;
-        } else {
-          text += `\n${lineText}`;
-        }
-      }
-      previousLine = line;
-      previousLineText = lineText;
-    }
-    return text.replaceAll(String.fromCharCode(160), " ");
+    return {
+      selection: {
+        start: { x: selection.start.x, y: selection.start.y },
+        end: { x: selection.end.x, y: selection.end.y },
+      },
+      profile: activeProfileId || "",
+      session: activeSessionName,
+      paneId: terminalPaneId,
+      epoch: terminalEpoch,
+      revision: terminalRevision,
+      cutoff: terminalCutoff,
+      layoutGeneration: terminalLayoutGeneration,
+      baseY: term.buffer.active.baseY,
+      bufferType: term.buffer.active.type,
+    };
   }
 
-  function terminalSelectionText() {
-    if (typeof term.getSelection !== "function") {
-      return "";
+  function sameTerminalSelectionState(left, right) {
+    return Boolean(left && right && JSON.stringify(left) === JSON.stringify(right));
+  }
+
+  function requestAuthoritativeSelection() {
+    const state = terminalSelectionState();
+    if (!state) {
+      return Promise.resolve({ error: "Select terminal text first." });
     }
     if (
-      typeof term.getSelectionPosition !== "function" ||
-      !term.buffer?.active ||
-      !Number.isInteger(term.cols)
+      !terminalAuthoritative ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN
     ) {
-      return term.getSelection();
+      return Promise.resolve({ error: "Terminal changed; select again." });
     }
-    const selection = term.getSelectionPosition();
-    if (!selection) {
-      return "";
-    }
-    const extracted = extractTerminalSelectionText(term.buffer.active, term.cols, selection);
-    return extracted === null ? term.getSelection() : extracted;
+    selectionRequestCounter += 1;
+    const requestId = `${Date.now()}-${selectionRequestCounter}`;
+    return new Promise((resolve) => {
+      const timer = window.setTimeout(() => {
+        pendingSelectionRequests.delete(requestId);
+        resolve({ error: "Terminal changed; select again." });
+      }, 6000);
+      pendingSelectionRequests.set(requestId, { resolve, timer, state });
+      const sent = sendMessage({ type: "selection-request", requestId, ...state });
+      if (!sent) {
+        window.clearTimeout(timer);
+        pendingSelectionRequests.delete(requestId);
+        resolve({ error: "Terminal changed; select again." });
+      }
+    });
   }
 
   function copyTextWithFallback(text) {
-    if (!text) {
-      return false;
-    }
     const textarea = document.createElement("textarea");
     textarea.value = text;
     textarea.setAttribute("readonly", "");
@@ -1575,10 +1526,56 @@
     return copied;
   }
 
-  // xterm already joins soft-wrapped rows, so preserve its selection exactly apart
-  // from normalizing platform line endings for the clipboard.
+  // The server already joins soft-wrapped rows, so preserve its authoritative
+  // selection exactly apart from normalizing platform line endings.
   function normalizeTerminalCopyText(text) {
     return text.replace(/\r\n?/g, "\n");
+  }
+
+  function beginAuthoritativeClipboardWrite(selectionPromise) {
+    try {
+      if (
+        typeof ClipboardItem !== "function" ||
+        !navigator.clipboard ||
+        typeof navigator.clipboard.write !== "function"
+      ) {
+        return null;
+      }
+      const blobPromise = selectionPromise.then((result) => {
+        if (result.error) {
+          throw new Error(result.error);
+        }
+        return new Blob([normalizeTerminalCopyText(result.text)], { type: "text/plain" });
+      });
+      blobPromise.catch(() => {});
+      const writePromise = Promise.resolve(
+        navigator.clipboard.write([
+          new ClipboardItem({ "text/plain": blobPromise }),
+        ]),
+      );
+      writePromise.catch(() => {});
+      return writePromise;
+    } catch (error) {
+      const writePromise = Promise.reject(error);
+      writePromise.catch(() => {});
+      return writePromise;
+    }
+  }
+
+  async function copyClipboardTextWithFallback(text) {
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_error) {
+      // Fall through to the legacy browser path.
+    }
+    try {
+      return copyTextWithFallback(text);
+    } catch (_error) {
+      return false;
+    }
   }
 
   // Direct PTY paste remains deliberately single-line so a multi-line paste does
@@ -1599,22 +1596,40 @@
   }
 
   async function copyTerminalSelection() {
-    const raw = terminalSelectionText();
-    if (!raw) {
-      showToast("Select terminal text first.");
+    let selectionPromise;
+    try {
+      selectionPromise = Promise.resolve(requestAuthoritativeSelection());
+    } catch (_error) {
+      showToast("Terminal changed; select again.");
       return;
     }
-    const text = normalizeTerminalCopyText(raw);
+    const clipboardWritePromise = beginAuthoritativeClipboardWrite(selectionPromise);
+    let result;
     try {
-      await navigator.clipboard.writeText(text);
-      showToast("Copied terminal selection.");
+      result = await selectionPromise;
     } catch (_error) {
-      if (copyTextWithFallback(text)) {
+      showToast("Terminal changed; select again.");
+      return;
+    }
+    if (result.error) {
+      showToast(result.error);
+      return;
+    }
+    const text = normalizeTerminalCopyText(result.text);
+    if (clipboardWritePromise) {
+      try {
+        await clipboardWritePromise;
         showToast("Copied terminal selection.");
         return;
+      } catch (_error) {
+        // A delayed write may still work in browsers without promised ClipboardItem support.
       }
-      showToast("Clipboard copy is blocked by this browser.");
     }
+    if (await copyClipboardTextWithFallback(text)) {
+      showToast("Copied terminal selection.");
+      return;
+    }
+    showToast("Clipboard copy is blocked by this browser.");
   }
 
   // The most recent tab other than the current one. Prefers the tab the user
@@ -1647,9 +1662,9 @@
   // drop the text into its composer once it's ready. The paste lands in the
   // prompt for review — it is not auto-executed.
   async function pasteSelectionToRecentTab() {
-    const raw = terminalSelectionText();
-    if (!raw) {
-      showToast("Select terminal text first.");
+    const result = await requestAuthoritativeSelection();
+    if (result.error) {
+      showToast(result.error);
       return;
     }
     const target = recentOtherSession();
@@ -1659,7 +1674,7 @@
     }
     pendingPasteAfterSwitch = {
       session: target,
-      text: normalizeTerminalCopyText(raw),
+      text: normalizeTerminalCopyText(result.text),
       ready: false,
     };
     dismissTerminalSelection();
@@ -2182,7 +2197,7 @@
       hideSelectionMagnifier();
       return;
     }
-    if (!terminalSelectionText()) {
+    if (!terminalHasSelection()) {
       clearTerminalSelectionUI();
       return;
     }
@@ -2521,7 +2536,7 @@
   function updateTerminalSelectionUI() {
     const pos =
       typeof term.getSelectionPosition === "function" ? term.getSelectionPosition() : null;
-    if (!pos || !terminalSelectionText()) {
+    if (!pos || !terminalHasSelection()) {
       clearTerminalSelectionUI();
       return;
     }
@@ -2772,7 +2787,7 @@
       end += 1;
     }
     term.select(start, absRow, end - start + 1);
-    if (!terminalSelectionText()) {
+    if (!terminalHasSelection()) {
       return false;
     }
     suppressNextTerminalClick = true;
@@ -3117,10 +3132,6 @@
     }
     if (selectedSessionName) {
       url.searchParams.set("session", selectedSessionName);
-    }
-    if (skipHistoryOnNextConnect) {
-      url.searchParams.set("skip_history", "1");
-      skipHistoryOnNextConnect = false;
     }
     url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     return url.toString();
@@ -4314,6 +4325,119 @@
     return true;
   }
 
+  function writeTerminal(data) {
+    return new Promise((resolve) => term.write(data, resolve));
+  }
+
+  function terminalCursorStyle(meta) {
+    const shape = String(meta.cursorShape || "default");
+    const blinking = shape.startsWith("blinking-") || meta.cursorBlinking;
+    if (shape.endsWith("underline")) return blinking ? 3 : 4;
+    if (shape.endsWith("bar")) return blinking ? 5 : 6;
+    return blinking ? 1 : 2;
+  }
+
+  function terminalReplayBaselineSequence() {
+    return "\x1b[0m\x0f\x1b(B\x1b[?1l\x1b[?6l\x1b[?7l\x1b[4l\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b>\x1b[r\x1b[H";
+  }
+
+  function terminalTabStopsSequence(meta) {
+    let sequence = "\x1b[3g";
+    for (const stop of Array.isArray(meta.tabStops) ? meta.tabStops : []) {
+      sequence += `\x1b[${Number(stop) + 1}G\x1bH`;
+    }
+    return `${sequence}\x1b[H`;
+  }
+
+  function terminalModeSequence(meta) {
+    let sequence = terminalReplayBaselineSequence();
+    const scrollUpper = Number(meta.scrollUpper) || 0;
+    const scrollLower = Number.isFinite(Number(meta.scrollLower))
+      ? Number(meta.scrollLower)
+      : Number(meta.rows) - 1;
+    if (scrollUpper !== 0 || scrollLower !== Number(meta.rows) - 1) {
+      sequence += `\x1b[${scrollUpper + 1};${scrollLower + 1}r`;
+    }
+    if (meta.insert) sequence += "\x1b[4h";
+    if (meta.wrap) sequence += "\x1b[?7h";
+    if (meta.keypadCursor) sequence += "\x1b[?1h";
+    if (meta.keypad) sequence += "\x1b=";
+    if (meta.mouseStandard) sequence += "\x1b[?1000h";
+    if (meta.mouseButton) sequence += "\x1b[?1002h";
+    if (meta.mouseAny) sequence += "\x1b[?1003h";
+    if (meta.mouseSgr) sequence += "\x1b[?1006h";
+    if (meta.origin) sequence += "\x1b[?6h";
+    if (meta.cursorFlag) sequence += "\x1b[?25h";
+    sequence += `\x1b[${terminalCursorStyle(meta)} q`;
+    const cursorRow = meta.origin ? Number(meta.cursorY) - scrollUpper : Number(meta.cursorY);
+    sequence += `\x1b[${cursorRow + 1};${Number(meta.cursorX) + 1}H`;
+    return sequence;
+  }
+
+  async function applyTerminalSeed(payload) {
+    const meta = payload.meta;
+    if (!meta || !Array.isArray(payload.physicalRows)) {
+      throw new Error("Invalid terminal seed");
+    }
+    decoder = new TextDecoder();
+    term.resize(Number(meta.cols), Number(meta.rows));
+    let reset = `\x1b[?1049l${terminalReplayBaselineSequence()}\x1b[3J\x1b[2J\x1b[H`;
+    if (meta.alternate) {
+      reset += `\x1b[?1049h${terminalReplayBaselineSequence()}\x1b[2J\x1b[H`;
+    }
+    await writeTerminal(reset);
+    await writeTerminal(terminalTabStopsSequence(meta));
+    await writeTerminal(payload.physicalRows.join("\r\n"));
+    await writeTerminal(terminalModeSequence(meta));
+    terminalEpoch = Number(payload.epoch);
+    terminalPaneId = String(payload.paneId || meta.paneId || "");
+    terminalCutoff = Number(payload.cutoff);
+    terminalRevision = terminalCutoff;
+    terminalLayoutGeneration = Number(payload.layoutGeneration);
+    terminalSeedHistory = Number(meta.seedHistory) || 0;
+    terminalHistory = Number(meta.history) || 0;
+    pendingSeedScrollTarget = Number.isFinite(Number(payload.scrollTarget))
+      ? Number(payload.scrollTarget)
+      : null;
+  }
+
+  async function handleTerminalBinary(data) {
+    const metadata = pendingTerminalOutput;
+    pendingTerminalOutput = null;
+    if (!metadata) {
+      throw new Error("Terminal output arrived without metadata");
+    }
+    let chunk = data;
+    if (chunk instanceof Blob) {
+      chunk = await chunk.arrayBuffer();
+    }
+    const bytes = new Uint8Array(chunk);
+    if (
+      String(metadata.paneId || "") !== terminalPaneId ||
+      Number(metadata.epoch) !== terminalEpoch ||
+      Number(metadata.start) !== terminalRevision ||
+      Number(metadata.end) !== terminalRevision + bytes.byteLength
+    ) {
+      terminalAuthoritative = false;
+      throw new Error("Terminal output ordering changed");
+    }
+    if (!terminalAuthoritative && metadata.kind === "live") {
+      terminalRevision = Number(metadata.end);
+      return;
+    }
+    await writeTerminal(decoder.decode(bytes, { stream: true }));
+    terminalRevision = Number(metadata.end);
+    if (followOutput || performance.now() < bottomPinUntil) {
+      term.scrollToBottom();
+    }
+    if (semanticPromptState.seenMarker) {
+      scheduleSemanticComposerSync();
+    }
+    if (terminalHorizontallyOverflows()) {
+      scheduleLayoutRefresh();
+    }
+  }
+
   function scheduleLayoutRefresh({ preserveTerminalCols = false } = {}) {
     window.clearTimeout(fitTimer);
     fitTimer = window.setTimeout(() => {
@@ -4436,7 +4560,9 @@
       if (term.cols !== lastTerminalCols || term.rows !== lastTerminalRows) {
         lastTerminalCols = term.cols;
         lastTerminalRows = term.rows;
-        sendMessage({ type: "resize", cols: term.cols, rows: term.rows });
+        if (terminalAuthoritative) {
+          sendMessage({ type: "resize", cols: term.cols, rows: term.rows });
+        }
       }
       if (followOutput) {
         term.scrollToBottom();
@@ -4533,12 +4659,27 @@
       const before = term.buffer.active.viewportY;
       term.scrollLines(-lines);
       if (term.buffer.active.viewportY !== before || lines <= 0) {
-        return; // local scroll moved (or we're scrolling down at the bottom)
+        return;
       }
-      // Nothing to scroll locally: some TUIs (e.g. codex) render in place with
-      // no xterm scrollback — their history lives in the tmux buffer. Fall back
-      // to the server (tmux copy-mode) for the rest of this pane's session.
-      activePaneLocalScroll = false;
+      if (
+        historyReseedPending ||
+        terminalSeedHistory >= terminalHistory ||
+        terminalSeedHistory >= 20000
+      ) {
+        return;
+      }
+      const scrollTarget = before - terminalSeedHistory - lines;
+      const historyLines = Math.min(
+        20000,
+        terminalHistory,
+        Math.max(terminalSeedHistory + 2000, terminalSeedHistory * 2, -scrollTarget + term.rows),
+      );
+      historyReseedPending = sendMessage({
+        type: "history-reseed",
+        historyLines,
+        scrollTarget,
+      });
+      return;
     }
     pendingScrollLines += lines;
     if (pendingScrollFrameId === null) {
@@ -4892,7 +5033,7 @@
         scheduleTerminalSelectionUISync();
         return;
       }
-      if (!terminalSelectionText()) {
+      if (!terminalHasSelection()) {
         clearTerminalSelectionUI();
       } else if (isSelectionUIVisible()) {
         scheduleTerminalSelectionUISync();
@@ -5539,6 +5680,7 @@
     closeSessionMenu();
     closeTabMenu();
     clearTerminalSelectionUI();
+    terminalAuthoritative = false;
     resetComposerTracking(true);
     term.reset();
     applyActiveProfile();
@@ -6928,6 +7070,15 @@
     socketConnectStartedAt = performance.now();
     const thisSocket = socket;
     socket.binaryType = "arraybuffer";
+    socketMessageChain = Promise.resolve();
+    pendingTerminalOutput = null;
+    pendingTerminalSeed = null;
+    terminalAuthoritative = false;
+    for (const pending of pendingSelectionRequests.values()) {
+      window.clearTimeout(pending.timer);
+      pending.resolve({ error: "Terminal changed; select again." });
+    }
+    pendingSelectionRequests.clear();
     updateProfileConnectionState();
 
     // Auth is challenge-driven now: the server sends {type:"auth-challenge",
@@ -6942,7 +7093,7 @@
       updateProfileConnectionState();
     });
 
-    const onSocketMessage = async (event) => {
+    const processSocketMessage = async (event) => {
       if (socket !== thisSocket) {
         return;
       }
@@ -6954,21 +7105,18 @@
         await handleServerMessage(payload);
         return;
       }
-      let chunk = event.data;
-      if (chunk instanceof Blob) {
-        chunk = await chunk.arrayBuffer();
-      }
-      term.write(decoder.decode(chunk, { stream: true }), () => {
-        if (followOutput || performance.now() < bottomPinUntil) {
-          term.scrollToBottom();
-        }
-        if (semanticPromptState.seenMarker) {
-          scheduleSemanticComposerSync();
-        }
-        if (terminalHorizontallyOverflows()) {
-          scheduleLayoutRefresh();
-        }
-      });
+      await handleTerminalBinary(event.data);
+    };
+    const onSocketMessage = (event) => {
+      socketMessageChain = socketMessageChain
+        .then(() => processSocketMessage(event))
+        .catch((error) => {
+          console.error(error);
+          terminalAuthoritative = false;
+          if (socket === thisSocket) {
+            reconnectSocket();
+          }
+        });
     };
     socket.addEventListener("message", onSocketMessage);
     // Replay anything the bootstrap socket buffered before app.js attached.
@@ -7032,6 +7180,94 @@
   }
 
   async function handleServerMessage(payload) {
+    if (payload.type === "terminal-output") {
+      if (pendingTerminalOutput) {
+        terminalAuthoritative = false;
+        throw new Error("Terminal output metadata overlapped");
+      }
+      pendingTerminalOutput = payload;
+      return;
+    }
+    if (payload.type === "seed-start") {
+      terminalAuthoritative = false;
+      pendingTerminalSeed = null;
+      pendingSeedScrollTarget = null;
+      clearTerminalSelectionUI();
+      sendMessage({
+        type: "seed-start-ack",
+        epoch: payload.epoch,
+        cols: term.cols,
+        rows: term.rows,
+      });
+      return;
+    }
+    if (payload.type === "seed-data") {
+      pendingTerminalSeed = payload;
+      return;
+    }
+    if (payload.type === "seed-end") {
+      if (!pendingTerminalSeed || Number(pendingTerminalSeed.epoch) !== Number(payload.epoch)) {
+        throw new Error("Terminal seed ended without matching data");
+      }
+      await applyTerminalSeed(pendingTerminalSeed);
+      pendingTerminalSeed = null;
+      sendMessage({ type: "seed-ack", epoch: payload.epoch });
+      return;
+    }
+    if (payload.type === "post-flush") {
+      sendMessage({ type: "post-flush-ack", epoch: payload.epoch, cycle: payload.cycle });
+      return;
+    }
+    if (payload.type === "seed-open") {
+      if (
+        Number(payload.epoch) !== terminalEpoch ||
+        String(payload.paneId || "") !== terminalPaneId ||
+        Number(payload.cutoff) !== terminalCutoff ||
+        Number(payload.layoutGeneration) !== terminalLayoutGeneration
+      ) {
+        terminalAuthoritative = false;
+        return;
+      }
+      terminalAuthoritative = true;
+      historyReseedPending = false;
+      if (pendingSeedScrollTarget !== null && term.buffer.active.type === "normal") {
+        term.scrollToLine(Math.max(0, pendingSeedScrollTarget + terminalSeedHistory));
+        followOutput = false;
+      }
+      pendingSeedScrollTarget = null;
+      if (
+        lastTerminalCols > 0 &&
+        lastTerminalRows > 0 &&
+        (term.cols !== lastTerminalCols || term.rows !== lastTerminalRows)
+      ) {
+        sendMessage({ type: "resize", cols: lastTerminalCols, rows: lastTerminalRows });
+      }
+      return;
+    }
+    if (payload.type === "selection-check") {
+      const pending = pendingSelectionRequests.get(String(payload.requestId || ""));
+      sendMessage({
+        type: "selection-check-ack",
+        requestId: payload.requestId,
+        epoch: terminalEpoch,
+        unchanged: Boolean(
+          pending &&
+          terminalAuthoritative &&
+          sameTerminalSelectionState(pending.state, terminalSelectionState()),
+        ),
+      });
+      return;
+    }
+    if (payload.type === "selection-result") {
+      const requestId = String(payload.requestId || "");
+      const pending = pendingSelectionRequests.get(requestId);
+      if (pending) {
+        window.clearTimeout(pending.timer);
+        pendingSelectionRequests.delete(requestId);
+        pending.resolve(payload.error ? { error: payload.error } : { text: String(payload.text || "") });
+      }
+      return;
+    }
     if (
       window.MobileTerminalPasskeys &&
       (payload.type === "webauthn-auth-options" || payload.type === "webauthn-register-options")
@@ -7136,6 +7372,7 @@
       return;
     }
     if (payload.type === "ready") {
+      terminalAuthoritative = false;
       clearTerminalSelectionUI();
       const readyIsHidden = document.visibilityState === "hidden";
       applyTerminalReadyVisibility(readyIsHidden);
@@ -7161,9 +7398,8 @@
       resetComposerRevisionState();
       resetSemanticPromptState();
       resetTerminalBufferSyncState();
-      // New pane: assume local scroll until the server's pane-scroll message
-      // (sent right after) says otherwise — avoids the server copy-mode path
-      // running before we know the pane type.
+      // New pane: assume local scroll until the server reports whether the pane
+      // owns scrolling through an alternate screen or mouse tracking.
       activePaneLocalScroll = true;
       if (payload.multiTenant) {
         currentUser = payload.user || currentUser;
@@ -7216,20 +7452,6 @@
       addOpenTab(activeSessionName);
       pushOpenTabsToServer();
       followOutput = true;
-      // Each connection gets a fresh bridge PTY on the server; the resize
-      // gate below is page-lifetime, so without resetting it an unchanged
-      // layout would leave the new bridge at the server's default size and
-      // flap the tmux window width (rewrapping the pane and its history).
-      // Only re-send once a fit has completed (lastTerminalLayoutWidth is set
-      // at the end of the first fit) — before that, term.cols/rows are
-      // xterm's 80x24 default and would shrink the live tmux window.
-      lastTerminalCols = 0;
-      lastTerminalRows = 0;
-      if (lastTerminalLayoutWidth > 0 && term.cols > 0 && term.rows > 0) {
-        lastTerminalCols = term.cols;
-        lastTerminalRows = term.rows;
-        sendMessage({ type: "resize", cols: term.cols, rows: term.rows });
-      }
       if (!pendingProfileId) {
         loginOverlay.classList.add("hidden");
         loginMessage.textContent = "";
@@ -7797,25 +8019,24 @@
     // snapshot restore + live redraw can't strand it scrolled up.
     bottomPinUntil = performance.now() + 1500;
     // Fast path: switch on the live connection (no WS reconnect/handshake).
-    // The server re-attaches the target session and streams it; `ready` arrives
-    // and re-inits for the new session. tmux redraws on attach, so skip history.
+    // A cached snapshot is paint-only. Finish that write before asking the server
+    // to switch, then the target's authoritative seed replaces it.
     if (socket && socket.readyState === WebSocket.OPEN) {
       selectedSessionName = sessionName;
-      // Paint the last-seen buffer instantly (0 RTT) from cache. tmux redraws the
-      // live screen over it on attach, so the switch is seamless — the snapshot IS
-      // the ready state, with no reset/repaint flash. No history is requested; the
-      // snapshot carries the scrollback (panes with none use the server fallback).
+      terminalAuthoritative = false;
+      const requestSwitch = () => sendMessage({ type: "switch-session", session: sessionName });
       const snapshot = sessionSnapshots.get(sessionSnapshotKey(sessionName));
       if (snapshot) {
         term.write(snapshot, () => {
           term.scrollToBottom();
+          requestSwitch();
         });
+      } else {
+        requestSwitch();
       }
-      sendMessage({ type: "switch-session", session: sessionName, skipHistory: true });
       return;
     }
-    // No live socket: fall back to a fresh connect for this session.
-    skipHistoryOnNextConnect = true;
+    // No live socket: fall back to a fresh authoritative attach.
     if (socket && socket.readyState === WebSocket.CONNECTING) {
       reconnectForSessionSwitch = true;
       socket.close(1000, "switch-session");
@@ -8729,17 +8950,22 @@
     }
   }
 
-  document.addEventListener("copy", (event) => {
-    if (isEditableTarget(event.target)) {
+  function isTerminalCopyTarget(target) {
+    return Boolean(target && (target === terminalElement || terminalElement.contains(target)));
+  }
+
+  function handleNativeTerminalCopy(event) {
+    if (!terminalHasSelection() || !isTerminalCopyTarget(event.target)) {
       return;
     }
-    const text = terminalSelectionText();
-    if (!text || !event.clipboardData) {
-      return;
-    }
-    event.clipboardData.setData("text/plain", normalizeTerminalCopyText(text));
     event.preventDefault();
-  });
+    event.stopPropagation();
+    copyTerminalSelection().catch(() => {
+      showToast("Clipboard copy is blocked by this browser.");
+    });
+  }
+
+  document.addEventListener("copy", handleNativeTerminalCopy, true);
 
   function handleImagePaste(file) {
     if (!file) {

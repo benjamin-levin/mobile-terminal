@@ -45,6 +45,7 @@ from webauthn_auth import (
 WS_PATH = "/_ws"
 INTERNAL_TOKEN_HEADER = "X-Mobile-Terminal-Internal-Token"
 PRINCIPAL_HEADER = "X-Mobile-Terminal-Principal"
+PROFILE_HEADER = "X-Mobile-Terminal-Profile"
 
 
 class BackendAuthenticationError(Exception):
@@ -995,12 +996,13 @@ class ProxyServer:
                 additional_headers={
                     INTERNAL_TOKEN_HEADER: self.config.internal_token_for(profile),
                     PRINCIPAL_HEADER: principal,
+                    PROFILE_HEADER: profile.id,
                 },
                 proxy=None,
                 open_timeout=5,
                 ping_interval=20,
                 ping_timeout=20,
-                max_size=2**20,
+                max_size=64 * 2**20,
             )
         except Exception:
             return await self._unavailable_profile(
@@ -1116,6 +1118,16 @@ class ProxyServer:
                     continue
                 if message_type == "switch-profile":
                     return str(payload.get("profile", "")), str(payload.get("session", ""))
+                if message_type == "selection-request" and payload.get("profile", "") != profile.id:
+                    await self.send_json(
+                        connection,
+                        {
+                            "type": "selection-result",
+                            "requestId": str(payload.get("requestId", "")),
+                            "error": "Terminal changed; select again.",
+                        },
+                    )
+                    continue
                 if await self._handle_device_key_message(
                     connection,
                     profile,
