@@ -858,21 +858,27 @@ class RenderingAndMatchingTest(unittest.TestCase):
                     if selection_name == "full":
                         self.assertNotIn(result.text, {"same", "same  "})
 
-    def test_clipped_prefix_and_suffix_fail_but_full_surroundings_match(self):
-        cases = (
-            ("top", self.candidate("prefix\nsame", cols=12), 1),
-            ("bottom", self.candidate("same\nsuffix", cols=12), 0),
+    def test_unique_top_clipping_matches_and_bottom_clipping_fails_closed(self):
+        top_clipped = self.candidate("prefix\nsame", cols=12)
+        result = match_complete_provider_block(
+            (top_clipped,),
+            (top_clipped.plain_rows[1],),
+            (0, 2),
+            (0, 6),
         )
-        for name, candidate, visible_row in cases:
-            with self.subTest(edge=name):
-                result = match_complete_provider_block(
-                    (candidate,),
-                    (candidate.plain_rows[visible_row],),
-                    (0, 2),
-                    (0, 6),
-                )
-                self.assertFalse(result.matched)
-                self.assertEqual(result.internal_reason, "placement-ambiguous")
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "same")
+        self.assertEqual(result.placement_row, -1)
+
+        bottom_clipped = self.candidate("same\nsuffix", cols=12)
+        result = match_complete_provider_block(
+            (bottom_clipped,),
+            (bottom_clipped.plain_rows[0],),
+            (0, 2),
+            (0, 6),
+        )
+        self.assertFalse(result.matched)
+        self.assertEqual(result.internal_reason, "placement-ambiguous")
 
         candidate = self.candidate("prefix\nsame\nsuffix", cols=12)
         result = match_complete_provider_block(
@@ -1431,6 +1437,18 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
             plain_rows,
             cols,
         )
+        transcript_path = LIVE_FIXTURE_ROOT / metadata["transcript"]["copy"]
+        transcript_texts = []
+        for line in transcript_path.read_text().splitlines():
+            record = json.loads(line)
+            if record.get("type") != "assistant":
+                continue
+            message = record.get("message")
+            if not isinstance(message, dict):
+                continue
+            for block in message.get("content", ()):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    transcript_texts.append(block["text"])
         cached = metadata["binding"]
         binding = ProviderBinding(
             provider=cached["provider"],
@@ -1439,7 +1457,7 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
             proc_start=cached["procStart"],
             session_id=cached["sessionId"],
             transcript_id=cached["sessionId"],
-            transcript_path=LIVE_FIXTURE_ROOT / metadata["transcript"]["copy"],
+            transcript_path=transcript_path,
             version=cached["version"],
             generation=cached["generation"],
         )
@@ -1449,6 +1467,7 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
             cols=cols,
             plain_rows=normalized_plain,
             style_rows=normalized_styles,
+            transcript_texts=tuple(transcript_texts),
         )
 
     def match(self, fixture, start, end, *, plain_rows=None, style_rows=None):
@@ -1529,6 +1548,164 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
         self.assertEqual(wrapped_prose.text, self.prose)
         self.assertNotIn("\n", wrapped_prose.text)
 
+    def test_richtext_heading_replay_consumes_marker_and_requires_real_style(self):
+        fixture = self.fixture("wide-richtext-complete")
+        transcript = fixture.transcript_texts[-1]
+        source_heading = transcript.splitlines()[1]
+        expected = source_heading.removeprefix("## ")
+
+        heading = self.match(fixture, (13, 2), (13, 20))
+        self.assertTrue(heading.matched)
+        self.assertEqual(heading.text, expected)
+        self.assertNotIn("#", heading.text)
+        heading_styles = provider_authority_module._captured_style_cells(
+            fixture.style_rows[13]
+        )
+        self.assertTrue(
+            all(heading_styles[column] == "strong" for column in range(2, 20))
+        )
+
+        wrong_styles = list(fixture.style_rows)
+        wrong_styles[13] = tuple(
+            (start, end, "plain" if style == "strong" else style)
+            for start, end, style in wrong_styles[13]
+        )
+        mismatch = self.match(fixture, (13, 2), (13, 20), style_rows=wrong_styles)
+        self.assertFalse(mismatch.matched)
+        self.assertEqual(mismatch.internal_reason, "style-mismatch")
+
+    def test_richtext_ordered_list_replay_and_hanging_wrap_are_exact(self):
+        fixture = self.fixture("wide-richtext-complete")
+        transcript = fixture.transcript_texts[-1]
+        source_lines = transcript.splitlines()
+        expected = "\n".join(source_lines[2:5])
+
+        ordered = self.match(fixture, (15, 2), (17, 63))
+        self.assertTrue(ordered.matched)
+        self.assertEqual(ordered.text, expected)
+        marker_styles = provider_authority_module._captured_style_cells(
+            fixture.style_rows[15]
+        )
+        self.assertEqual(
+            tuple(marker_styles[column] for column in range(2, 4)),
+            ("plain", "plain"),
+        )
+
+        candidate = render_semantic_candidate(
+            AssistantTextRecord("claude", "ordered", "ordered", expected, 1),
+            version="2.1.241",
+            cols=60,
+            first_record_island=False,
+        )
+        self.assertEqual(candidate.copy_text, expected)
+        self.assertTrue(any(row.startswith("     ") for row in candidate.plain_rows[1:]))
+        markers = [
+            (cell.text, cell.style)
+            for cell in candidate.cells
+            if cell.copy_start is not None
+            and cell.text in "123."
+            and cell.column in (2, 3)
+        ]
+        self.assertEqual(
+            markers,
+            [
+                ("1", "assistant"),
+                (".", "assistant"),
+                ("2", "assistant"),
+                (".", "assistant"),
+                ("3", "assistant"),
+                (".", "assistant"),
+            ],
+        )
+        replay = match_complete_provider_block(
+            (candidate,),
+            candidate.plain_rows,
+            candidate.selection_start,
+            candidate.selection_end,
+            style_rows=normalize_styled_rows(
+                verified_styled_rows(candidate), candidate.plain_rows
+            ),
+        )
+        self.assertTrue(replay.matched)
+        self.assertEqual(replay.text, expected)
+
+    def test_richtext_emphasis_replay_maps_across_style_boundaries(self):
+        fixture = self.fixture("wide-richtext-complete")
+        transcript = fixture.transcript_texts[-1]
+        source_paragraph = transcript.splitlines()[6]
+        expected = source_paragraph.replace("**", "").replace("*", "")
+
+        paragraph = self.match(fixture, (19, 2), (20, 42))
+        self.assertTrue(paragraph.matched)
+        self.assertEqual(paragraph.text, expected)
+        self.assertNotIn("*", paragraph.text)
+
+        crossing = self.match(fixture, (19, 20), (19, 60))
+        self.assertTrue(crossing.matched)
+        crossing_start = expected.index("stays")
+        crossing_end = expected.index(" lat")
+        self.assertEqual(crossing.text, expected[crossing_start:crossing_end])
+        styles = provider_authority_module._captured_style_cells(fixture.style_rows[19])
+        self.assertTrue(all(styles[column] == "strong" for column in range(26, 34)))
+        self.assertTrue(all(styles[column] == "emphasis" for column in range(41, 54)))
+
+    def test_history_top_clipped_replay_uses_unique_captured_suffix(self):
+        fixture = self.fixture("wide-history-complete")
+        transcript = fixture.transcript_texts[-1]
+        expected = transcript[transcript.index("item 23:") :]
+
+        visible_suffix = self.match(fixture, (0, 2), (22, 21))
+        self.assertTrue(visible_suffix.matched)
+        self.assertEqual(visible_suffix.text, expected)
+        self.assertEqual(visible_suffix.placement_row, -23)
+
+        paragraph_start = transcript.index("Selections that start")
+        paragraph_end = transcript.index("\n\nFIXTURE-HISTORY-END")
+        paragraph = self.match(fixture, (19, 2), (20, 81))
+        self.assertTrue(paragraph.matched)
+        self.assertEqual(
+            paragraph.text,
+            transcript[paragraph_start:paragraph_end],
+        )
+        self.assertEqual(paragraph.placement_row, -23)
+
+        repeated_phrase = "retained history row"
+        interior = self.match(fixture, (0, 11), (0, 31))
+        self.assertTrue(interior.matched)
+        source_row = transcript.splitlines()[23]
+        phrase_start = source_row.index(repeated_phrase)
+        self.assertEqual(
+            interior.text,
+            source_row[phrase_start : phrase_start + len(repeated_phrase)],
+        )
+        self.assertEqual(interior.placement_row, -23)
+
+    def test_history_top_clipped_aliases_remain_placement_ambiguous(self):
+        fixture = self.fixture("wide-history-complete")
+        transcript = fixture.transcript_texts[-1]
+        repeated = transcript.replace(
+            "item 24: retained history row twenty-four",
+            "item 23: retained history row twenty-three",
+        )
+        candidate = render_semantic_candidate(
+            AssistantTextRecord("claude", "history-alias", "history-alias", repeated, 1),
+            version="2.1.241",
+            cols=fixture.cols,
+        )
+        selected_row = candidate.plain_rows[23]
+        quarantined = provider_authority_module._QuarantinedCapturedRow(
+            "unsafe-captured-wide-cell"
+        )
+        rows = (selected_row,) + (quarantined,) * len(candidate.plain_rows)
+        result = match_complete_provider_block(
+            (candidate,),
+            rows,
+            (0, 2),
+            (0, 44),
+        )
+        self.assertFalse(result.matched)
+        self.assertEqual(result.internal_reason, "placement-ambiguous")
+
     def test_real_snapshot_mutations_preserve_fail_closed_boundaries(self):
         fixture = self.fixture("wide-mixed-complete")
 
@@ -1549,8 +1726,12 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
             plain_rows=fixture.plain_rows[11:19],
             style_rows=fixture.style_rows[11:19],
         )
-        self.assertFalse(clipped.matched)
-        self.assertEqual(clipped.internal_reason, "placement-ambiguous")
+        transcript = fixture.transcript_texts[-1]
+        clipped_start = transcript.index("Reliable terminal copying")
+        clipped_end = transcript.index("\n\nInline ")
+        self.assertTrue(clipped.matched)
+        self.assertEqual(clipped.text, transcript[clipped_start:clipped_end])
+        self.assertEqual(clipped.placement_row, -1)
 
         wrong_styles = list(fixture.style_rows)
         wrong_styles[10] = tuple(

@@ -2264,11 +2264,11 @@ def match_complete_provider_block(
                 )
             candidate_has_selection = False
             for placement in placements:
-                complete = (
-                    placement >= 0
-                    and placement + len(candidate.plain_rows) <= len(plain_rows)
-                )
-                if complete:
+                candidate_end = placement + len(candidate.plain_rows)
+                complete = placement >= 0 and candidate_end <= len(plain_rows)
+                top_clipped = placement < 0 and candidate_end <= len(plain_rows)
+                selectable = complete or top_clipped
+                if selectable:
                     has_plain_placement = True
                 try:
                     selected = _candidate_selection_text(
@@ -2280,7 +2280,7 @@ def match_complete_provider_block(
                     )
                 except ProviderAuthorityError:
                     continue
-                if complete:
+                if selectable:
                     candidate_has_selection = True
                     has_complete_selection = True
                 if style_rows is not None and not _candidate_styles_match(
@@ -2293,7 +2293,7 @@ def match_complete_provider_block(
                     allow_clipped=True,
                 ):
                     continue
-                if not complete:
+                if not selectable:
                     return MatchResult.failure("placement-ambiguous")
                 has_matching_style = True
                 identity = (candidate_instance, placement, selected)
