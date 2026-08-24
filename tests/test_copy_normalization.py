@@ -242,6 +242,50 @@ async function resolveResult(payload) {
         self.assertNotIn("clipboardData.setData", native_copy)
         self.assertNotIn("getSelection", native_copy)
 
+    def test_copy_and_to_tab_receive_the_same_unwrapped_url(self):
+        self.run_node(
+            [
+                "normalizeTerminalCopyText",
+                "beginAuthoritativeClipboardWrite",
+                "copyTextWithFallback",
+                "copyClipboardTextWithFallback",
+                "copyTerminalSelection",
+                "pasteSelectionToRecentTab",
+            ],
+            r'''
+let pendingPasteAfterSwitch = null;
+(async () => {
+  const url = "https://console.example.test/oauth?code=abc&state=xyz#done";
+  const writes = [];
+  const switched = [];
+  const toasts = [];
+  Object.defineProperty(global, "ClipboardItem", { value: undefined, configurable: true });
+  Object.defineProperty(global, "navigator", {
+    value: { clipboard: { async writeText(text) { writes.push(text); } } },
+    configurable: true,
+  });
+  global.requestAuthoritativeSelection = () => Promise.resolve({
+    text: url,
+    authority: "terminal-raw",
+  });
+  global.showToast = (message) => { toasts.push(message); };
+  global.recentOtherSession = () => "other";
+  global.switchSession = (session) => { switched.push(session); };
+
+  await copyTerminalSelection();
+  assert.deepEqual(writes, [url]);
+  await pasteSelectionToRecentTab();
+  assert.deepEqual(pendingPasteAfterSwitch, {
+    session: "other",
+    text: url,
+    authority: "terminal-raw",
+    ready: false,
+  });
+  assert.deepEqual(switched, ["other"]);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+'''
+        )
+
     def test_copy_teardown_runs_for_error_exception_and_clipboard_failure(self):
         self.run_node(
             [

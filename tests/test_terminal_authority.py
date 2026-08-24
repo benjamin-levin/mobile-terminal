@@ -31,6 +31,7 @@ from server import (
     capture_pane_snapshot,
     exact_provenance_selection,
     extract_authoritative_selection,
+    unwrap_selected_url,
 )
 
 
@@ -129,6 +130,41 @@ class QueuedConnection:
 
 
 class AuthoritativeSelectionTest(unittest.TestCase):
+    def test_wrapped_http_urls_join_only_when_every_line_is_a_continuation(self):
+        cases = (
+            (
+                "https://console.example.test/oauth/authorize?client_id=mobile\n"
+                "  &code=abc123&state=long-token_-.~\n"
+                "  &redirect_uri=https%3A%2F%2Flocalhost%2Fcallback",
+                "https://console.example.test/oauth/authorize?client_id=mobile"
+                "&code=abc123&state=long-token_-.~"
+                "&redirect_uri=https%3A%2F%2Flocalhost%2Fcallback",
+            ),
+            (
+                "  https://example.test/login?code=abc&state=xyz  \n"
+                "  /continue?token=a-b_c.123  \n"
+                "  #complete  ",
+                "https://example.test/login?code=abc&state=xyz"
+                "/continue?token=a-b_c.123#complete",
+            ),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(unwrap_selected_url(value), expected)
+
+    def test_nonmatching_url_selections_are_preserved_byte_for_byte(self):
+        cases = (
+            "https://example.test/single",
+            "https://one.example.test/path\nhttps://two.example.test/path",
+            "https://example.test/path\n  continuation contains spaces  ",
+            "https://example.test/path\n\ncontinuation",
+            "non-url first line  \n\tindented\ttext  \n",
+            "ftp://example.test/path\ncontinuation",
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                self.assertEqual(unwrap_selected_url(value), value)
+
     def test_selection_wire_limit_counts_received_escape_encoding(self):
         raw_message = (
             '{"type":"selection-request","clientRows":[{"text":"'
@@ -2228,6 +2264,10 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
                 "server.provider_selection",
                 side_effect=AssertionError("provider authority ran before composer authority"),
             ),
+            mock.patch(
+                "server.unwrap_selected_url",
+                side_effect=AssertionError("command provenance was unwrapped"),
+            ),
         ):
             text, error = await bridge.authoritative_selection(payload)
             self.assertEqual((text, error), (exact, None))
@@ -2404,6 +2444,83 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.text, expected_text)
             self.assertIsNone(result.error)
             self.assertEqual(result.authority, expected_authority)
+
+    async def test_normal_terminal_fallback_unwraps_urls_but_provider_exact_does_not(self):
+        connection = RecordingConnection()
+        bridge = TmuxBridge(
+            connection,
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=CommandProvenanceState(),
+        )
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.quiet = mock.AsyncMock()
+        pieces = (
+            "https://console.example.test/oauth?code=abc&",
+            "state=long-token_-.~&redirect_uri=",
+            "https%3A%2F%2Flocalhost%2Fcallback#done",
+        )
+        pane = snapshot(
+            cols=64,
+            authored_lines=list(pieces),
+            plain_physical_rows=[value.ljust(64) for value in pieces],
+            rows=3,
+        )
+        payload = {
+            "requestId": "normal-url",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 64,
+            "rows": 3,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {
+                "start": {"x": 0, "y": 0},
+                "end": {"x": len(pieces[-1]), "y": 2},
+            },
+        }
+        exact_text = "https://provider.example.test/exact\ncontinuation"
+        exact = mock.Mock(owned=True, text=exact_text, authority="provider-exact")
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.provider_selection", return_value=exact),
+            mock.patch(
+                "server.unwrap_selected_url",
+                side_effect=AssertionError("provider-exact text was unwrapped"),
+            ),
+        ):
+            result = await bridge.authoritative_selection_result(payload)
+        self.assertEqual(result.text, exact_text)
+        self.assertEqual(result.authority, "provider-exact")
+
+        expected = "".join(pieces)
+        cases = (
+            ("terminal-raw", "terminal-raw"),
+            (None, None),
+        )
+        for index, (provider_authority, expected_authority) in enumerate(cases):
+            payload["requestId"] = f"normal-url-{index}"
+            provider = mock.Mock(
+                owned=False,
+                text=None,
+                authority=provider_authority,
+            )
+            with (
+                mock.patch("server.capture_pane_snapshot", return_value=pane),
+                mock.patch("server.provider_selection", return_value=provider),
+            ):
+                result = await bridge.authoritative_selection_result(payload)
+            self.assertEqual(result.text, expected)
+            self.assertEqual(result.authority, expected_authority)
+            self.assertIsNone(result.error)
 
     async def test_selection_result_protocol_exposes_only_sanitized_authority(self):
         app = object.__new__(AppServer)
@@ -3389,6 +3506,57 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.authority, "terminal-raw")
         self.assertIsNone(result.error)
         self.assertEqual(select.call_args.kwargs["client_rows"][0][1], "😀é界")
+
+    async def test_alternate_terminal_raw_fallback_unwraps_client_url_rows(self):
+        pane = replace(
+            snapshot(
+                cols=64,
+                authored_lines=["changed", "changed", "changed"],
+                rows=3,
+            ),
+            alternate=True,
+            seed_history=0,
+            history=0,
+        )
+        bridge, payload = self.make_bridge(pane)
+        pieces = (
+            "https://console.example.test/oauth?code=abc&",
+            "  state=long-token_-.~&redirect_uri=",
+            "  https%3A%2F%2Flocalhost%2Fcallback#done",
+        )
+        payload.update(
+            {
+                "bufferType": "alternate",
+                "baseY": 0,
+                "selection": {
+                    "start": {"x": 0, "y": 0},
+                    "end": {"x": len(pieces[-1]), "y": 2},
+                },
+                "clientRows": [
+                    {
+                        "y": index,
+                        "text": value,
+                        "styles": [[0, 64, "plain"]],
+                    }
+                    for index, value in enumerate(pieces)
+                ],
+            }
+        )
+        provider = mock.Mock(owned=False, text=None, authority="terminal-raw")
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.provider_selection", return_value=provider),
+        ):
+            result = await bridge.authoritative_selection_result(payload)
+
+        self.assertEqual(
+            result.text,
+            "https://console.example.test/oauth?code=abc&"
+            "state=long-token_-.~&redirect_uri="
+            "https%3A%2F%2Flocalhost%2Fcallback#done",
+        )
+        self.assertEqual(result.authority, "terminal-raw")
+        self.assertIsNone(result.error)
 
     async def test_alternate_provider_exact_accepts_client_emoji_rows(self):
         pane = replace(

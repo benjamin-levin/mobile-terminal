@@ -1479,6 +1479,24 @@ def _extract_client_selection_rows(
     return "\n".join(pieces)
 
 
+def unwrap_selected_url(text: str) -> str:
+    lines = text.split("\n")
+    if len(lines) < 2:
+        return text
+    stripped = [line.strip() for line in lines]
+    if re.fullmatch(r"https?://\S+", stripped[0]) is None:
+        return text
+    if any(
+        not line or re.search(r"\s", line) or re.match(r"https?://", line)
+        for line in stripped[1:]
+    ):
+        return text
+    joined = "".join(stripped)
+    if re.fullmatch(r"https?://\S+", joined) is None:
+        return text
+    return joined
+
+
 def extract_authoritative_selection(
     snapshot: PaneSnapshot,
     start_x: int,
@@ -3795,10 +3813,12 @@ class TmuxBridge:
                         if authority != "terminal-raw":
                             authority = None
                         return AuthoritativeSelectionResult(
-                            text=_extract_client_selection_rows(
-                                client_selection_rows,
-                                start_x,
-                                end_x,
+                            text=unwrap_selected_url(
+                                _extract_client_selection_rows(
+                                    client_selection_rows,
+                                    start_x,
+                                    end_x,
+                                )
                             ),
                             authority=authority,
                         )
@@ -4030,12 +4050,14 @@ class TmuxBridge:
                             text=provider.text or "",
                             authority="provider-exact",
                         )
-                    selected_text = extract_authoritative_selection(
-                        snapshot,
-                        start_x,
-                        resolved_start_row,
-                        end_x,
-                        resolved_end_row,
+                    selected_text = unwrap_selected_url(
+                        extract_authoritative_selection(
+                            snapshot,
+                            start_x,
+                            resolved_start_row,
+                            end_x,
+                            resolved_end_row,
+                        )
                     )
                     authority = getattr(provider, "authority", None)
                     if authority != "terminal-raw":
