@@ -3033,6 +3033,52 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((text, error), ("KEEP", None))
         rejected.assert_not_called()
 
+    async def test_hard_break_becoming_soft_wrap_is_stale_at_entry(self):
+        seed = snapshot(
+            cols=4,
+            authored_lines=["abcd", "efgh"],
+            plain_physical_rows=["abcd", "efgh"],
+            rows=2,
+        )
+        current = replace(seed, authored_lines=["abcdefgh"])
+        bridge, payload = self.make_bridge(seed, offset=5, revision=0)
+        payload["selection"]["end"] = {"x": 4, "y": 1}
+
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=current),
+            mock.patch("server.provider_selection") as provider,
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+        provider.assert_not_called()
+
+    async def test_hard_break_becoming_soft_wrap_is_stale_during_verification(self):
+        hard = snapshot(
+            cols=4,
+            authored_lines=["abcd", "efgh"],
+            plain_physical_rows=["abcd", "efgh"],
+            rows=2,
+        )
+        soft = replace(hard, authored_lines=["abcdefgh"])
+        bridge, payload = self.make_bridge(hard)
+        payload["selection"]["end"] = {"x": 4, "y": 1}
+        provider_result = mock.Mock(owned=False, text=None, authority=None)
+
+        with (
+            mock.patch("server.capture_pane_snapshot", side_effect=(hard, soft)),
+            mock.patch(
+                "server.provider_selection",
+                return_value=provider_result,
+            ) as provider,
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+        provider.assert_called_once()
+
     async def test_repaints_outside_selected_rows_succeed_repeatedly(self):
         seed = snapshot(
             cols=8,
@@ -3266,6 +3312,7 @@ class PrivateTmuxSelectionStabilityIntegrationTest(unittest.IsolatedAsyncioTestC
                     if self.bridge.offset > before:
                         break
                     deadline.wait(0.01)
+                self.assertGreater(self.bridge.offset, before)
                 return mock.Mock(owned=False, text=None, authority=None)
 
             with mock.patch("server.provider_selection", side_effect=stream_during_provider):

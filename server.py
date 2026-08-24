@@ -602,6 +602,16 @@ class AcceptedCommand:
 
 
 @dataclass(frozen=True)
+class SelectionRowSignature:
+    styled: str
+    plain: str
+    authored: str
+    continues_from_previous: bool
+    continues_to_next: bool
+    tab_stops: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class SnapshotRowIdentity:
     epoch: int
     first_row: int
@@ -617,6 +627,7 @@ class PaneRowTracker:
     first_row: int = 0
     revision: int = -1
     plain_rows: tuple[str, ...] = ()
+    row_signatures: tuple[SelectionRowSignature | None, ...] = ()
 
     def invalidate(self) -> None:
         self.epoch += 1
@@ -625,15 +636,22 @@ class PaneRowTracker:
         self.history_limit = 0
         self.revision = -1
         self.plain_rows = ()
+        self.row_signatures = ()
 
     def observe(
         self,
         snapshot: "PaneSnapshot",
         revision: int,
-        stable_rows: tuple[tuple[int, str], ...] = (),
+        stable_rows: tuple[tuple[int, SelectionRowSignature], ...] = (),
     ) -> SnapshotRowIdentity:
         first_absolute_row = snapshot.history - snapshot.seed_history
         rows = tuple(snapshot.plain_physical_rows)
+        try:
+            row_signatures: tuple[SelectionRowSignature | None, ...] = (
+                _selection_row_signatures(snapshot)
+            )
+        except RuntimeError:
+            row_signatures = (None,) * len(rows)
         if not self.pane_id or self.pane_id != snapshot.pane_id:
             if self.pane_id:
                 self.epoch += 1
@@ -652,7 +670,11 @@ class PaneRowTracker:
                 snapshot.history_limit,
             )
             if delta is None and stable_rows:
-                delta = self._stable_row_delta(rows, expected_delta, stable_rows)
+                delta = self._stable_row_delta(
+                    row_signatures,
+                    expected_delta,
+                    stable_rows,
+                )
             if delta is None:
                 self.epoch += 1
                 first_row = 0
@@ -665,6 +687,7 @@ class PaneRowTracker:
         self.first_row = first_row
         self.revision = revision
         self.plain_rows = rows
+        self.row_signatures = row_signatures
         return SnapshotRowIdentity(self.epoch, first_row)
 
     def _matching_delta(
@@ -715,17 +738,17 @@ class PaneRowTracker:
 
     def _stable_row_delta(
         self,
-        rows: tuple[str, ...],
+        row_signatures: tuple[SelectionRowSignature | None, ...],
         expected_delta: int,
-        stable_rows: tuple[tuple[int, str], ...],
+        stable_rows: tuple[tuple[int, SelectionRowSignature], ...],
     ) -> int | None:
         deltas = []
         for delta in range(max(0, expected_delta), len(self.plain_rows) + 1):
             first_row = self.first_row + delta
             if all(
-                0 <= identity_row - first_row < len(rows)
-                and rows[identity_row - first_row] == content
-                for identity_row, content in stable_rows
+                0 <= identity_row - first_row < len(row_signatures)
+                and row_signatures[identity_row - first_row] == signature
+                for identity_row, signature in stable_rows
             ):
                 deltas.append(delta)
         if len(deltas) != 1:
@@ -1257,6 +1280,27 @@ def _authored_physical_map(snapshot: PaneSnapshot) -> list[tuple[int, str]]:
     if physical_index != len(snapshot.plain_physical_rows):
         raise RuntimeError("tmux authored text does not map to its physical geometry")
     return mapping
+
+
+def _selection_row_signatures(
+    snapshot: PaneSnapshot,
+) -> tuple[SelectionRowSignature, ...]:
+    mapping = _authored_physical_map(snapshot)
+    return tuple(
+        SelectionRowSignature(
+            styled=snapshot.physical_rows[index],
+            plain=snapshot.plain_physical_rows[index],
+            authored=authored,
+            continues_from_previous=(
+                index > 0 and mapping[index - 1][0] == logical_index
+            ),
+            continues_to_next=(
+                index + 1 < len(mapping) and mapping[index + 1][0] == logical_index
+            ),
+            tab_stops=snapshot.tab_stops,
+        )
+        for index, (logical_index, authored) in enumerate(mapping)
+    )
 
 
 def _slice_display_cells(
@@ -3542,7 +3586,9 @@ class TmuxBridge:
 
                     relative_start_row = start_y - base_y
                     relative_end_row = end_y - base_y
-                    entry_stable_rows: tuple[tuple[int, str], ...] = ()
+                    entry_stable_rows: tuple[
+                        tuple[int, SelectionRowSignature], ...
+                    ] = ()
                     if not alternate_request and self.selection_row_identity is not None:
                         if (
                             self.selection_row_identity.epoch
@@ -3564,11 +3610,12 @@ class TmuxBridge:
                             entry_end_identity + 1,
                         ):
                             index = identity_row - tracker.first_row
-                            if not 0 <= index < len(tracker.plain_rows):
+                            if not 0 <= index < len(tracker.row_signatures):
                                 return reject("selection-rows-unresolvable")
-                            entry_stable.append(
-                                (identity_row, tracker.plain_rows[index])
-                            )
+                            signature = tracker.row_signatures[index]
+                            if signature is None:
+                                return reject("selection-rows-unresolvable")
+                            entry_stable.append((identity_row, signature))
                         entry_stable_rows = tuple(entry_stable)
                     identity = self.provenance_state.row_tracker.observe(
                         snapshot,
@@ -3631,10 +3678,11 @@ class TmuxBridge:
                         or last_index >= len(snapshot.plain_physical_rows)
                     ):
                         return reject("selection-rows-unresolvable")
+                    snapshot_row_signatures = _selection_row_signatures(snapshot)
                     selected_rows = tuple(
                         (
                             identity_row,
-                            snapshot.plain_physical_rows[
+                            snapshot_row_signatures[
                                 _absolute_row(snapshot, identity, identity_row)
                                 - first_absolute_row
                             ],
@@ -3732,7 +3780,10 @@ class TmuxBridge:
                             - verification_snapshot.seed_history
                         )
                         verification_indexes = []
-                        for identity_row, content in selected_rows:
+                        verification_row_signatures = _selection_row_signatures(
+                            verification_snapshot
+                        )
+                        for identity_row, signature in selected_rows:
                             absolute_row = _absolute_row(
                                 verification_snapshot,
                                 verification_identity,
@@ -3744,10 +3795,7 @@ class TmuxBridge:
                             ):
                                 return reject("selection-rows-unresolvable")
                             verification_indexes.append(index)
-                            if (
-                                verification_snapshot.plain_physical_rows[index]
-                                != content
-                            ):
+                            if verification_row_signatures[index] != signature:
                                 return reject("selected-rows-changed")
                         if len(set(verification_indexes)) != len(verification_indexes):
                             return reject("selection-rows-unresolvable")
