@@ -460,6 +460,8 @@ AUTHORITATIVE_SELECTION_REJECTION_REASONS = frozenset(
         "client-selection-check-false",
         "client-selection-check-timeout",
         "output-changed",
+        "selected-rows-changed",
+        "selection-rows-unresolvable",
         "snapshot-capture",
         "geometry-buffer-base-mismatch",
         "stability-recheck",
@@ -624,7 +626,12 @@ class PaneRowTracker:
         self.revision = -1
         self.plain_rows = ()
 
-    def observe(self, snapshot: "PaneSnapshot", revision: int) -> SnapshotRowIdentity:
+    def observe(
+        self,
+        snapshot: "PaneSnapshot",
+        revision: int,
+        stable_rows: tuple[tuple[int, str], ...] = (),
+    ) -> SnapshotRowIdentity:
         first_absolute_row = snapshot.history - snapshot.seed_history
         rows = tuple(snapshot.plain_physical_rows)
         if not self.pane_id or self.pane_id != snapshot.pane_id:
@@ -644,6 +651,8 @@ class PaneRowTracker:
                 revision,
                 snapshot.history_limit,
             )
+            if delta is None and stable_rows:
+                delta = self._stable_row_delta(rows, expected_delta, stable_rows)
             if delta is None:
                 self.epoch += 1
                 first_row = 0
@@ -700,6 +709,25 @@ class PaneRowTracker:
             if delta >= expected_delta:
                 deltas.append(delta)
             matched = prefix[matched - 1]
+        if len(deltas) != 1:
+            return None
+        return deltas[0]
+
+    def _stable_row_delta(
+        self,
+        rows: tuple[str, ...],
+        expected_delta: int,
+        stable_rows: tuple[tuple[int, str], ...],
+    ) -> int | None:
+        deltas = []
+        for delta in range(max(0, expected_delta), len(self.plain_rows) + 1):
+            first_row = self.first_row + delta
+            if all(
+                0 <= identity_row - first_row < len(rows)
+                and rows[identity_row - first_row] == content
+                for identity_row, content in stable_rows
+            ):
+                deltas.append(delta)
         if len(deltas) != 1:
             return None
         return deltas[0]
@@ -2608,6 +2636,7 @@ class TmuxBridge:
         self.seed_acks: dict[int, asyncio.Event] = {}
         self.flush_acks: dict[tuple[int, int], asyncio.Event] = {}
         self.selection_acks: dict[str, tuple[asyncio.Event, dict[str, Any]]] = {}
+        self.selection_row_identity: SnapshotRowIdentity | None = None
 
     @staticmethod
     def unescape_control(value: bytes) -> bytes:
@@ -3339,6 +3368,10 @@ class TmuxBridge:
             self.pane_id = snapshot.pane_id
             self.cutoff = cutoff
             self.seed_history = snapshot.seed_history
+            self.selection_row_identity = self.provenance_state.row_tracker.observe(
+                snapshot,
+                cutoff,
+            )
             self.held = [record for record in self.held if record["start"] >= cutoff]
             await self._send_json(
                 {
@@ -3361,15 +3394,14 @@ class TmuxBridge:
             await self._flush_seed_output(epoch, cutoff)
 
     async def _flush_selection_hold(self) -> None:
-        while True:
-            async with self.send_lock:
-                pending = self.held
-                self.held = []
-                if not pending:
-                    self.phase = "forward"
-                    return
-            for record in pending:
-                await self._send_output(record, "selection-held")
+        async with self.send_lock:
+            pending = self.held
+            self.held = []
+            try:
+                for record in pending:
+                    await self._send_output(record, "selection-held")
+            finally:
+                self.phase = "forward"
 
     async def authoritative_selection_result(
         self,
@@ -3390,6 +3422,7 @@ class TmuxBridge:
             client_cols = int(payload.get("cols", -1))
             client_rows = int(payload.get("rows", -1))
             base_y = int(payload.get("baseY", -1))
+            buffer_type = str(payload.get("bufferType", ""))
             start = payload["selection"]["start"]
             end = payload["selection"]["end"]
             start_x, start_y = int(start["x"]), int(start["y"])
@@ -3410,9 +3443,14 @@ class TmuxBridge:
         async with self.seed_lock:
             async with self.write_lock:
                 async with self.send_lock:
+                    alternate_request = buffer_type == "alternate"
+                    # Alternate-screen rows are repaintable positions, not retained
+                    # main-screen identities, so they keep the exact revision fence.
                     if (
                         self.phase != "forward"
-                        or revision != self.offset
+                        or revision < cutoff
+                        or revision > self.offset
+                        or (alternate_request and revision != self.offset)
                         or epoch != self.epoch_state["epoch"]
                         or cutoff != self.cutoff
                         or layout_generation != self.epoch_state["layout"]
@@ -3444,83 +3482,279 @@ class TmuxBridge:
                         return reject("client-selection-check-timeout")
                     if ack_payload.get("unchanged") is not True:
                         return reject("client-selection-check-false")
-                    exception_reason = "provider-tmux-exception"
-                    self.last_output_at = time.monotonic()
-                    await self.quiet(0.1)
-                    if self.offset != stable_offset:
-                        return reject("output-changed")
-                    exception_reason = "snapshot-capture"
-                    snapshot = await asyncio.to_thread(
-                        capture_pane_snapshot,
-                        self.session_name,
-                        self.pane_id,
-                        max(base_y, self.seed_history, CONNECT_HISTORY_LINES),
+
+                    history_lines = max(
+                        base_y,
+                        self.seed_history,
+                        CONNECT_HISTORY_LINES,
                     )
-                    exception_reason = "provider-tmux-exception"
-                    self.last_output_at = time.monotonic()
-                    await self.quiet(0.05)
-                    if self.offset != stable_offset:
-                        return reject("output-changed")
-                    if snapshot.cols != client_cols or snapshot.rows != client_rows:
+
+                    async def capture_selection_snapshot(attempts: int) -> PaneSnapshot:
+                        for attempt in range(attempts):
+                            try:
+                                return await asyncio.to_thread(
+                                    capture_pane_snapshot,
+                                    self.session_name,
+                                    self.pane_id,
+                                    history_lines,
+                                )
+                            except RuntimeError:
+                                if attempt + 1 == attempts:
+                                    raise
+                                await asyncio.sleep(0)
+                        raise RuntimeError("tmux pane snapshot is unavailable")
+
+                    if alternate_request:
+                        exception_reason = "provider-tmux-exception"
+                        self.last_output_at = time.monotonic()
+                        await self.quiet(0.1)
+                        if self.offset != stable_offset:
+                            return reject("output-changed")
+                    exception_reason = "snapshot-capture"
+                    snapshot = await capture_selection_snapshot(1 if alternate_request else 5)
+                    snapshot_revision = self.offset
+                    if alternate_request:
+                        exception_reason = "provider-tmux-exception"
+                        self.last_output_at = time.monotonic()
+                        await self.quiet(0.05)
+                        if self.offset != stable_offset:
+                            return reject("output-changed")
+                    if (
+                        buffer_type not in ("normal", "alternate")
+                        or snapshot.cols != client_cols
+                        or snapshot.rows != client_rows
+                        or snapshot.alternate != alternate_request
+                    ):
                         return reject("geometry-buffer-base-mismatch")
-                    if snapshot.alternate != (payload.get("bufferType") == "alternate"):
+                    if (
+                        (snapshot.alternate and base_y != 0)
+                        or (
+                            not snapshot.alternate
+                            and (
+                                base_y < self.seed_history
+                                or base_y > snapshot.history
+                                or not 0 <= start_y <= base_y + client_rows - 1
+                                or not 0 <= end_y <= base_y + client_rows - 1
+                            )
+                        )
+                    ):
                         return reject("geometry-buffer-base-mismatch")
-                    expected_base = 0 if snapshot.alternate else snapshot.seed_history
-                    if base_y != expected_base:
-                        return reject("geometry-buffer-base-mismatch")
+
                     relative_start_row = start_y - base_y
                     relative_end_row = end_y - base_y
-                    identity = self.provenance_state.row_tracker.observe(snapshot, stable_offset)
-                    absolute_start_row = snapshot.history + relative_start_row
-                    absolute_end_row = snapshot.history + relative_end_row
+                    entry_stable_rows: tuple[tuple[int, str], ...] = ()
+                    if not alternate_request and self.selection_row_identity is not None:
+                        if (
+                            self.selection_row_identity.epoch
+                            != self.provenance_state.row_tracker.epoch
+                        ):
+                            return reject("selection-rows-unresolvable")
+                        entry_start_identity = (
+                            self.selection_row_identity.first_row + start_y
+                        )
+                        entry_end_identity = (
+                            self.selection_row_identity.first_row + end_y
+                        )
+                        tracker = self.provenance_state.row_tracker
+                        if entry_start_identity > entry_end_identity:
+                            return reject("selection-rows-unresolvable")
+                        entry_stable = []
+                        for identity_row in range(
+                            entry_start_identity,
+                            entry_end_identity + 1,
+                        ):
+                            index = identity_row - tracker.first_row
+                            if not 0 <= index < len(tracker.plain_rows):
+                                return reject("selection-rows-unresolvable")
+                            entry_stable.append(
+                                (identity_row, tracker.plain_rows[index])
+                            )
+                        entry_stable_rows = tuple(entry_stable)
+                    identity = self.provenance_state.row_tracker.observe(
+                        snapshot,
+                        snapshot_revision,
+                        entry_stable_rows,
+                    )
+                    if alternate_request:
+                        absolute_start_row = snapshot.history + relative_start_row
+                        absolute_end_row = snapshot.history + relative_end_row
+                        start_identity_row = _identity_row(
+                            snapshot,
+                            identity,
+                            absolute_start_row,
+                        )
+                        end_identity_row = _identity_row(
+                            snapshot,
+                            identity,
+                            absolute_end_row,
+                        )
+                    elif self.selection_row_identity is not None:
+                        if self.selection_row_identity.epoch != identity.epoch:
+                            return reject("selection-rows-unresolvable")
+                        start_identity_row = (
+                            self.selection_row_identity.first_row + start_y
+                        )
+                        end_identity_row = self.selection_row_identity.first_row + end_y
+                        absolute_start_row = _absolute_row(
+                            snapshot,
+                            identity,
+                            start_identity_row,
+                        )
+                        absolute_end_row = _absolute_row(
+                            snapshot,
+                            identity,
+                            end_identity_row,
+                        )
+                    else:
+                        if revision < stable_offset:
+                            return reject("selection-rows-unresolvable")
+                        absolute_start_row = snapshot.history + relative_start_row
+                        absolute_end_row = snapshot.history + relative_end_row
+                        start_identity_row = _identity_row(
+                            snapshot,
+                            identity,
+                            absolute_start_row,
+                        )
+                        end_identity_row = _identity_row(
+                            snapshot,
+                            identity,
+                            absolute_end_row,
+                        )
+                    first_absolute_row = snapshot.history - snapshot.seed_history
+                    first_index = absolute_start_row - first_absolute_row
+                    last_index = absolute_end_row - first_absolute_row
+                    if (
+                        start_identity_row > end_identity_row
+                        or absolute_start_row > absolute_end_row
+                        or first_index < 0
+                        or last_index < first_index
+                        or last_index >= len(snapshot.plain_physical_rows)
+                    ):
+                        return reject("selection-rows-unresolvable")
+                    selected_rows = tuple(
+                        (
+                            identity_row,
+                            snapshot.plain_physical_rows[
+                                _absolute_row(snapshot, identity, identity_row)
+                                - first_absolute_row
+                            ],
+                        )
+                        for identity_row in range(
+                            start_identity_row,
+                            end_identity_row + 1,
+                        )
+                    )
+                    if entry_stable_rows and selected_rows != entry_stable_rows:
+                        return reject("selected-rows-changed")
+                    resolved_start_row = _absolute_row(
+                        snapshot,
+                        identity,
+                        selected_rows[0][0],
+                    ) - snapshot.history
+                    resolved_end_row = _absolute_row(
+                        snapshot,
+                        identity,
+                        selected_rows[-1][0],
+                    ) - snapshot.history
                     accepted = self.provenance_state.accepted(self.pane_id)
                     active = self.provenance_state.active
                     if (
-                        self.offset != stable_offset
-                        or self.epoch_state["epoch"] != stable_epoch
+                        self.epoch_state["epoch"] != stable_epoch
                         or self.epoch_state["layout"] != stable_layout
                         or self.session_name != payload.get("session")
                         or self.pane_id != snapshot.pane_id
+                        or (alternate_request and self.offset != stable_offset)
                     ):
                         return reject("stability-recheck")
                     matched, exact_text = exact_provenance_selection(
                         snapshot,
                         self.session_name,
                         self.provenance_state.layout_generation,
-                        (_identity_row(snapshot, identity, absolute_start_row), start_x),
-                        (_identity_row(snapshot, identity, absolute_end_row), end_x),
+                        (selected_rows[0][0], start_x),
+                        (selected_rows[-1][0], end_x),
                         active,
                         accepted,
                         identity,
                         terminal_revision=stable_offset,
                     )
-                    if matched:
-                        return AuthoritativeSelectionResult(text=exact_text or "")
-                    provider = await asyncio.to_thread(
-                        provider_selection,
-                        snapshot,
-                        start_x,
-                        relative_start_row,
-                        end_x,
-                        relative_end_row,
-                    )
+                    provider = None
+                    if not matched:
+                        exception_reason = "provider-tmux-exception"
+                        provider = await asyncio.to_thread(
+                            provider_selection,
+                            snapshot,
+                            start_x,
+                            resolved_start_row,
+                            end_x,
+                            resolved_end_row,
+                        )
+
                     exception_reason = "snapshot-capture"
-                    verification_snapshot = await asyncio.to_thread(
-                        capture_pane_snapshot,
-                        self.session_name,
-                        self.pane_id,
-                        max(base_y, self.seed_history, CONNECT_HISTORY_LINES),
+                    verification_snapshot = await capture_selection_snapshot(
+                        1 if alternate_request else 5
                     )
-                    exception_reason = "provider-tmux-exception"
+                    verification_revision = self.offset
                     if (
-                        verification_snapshot != snapshot
-                        or self.offset != stable_offset
-                        or self.epoch_state["epoch"] != stable_epoch
+                        self.epoch_state["epoch"] != stable_epoch
                         or self.epoch_state["layout"] != stable_layout
                         or self.session_name != payload.get("session")
                         or self.pane_id != snapshot.pane_id
+                        or verification_snapshot.pane_id != snapshot.pane_id
                     ):
-                        return reject("verification-changed")
+                        return reject("stability-recheck")
+                    if (
+                        verification_snapshot.cols != client_cols
+                        or verification_snapshot.rows != client_rows
+                        or verification_snapshot.alternate != alternate_request
+                        or (alternate_request and base_y != 0)
+                        or (
+                            not alternate_request
+                            and base_y > verification_snapshot.history
+                        )
+                    ):
+                        return reject("geometry-buffer-base-mismatch")
+                    if alternate_request:
+                        if (
+                            verification_snapshot != snapshot
+                            or self.offset != stable_offset
+                        ):
+                            return reject("verification-changed")
+                    else:
+                        verification_identity = self.provenance_state.row_tracker.observe(
+                            verification_snapshot,
+                            verification_revision,
+                            selected_rows,
+                        )
+                        if verification_identity.epoch != identity.epoch:
+                            return reject("selection-rows-unresolvable")
+                        verification_first_absolute = (
+                            verification_snapshot.history
+                            - verification_snapshot.seed_history
+                        )
+                        verification_indexes = []
+                        for identity_row, content in selected_rows:
+                            absolute_row = _absolute_row(
+                                verification_snapshot,
+                                verification_identity,
+                                identity_row,
+                            )
+                            index = absolute_row - verification_first_absolute
+                            if not 0 <= index < len(
+                                verification_snapshot.plain_physical_rows
+                            ):
+                                return reject("selection-rows-unresolvable")
+                            verification_indexes.append(index)
+                            if (
+                                verification_snapshot.plain_physical_rows[index]
+                                != content
+                            ):
+                                return reject("selected-rows-changed")
+                        if len(set(verification_indexes)) != len(verification_indexes):
+                            return reject("selection-rows-unresolvable")
+
+                    if matched:
+                        return AuthoritativeSelectionResult(text=exact_text or "")
+                    assert provider is not None
                     if provider.owned:
                         return AuthoritativeSelectionResult(
                             text=provider.text or "",
@@ -3529,9 +3763,9 @@ class TmuxBridge:
                     selected_text = extract_authoritative_selection(
                         snapshot,
                         start_x,
-                        relative_start_row,
+                        resolved_start_row,
                         end_x,
-                        relative_end_row,
+                        resolved_end_row,
                     )
                     authority = getattr(provider, "authority", None)
                     if authority != "terminal-raw":
@@ -3544,7 +3778,10 @@ class TmuxBridge:
                     return reject(exception_reason)
                 finally:
                     self.selection_acks.pop(request_id, None)
-                    await self._flush_selection_hold()
+                    try:
+                        await self._flush_selection_hold()
+                    except Exception:
+                        pass
 
     async def authoritative_selection(
         self,

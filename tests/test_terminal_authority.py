@@ -2602,7 +2602,7 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
 
         writer.command.assert_awaited_once_with("send-keys -t %1 -H 78")
 
-    async def test_transient_unknown_client_edit_during_copy_fails_closed(self):
+    async def test_selected_row_edit_during_copy_fails_closed(self):
         connection = RecordingConnection()
         provenance = CommandProvenanceState(layout_generation=3)
         bridge = TmuxBridge(
@@ -2656,9 +2656,18 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
             "bufferType": "normal",
             "selection": {"start": {"x": 2, "y": 0}, "end": {"x": 5, "y": 1}},
         }
+        changed = snapshot(
+            cols=10,
+            authored_lines=["$ stale command"],
+            plain_physical_rows=["$ stale co", "mmand     "],
+            rows=2,
+            cursor_x=5,
+            cursor_y=1,
+        )
+
         def capture_with_external_revision(*_args):
             bridge.offset += 1
-            return pane
+            return pane if bridge.offset == 1 else changed
 
         with mock.patch(
             "server.capture_pane_snapshot",
@@ -2970,6 +2979,321 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(text)
         self.assertEqual(error, "Terminal changed; select again.")
+
+
+class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
+    def make_bridge(self, pane, *, offset=0, revision=None):
+        connection = RecordingConnection()
+        bridge = TmuxBridge(connection, "session", "/bin/sh", "/")
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.offset = offset
+        bridge.quiet = mock.AsyncMock()
+        bridge.selection_row_identity = bridge.provenance_state.row_tracker.observe(
+            pane,
+            0,
+        )
+        payload = {
+            "requestId": uuid.uuid4().hex,
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": offset if revision is None else revision,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": pane.cols,
+            "rows": pane.rows,
+            "baseY": pane.seed_history,
+            "bufferType": "normal",
+            "selection": {
+                "start": {"x": 0, "y": 0},
+                "end": {"x": 4, "y": 0},
+            },
+        }
+        return bridge, payload
+
+    async def test_old_revision_with_intact_identity_succeeds_without_rejection(self):
+        pane = snapshot(
+            cols=8,
+            authored_lines=["KEEP", "other"],
+            plain_physical_rows=["KEEP    ", "other   "],
+            rows=2,
+        )
+        bridge, payload = self.make_bridge(pane, offset=9, revision=0)
+        provider = mock.Mock(owned=False, text=None, authority=None)
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.provider_selection", return_value=provider),
+            mock.patch("server._record_authoritative_selection_rejection") as rejected,
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertEqual((text, error), ("KEEP", None))
+        rejected.assert_not_called()
+
+    async def test_repaints_outside_selected_rows_succeed_repeatedly(self):
+        seed = snapshot(
+            cols=8,
+            authored_lines=["KEEP", "spin-a", "tail"],
+            plain_physical_rows=["KEEP    ", "spin-a  ", "tail    "],
+            rows=3,
+        )
+        bridge, payload = self.make_bridge(seed, offset=10, revision=0)
+        provider = mock.Mock(owned=False, text=None, authority=None)
+        for index in range(4):
+            first = replace(
+                seed,
+                authored_lines=["KEEP", f"spin-{index}", "tail"],
+                plain_physical_rows=[
+                    "KEEP    ",
+                    f"spin-{index}".ljust(8),
+                    "tail    ",
+                ],
+                physical_rows=[
+                    "KEEP    ",
+                    f"spin-{index}".ljust(8),
+                    "tail    ",
+                ],
+            )
+            second = replace(
+                first,
+                authored_lines=["KEEP", f"paint-{index}", "tail"],
+                plain_physical_rows=[
+                    "KEEP    ",
+                    f"paint-{index}"[:8].ljust(8),
+                    "tail    ",
+                ],
+                physical_rows=[
+                    "KEEP    ",
+                    f"paint-{index}"[:8].ljust(8),
+                    "tail    ",
+                ],
+            )
+            payload["requestId"] = uuid.uuid4().hex
+            with (
+                mock.patch(
+                    "server.capture_pane_snapshot",
+                    side_effect=(first, second),
+                ),
+                mock.patch("server.provider_selection", return_value=provider),
+            ):
+                text, error = await bridge.authoritative_selection(payload)
+            self.assertEqual((text, error), ("KEEP", None))
+
+    async def test_scrolled_identity_beyond_retained_rows_is_stale(self):
+        seed = snapshot(
+            cols=8,
+            authored_lines=["KEEP", "other"],
+            plain_physical_rows=["KEEP    ", "other   "],
+            rows=1,
+            history_limit=1,
+        )
+        current = snapshot(
+            cols=8,
+            authored_lines=["other", "new"],
+            plain_physical_rows=["other   ", "new     "],
+            rows=1,
+            history_limit=1,
+        )
+        bridge, payload = self.make_bridge(seed, offset=1, revision=0)
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=current),
+            mock.patch("server.provider_selection") as provider,
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+        provider.assert_not_called()
+
+    async def test_provider_receives_identity_resolved_snapshot_coordinates(self):
+        seed = snapshot(
+            cols=8,
+            authored_lines=["KEEP", "prompt"],
+            plain_physical_rows=["KEEP    ", "prompt  "],
+            rows=2,
+        )
+        current = snapshot(
+            cols=8,
+            authored_lines=["KEEP", "prompt", "stream"],
+            plain_physical_rows=["KEEP    ", "prompt  ", "stream  "],
+            rows=2,
+        )
+        bridge, payload = self.make_bridge(seed, offset=7, revision=0)
+        provider = mock.Mock(owned=False, text=None, authority=None)
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=current),
+            mock.patch("server.provider_selection", return_value=provider) as select,
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertEqual((text, error), ("KEEP", None))
+        self.assertEqual(select.call_args.args[1:], (0, -1, 4, -1))
+
+    async def test_epoch_layout_geometry_and_alternate_revision_remain_strict(self):
+        pane = snapshot(cols=8, authored_lines=["KEEP"], rows=1)
+        cases = (
+            ("epoch", {"epoch": 1}),
+            ("layout", {"layoutGeneration": 1}),
+            ("geometry", {"cols": 9}),
+        )
+        for name, update in cases:
+            with self.subTest(name=name):
+                bridge, payload = self.make_bridge(pane)
+                payload.update(update)
+                with mock.patch("server.capture_pane_snapshot", return_value=pane):
+                    text, error = await bridge.authoritative_selection(payload)
+                self.assertIsNone(text)
+                self.assertEqual(error, "Terminal changed; select again.")
+
+        alternate = replace(pane, alternate=True, seed_history=0, history=0)
+        bridge, payload = self.make_bridge(alternate, offset=2, revision=1)
+        payload["bufferType"] = "alternate"
+        with mock.patch("server.capture_pane_snapshot") as capture:
+            text, error = await bridge.authoritative_selection(payload)
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+        capture.assert_not_called()
+
+
+class PrivateTmuxSelectionStabilityIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmux = TmuxHarness(self, prefix="mts-")
+        self.session_name = f"mt-selection-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.tmux.run(
+            "new-session",
+            "-d",
+            "-x",
+            "24",
+            "-y",
+            "6",
+            "-s",
+            self.session_name,
+            "/bin/sh",
+        )
+        self.tmux.run("set-option", "-t", self.session_name, "status", "off")
+        self.connection = RecordingConnection()
+        self.bridge = self.tmux.register_async_close(
+            TmuxBridge(
+                self.connection,
+                self.session_name,
+                "/bin/sh",
+                "/",
+                create_if_missing=False,
+                initial_size=(24, 6),
+            )
+        )
+        self.connection.bridge = self.bridge
+        await self.bridge.open()
+        self.bridge.phase = "forward"
+        await self.bridge.write("printf 'KEEP-ROW\\n'\r")
+        await self.bridge.quiet(0.08)
+        pane = capture_pane_snapshot(
+            self.session_name,
+            self.bridge.pane_id,
+            server.MAX_HISTORY_SEED_LINES,
+        )
+        self.keep_index = next(
+            index
+            for index, row in enumerate(pane.plain_physical_rows)
+            if row.startswith("KEEP-ROW")
+        )
+        self.bridge.seed_history = pane.seed_history
+        self.bridge.selection_row_identity = (
+            self.bridge.provenance_state.row_tracker.observe(
+                pane,
+                self.bridge.offset,
+            )
+        )
+        self.old_revision = self.bridge.offset
+
+    def payload(self, pane):
+        return {
+            "requestId": uuid.uuid4().hex,
+            "profile": "",
+            "session": self.session_name,
+            "paneId": self.bridge.pane_id,
+            "epoch": self.bridge.epoch_state["epoch"],
+            "revision": self.old_revision,
+            "cutoff": self.bridge.cutoff,
+            "layoutGeneration": self.bridge.epoch_state["layout"],
+            "cols": pane.cols,
+            "rows": pane.rows,
+            "baseY": pane.history,
+            "bufferType": "normal",
+            "selection": {
+                "start": {"x": 0, "y": self.keep_index},
+                "end": {"x": 8, "y": self.keep_index},
+            },
+        }
+
+    async def test_streaming_outside_selection_keeps_old_revision_and_provider_coordinates(self):
+        for index in range(3):
+            pane = capture_pane_snapshot(
+                self.session_name,
+                self.bridge.pane_id,
+                server.MAX_HISTORY_SEED_LINES,
+            )
+            provider_calls = []
+
+            def stream_during_provider(snapshot_value, start_x, start_row, end_x, end_row):
+                selected_index = next(
+                    row_index
+                    for row_index, row in enumerate(snapshot_value.plain_physical_rows)
+                    if row.startswith("KEEP-ROW")
+                )
+                provider_calls.append(
+                    (
+                        start_x,
+                        start_row,
+                        end_x,
+                        end_row,
+                        selected_index - snapshot_value.seed_history,
+                    )
+                )
+                before = self.bridge.offset
+                self.tmux.run(
+                    "send-keys",
+                    "-t",
+                    self.bridge.pane_id,
+                    f"printf 'stream-{index}\\n'",
+                    "Enter",
+                )
+                deadline = threading.Event()
+                for _ in range(40):
+                    if self.bridge.offset > before:
+                        break
+                    deadline.wait(0.01)
+                return mock.Mock(owned=False, text=None, authority=None)
+
+            with mock.patch("server.provider_selection", side_effect=stream_during_provider):
+                text, error = await self.bridge.authoritative_selection(self.payload(pane))
+
+            self.assertEqual((text, error), ("KEEP-ROW", None))
+            self.assertEqual(len(provider_calls), 1)
+            self.assertEqual(provider_calls[0][1], provider_calls[0][4])
+            self.assertEqual(provider_calls[0][1], provider_calls[0][3])
+
+    async def test_selected_identity_evicted_from_private_history_is_stale(self):
+        await self.bridge.write(
+            "for i in 1 2 3 4 5 6 7 8 9 10; do printf 'evict-%s\\n' \"$i\"; done\r"
+        )
+        await self.bridge.quiet(0.08)
+        self.tmux.run("clear-history", "-t", self.bridge.pane_id)
+        pane = capture_pane_snapshot(
+            self.session_name,
+            self.bridge.pane_id,
+            server.MAX_HISTORY_SEED_LINES,
+        )
+
+        with mock.patch("server.provider_selection") as provider:
+            text, error = await self.bridge.authoritative_selection(self.payload(pane))
+
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+        provider.assert_not_called()
 
 
 class RenameProvenanceTransferTest(unittest.IsolatedAsyncioTestCase):
