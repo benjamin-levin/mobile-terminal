@@ -688,7 +688,7 @@ class RenderingAndMatchingTest(unittest.TestCase):
         end = candidate.selection_end
         repeated = match_complete_provider_block((candidate,), rows, start, end)
         self.assertFalse(repeated.matched)
-        self.assertEqual(repeated.internal_reason, "ambiguous-provider-block")
+        self.assertEqual(repeated.internal_reason, "placement-ambiguous")
 
         other = self.candidate("**same**", record_id="two", source_id="two", cols=12)
         ambiguous_source = match_complete_provider_block((candidate, other), candidate.plain_rows, start, end)
@@ -1162,8 +1162,10 @@ class RuntimeBindingCacheTest(unittest.TestCase):
     def test_provider_rejection_is_immediate_before_aggregate_threshold(self):
         with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
             saved = provider_authority_module._PROVIDER_DIAGNOSTICS.copy()
+            saved_seen = provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.copy()
             saved_total = provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL
             provider_authority_module._PROVIDER_DIAGNOSTICS.clear()
+            provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.clear()
             provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = 0
         try:
             provider_authority_module._record_provider_diagnostic(
@@ -1193,26 +1195,84 @@ class RuntimeBindingCacheTest(unittest.TestCase):
             with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
                 provider_authority_module._PROVIDER_DIAGNOSTICS.clear()
                 provider_authority_module._PROVIDER_DIAGNOSTICS.update(saved)
+                provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.clear()
+                provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.update(saved_seen)
+                provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = saved_total
+
+    def test_repeated_rejection_is_aggregated_until_rate_limit(self):
+        with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
+            saved = provider_authority_module._PROVIDER_DIAGNOSTICS.copy()
+            saved_seen = provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.copy()
+            saved_total = provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL
+            provider_authority_module._PROVIDER_DIAGNOSTICS.clear()
+            provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.clear()
+            provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = 0
+        try:
+            with patch.object(
+                provider_authority_module,
+                "PROVIDER_DIAGNOSTIC_FLUSH_EVERY",
+                4,
+            ), patch("builtins.print") as output:
+                for _ in range(2):
+                    provider_authority_module._record_provider_diagnostic(
+                        "enforce",
+                        "rejected",
+                        "no-plain-placement",
+                    )
+                self.assertEqual(output.call_count, 1)
+                for _ in range(2):
+                    provider_authority_module._record_provider_diagnostic(
+                        "enforce",
+                        "rejected",
+                        "no-plain-placement",
+                    )
+                self.assertEqual(output.call_count, 2)
+            aggregate = json.loads(
+                output.call_args.args[0].removeprefix(
+                    "provider authority diagnostics "
+                )
+            )
+            self.assertEqual(
+                aggregate,
+                [
+                    {
+                        "count": 4,
+                        "decision": "rejected",
+                        "mode": "enforce",
+                        "reason": "no-plain-placement",
+                    }
+                ],
+            )
+        finally:
+            with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
+                provider_authority_module._PROVIDER_DIAGNOSTICS.clear()
+                provider_authority_module._PROVIDER_DIAGNOSTICS.update(saved)
+                provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.clear()
+                provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.update(saved_seen)
                 provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = saved_total
 
     def test_provider_diagnostics_are_bounded_aggregate_reason_codes(self):
         with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
             saved = provider_authority_module._PROVIDER_DIAGNOSTICS.copy()
+            saved_seen = provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.copy()
             saved_total = provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL
             provider_authority_module._PROVIDER_DIAGNOSTICS.clear()
+            provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.clear()
             provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = 0
         try:
             with patch("builtins.print") as output:
                 provider_authority_module._record_provider_diagnostic(
                     "shadow",
                     "fallback",
-                    "secret/path?credential=value",
+                    "private-secret",
                 )
-                for index in range(MAX_TRANSCRIPT_INDEXES * 3):
+                for reason in sorted(
+                    provider_authority_module._PROVIDER_DIAGNOSTIC_REASONS
+                ):
                     provider_authority_module._record_provider_diagnostic(
                         "enforce",
-                        "rejected",
-                        f"reason-{index}",
+                        "fallback",
+                        reason,
                     )
                 self.assertLessEqual(
                     len(provider_authority_module._PROVIDER_DIAGNOSTICS),
@@ -1221,7 +1281,20 @@ class RuntimeBindingCacheTest(unittest.TestCase):
                 provider_authority_module._flush_provider_diagnostics()
             self.assertTrue(all(call.kwargs["flush"] for call in output.call_args_list))
             diagnostic = output.call_args.args[0]
+            counters = json.loads(diagnostic.removeprefix("provider authority diagnostics "))
+            self.assertTrue(counters)
+            self.assertTrue(
+                all(set(counter) == {"mode", "decision", "reason", "count"} for counter in counters)
+            )
+            self.assertTrue(
+                all(
+                    counter["reason"]
+                    in provider_authority_module._PROVIDER_DIAGNOSTIC_REASONS
+                    for counter in counters
+                )
+            )
             self.assertIn("invalid-reason", diagnostic)
+            self.assertNotIn("private", diagnostic)
             self.assertNotIn("secret", diagnostic)
             self.assertNotIn("path", diagnostic)
             self.assertNotIn("credential", diagnostic)
@@ -1229,6 +1302,8 @@ class RuntimeBindingCacheTest(unittest.TestCase):
             with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
                 provider_authority_module._PROVIDER_DIAGNOSTICS.clear()
                 provider_authority_module._PROVIDER_DIAGNOSTICS.update(saved)
+                provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.clear()
+                provider_authority_module._PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.update(saved_seen)
                 provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = saved_total
 
     def test_transcript_indexes_are_lru_bounded_and_generations_supersede(self):
@@ -1408,7 +1483,7 @@ class ProviderSelectionQuarantineTest(unittest.TestCase):
             )
         self.assertEqual(
             raised.exception.reason,
-            "no-unique-canonical-provider-block",
+            "candidate-spans-quarantine",
         )
 
     def test_duplicate_candidate_remains_ambiguous_with_quarantine(self):
@@ -1422,7 +1497,7 @@ class ProviderSelectionQuarantineTest(unittest.TestCase):
         start, end = self.candidate_selection(0)
         with self.assertRaises(ProviderAuthorityError) as raised:
             self.select(plain_rows, styled_rows, start, end)
-        self.assertEqual(raised.exception.reason, "ambiguous-provider-block")
+        self.assertEqual(raised.exception.reason, "placement-ambiguous")
 
 
 class CodexOwnershipTest(unittest.TestCase):
@@ -1497,6 +1572,89 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         result = self.match()
         self.assertTrue(result.matched)
         self.assertEqual(result.text, "final answer")
+
+    def test_rejection_classifier_reports_each_coarse_reason(self):
+        quarantined = provider_authority_module._QuarantinedCapturedRow(
+            "private-secret"
+        )
+        unsupported = replace(self.candidate, unsupported=True)
+        cases = (
+            (
+                "no-renderable-records",
+                lambda: (
+                    write_jsonl(self.path, [claude_text("```private-secret\n```")]),
+                    self.match(),
+                )[1],
+            ),
+            (
+                "candidate-spans-quarantine",
+                lambda: authoritative_provider_match(
+                    self.binding,
+                    TranscriptIndex(),
+                    transcript_root=self.root,
+                    cols=24,
+                    plain_rows=(quarantined,),
+                    selection_start=self.candidate.selection_start,
+                    selection_end=self.candidate.selection_end,
+                    proc_start_reader=lambda pid: "77",
+                    proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+                ),
+            ),
+            (
+                "no-plain-placement",
+                lambda: match_complete_provider_block(
+                    (self.candidate,),
+                    ("changed".ljust(24),),
+                    self.candidate.selection_start,
+                    self.candidate.selection_end,
+                ),
+            ),
+            (
+                "selection-not-complete",
+                lambda: match_complete_provider_block(
+                    (self.candidate,),
+                    self.candidate.plain_rows,
+                    (0, 0),
+                    (0, 1),
+                ),
+            ),
+            (
+                "style-mismatch",
+                lambda: match_complete_provider_block(
+                    (self.candidate,),
+                    self.candidate.plain_rows,
+                    self.candidate.selection_start,
+                    self.candidate.selection_end,
+                    style_rows=tuple(() for _ in self.candidate.style_rows),
+                ),
+            ),
+            (
+                "no-supported-candidate",
+                lambda: match_complete_provider_block(
+                    (unsupported,),
+                    self.candidate.plain_rows,
+                    self.candidate.selection_start,
+                    self.candidate.selection_end,
+                ),
+            ),
+            (
+                "no-canonical-candidate",
+                lambda: match_complete_provider_block(
+                    (self.candidate, unsupported),
+                    self.candidate.plain_rows,
+                    self.candidate.selection_start,
+                    self.candidate.selection_end,
+                ),
+            ),
+        )
+        for reason, classify in cases:
+            with self.subTest(reason=reason):
+                write_jsonl(self.path, [claude_text("final answer")])
+                result = classify()
+                self.assertFalse(result.matched)
+                self.assertEqual(result.internal_reason, reason)
+                self.assertEqual(result.public_error, STALE_MESSAGE)
+                self.assertNotIn("private-secret", repr(result))
 
     def test_authoritative_match_enforces_production_dot_style(self):
         correct = normalize_styled_rows(
@@ -1583,11 +1741,11 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         self.assertFalse(crossing.matched)
         self.assertEqual(
             touching.internal_reason,
-            "no-unique-canonical-provider-block",
+            "selection-not-complete",
         )
         self.assertEqual(
             crossing.internal_reason,
-            "no-unique-canonical-provider-block",
+            "selection-not-complete",
         )
 
     def test_duplicate_supported_inline_code_islands_are_ambiguous(self):
@@ -1618,7 +1776,7 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
             proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
         )
         self.assertFalse(result.matched)
-        self.assertEqual(result.internal_reason, "ambiguous-provider-block")
+        self.assertEqual(result.internal_reason, "placement-ambiguous")
 
     def test_historical_mixed_width_rows_normalize_to_current_geometry(self):
         candidate = render_semantic_candidate(self.record, version="2.1.241", cols=180)
@@ -1707,7 +1865,7 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         )
         result = self.match()
         self.assertFalse(result.matched)
-        self.assertEqual(result.internal_reason, "unsupported-provider-alias")
+        self.assertEqual(result.internal_reason, "no-canonical-candidate")
 
         write_jsonl(
             self.path,
@@ -1746,7 +1904,7 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         )
         result = self.match()
         self.assertFalse(result.matched)
-        self.assertEqual(result.internal_reason, "unsupported-provider-alias")
+        self.assertEqual(result.internal_reason, "no-canonical-candidate")
 
         write_jsonl(
             self.path,
@@ -1761,7 +1919,7 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         )
         result = self.match()
         self.assertFalse(result.matched)
-        self.assertEqual(result.internal_reason, "unsupported-provider-alias")
+        self.assertEqual(result.internal_reason, "no-canonical-candidate")
 
     def test_html_entity_aliases_poison_but_unrelated_entities_do_not(self):
         source = "left > right"
@@ -1821,7 +1979,7 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
                 self.assertFalse(result.matched)
                 self.assertEqual(
                     result.internal_reason,
-                    "unsupported-provider-alias",
+                    "no-canonical-candidate",
                 )
 
         write_jsonl(
@@ -1865,7 +2023,7 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         )
         result = self.match()
         self.assertFalse(result.matched)
-        self.assertEqual(result.internal_reason, "ambiguous-provider-block")
+        self.assertEqual(result.internal_reason, "placement-ambiguous")
 
     def test_append_during_matching_fails_closed(self):
         def append():

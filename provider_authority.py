@@ -23,6 +23,102 @@ DEFAULT_MAX_INDEX_RECORDS = 128
 MAX_TRANSCRIPT_INDEXES = 32
 MAX_PROVIDER_DIAGNOSTIC_REASONS = 64
 PROVIDER_DIAGNOSTIC_FLUSH_EVERY = 128
+_PROVIDER_MATCH_REJECTION_REASONS = frozenset(
+    {
+        "no-renderable-records",
+        "candidate-spans-quarantine",
+        "no-plain-placement",
+        "selection-not-complete",
+        "style-mismatch",
+        "no-supported-candidate",
+        "no-canonical-candidate",
+    }
+)
+_PROVIDER_DIAGNOSTIC_REASONS = frozenset(
+    {
+        *_PROVIDER_MATCH_REJECTION_REASONS,
+        "ambiguous-claude-binding",
+        "binding-cache-invalid",
+        "binding-cache-oversized",
+        "binding-cache-stale",
+        "binding-cache-unavailable",
+        "binding-changed",
+        "binding-unavailable",
+        "canonical-match",
+        "captured-row-overflow",
+        "claude-binding-unavailable",
+        "codex-ownership-stale",
+        "codex-ownership-unavailable",
+        "codex-process-mismatch",
+        "inactive-unowned",
+        "invalid-captured-cell",
+        "invalid-captured-geometry",
+        "invalid-captured-row",
+        "invalid-codex-binding-event",
+        "invalid-jsonl-record",
+        "invalid-pane",
+        "invalid-process-stat",
+        "invalid-reason",
+        "missing-codex-session-metadata",
+        "oversized-assistant-record",
+        "oversized-jsonl-record",
+        "partial-jsonl-record",
+        "placement-ambiguous",
+        "process-pane-mismatch",
+        "process-start-mismatch",
+        "process-unavailable",
+        "provider-internal-failure",
+        "provider-mismatch",
+        "registry-hook-disagreement",
+        "registry-unavailable",
+        "renderer-profile-mismatch",
+        "renderer-width-too-small",
+        "schema-drift",
+        "selection-unowned",
+        "source-byte-coverage",
+        "styled-row-geometry",
+        "styled-row-text-mismatch",
+        "transcript-bootstrap-limit",
+        "transcript-changed",
+        "transcript-outside-root",
+        "transcript-read-failed",
+        "transcript-rotated",
+        "transcript-scan-limit",
+        "transcript-session-changed",
+        "transcript-session-mismatch",
+        "transcript-truncated",
+        "unknown-semantic-replacement",
+        "unmapped-semantic-text",
+        "unsafe-captured-wide-cell",
+        "unsafe-transcript-metadata",
+        "unsafe-transcript-open",
+        "unsafe-transcript-path",
+        "unsupported-assistant-record",
+        "unsupported-boundary-layout",
+        "unsupported-code-fence",
+        "unsupported-grapheme-width",
+        "unsupported-heading",
+        "unsupported-heading-style",
+        "unsupported-html-entity",
+        "unsupported-inline-code",
+        "unsupported-list-layout",
+        "unsupported-list-marker",
+        "unsupported-markdown",
+        "unsupported-markdown-escape",
+        "unsupported-nested-list",
+        "unsupported-nested-markdown",
+        "unsupported-provider",
+        "unsupported-provider-version",
+        "unsupported-source-control",
+        "unsupported-styled-row",
+        "unsupported-table",
+        "unsupported-unbreakable-token",
+        "unsupported-widget",
+        "unsupported-wrap-tab",
+        "unsupported-wrap-whitespace",
+        "unsupported-wrap-width",
+    }
+)
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
@@ -1875,6 +1971,30 @@ def _candidate_selection_text(
     return candidate.copy_text[output_start:output_end]
 
 
+def _quarantine_compatible_plain_row_placements(
+    candidate: RenderCandidate,
+    plain_rows: Sequence[str | _QuarantinedCapturedRow],
+) -> tuple[int, ...]:
+    height = len(candidate.plain_rows)
+    if not height or height > len(plain_rows):
+        return ()
+    placements = []
+    for start in range(len(plain_rows) - height + 1):
+        spans_quarantine = False
+        for expected, actual in zip(
+            candidate.plain_rows,
+            plain_rows[start : start + height],
+        ):
+            if isinstance(actual, _QuarantinedCapturedRow):
+                spans_quarantine = True
+            elif actual != expected:
+                break
+        else:
+            if spans_quarantine:
+                placements.append(start)
+    return tuple(placements)
+
+
 def match_complete_provider_block(
     candidates: Sequence[RenderCandidate],
     plain_rows: Sequence[str | _QuarantinedCapturedRow],
@@ -1889,9 +2009,19 @@ def match_complete_provider_block(
     try:
         matches: list[tuple[RenderCandidate, int, str]] = []
         shadows: list[tuple[RenderCandidate, int]] = []
+        spans_quarantine = False
+        has_plain_placement = False
+        has_complete_selection = False
+        has_matching_style = False
         repeated_selection = False
         for candidate in candidates:
             placements = exact_plain_row_placements(candidate, plain_rows)
+            if not placements and _quarantine_compatible_plain_row_placements(
+                candidate, plain_rows
+            ):
+                spans_quarantine = True
+            if placements:
+                has_plain_placement = True
             for placement in placements:
                 try:
                     text = _candidate_selection_text(
@@ -1902,21 +2032,37 @@ def match_complete_provider_block(
                     )
                 except ProviderAuthorityError:
                     continue
+                has_complete_selection = True
                 if len(placements) != 1:
                     if not candidate.unsupported:
                         repeated_selection = True
                     continue
                 if style_rows is not None and not _candidate_styles_match(candidate, style_rows, placement):
                     continue
+                has_matching_style = True
                 if candidate.unsupported:
                     shadows.append((candidate, placement))
                 else:
                     matches.append((candidate, placement, text))
         if repeated_selection:
-            return MatchResult.failure("ambiguous-provider-block")
+            return MatchResult.failure("placement-ambiguous")
         identities = {(candidate.source_id, placement) for candidate, placement, _ in matches}
-        if len(matches) != 1 or len(identities) != 1:
-            return MatchResult.failure("no-unique-canonical-provider-block" if not matches else "ambiguous-provider-block")
+        if len(matches) > 1 or len(identities) > 1:
+            return MatchResult.failure("placement-ambiguous")
+        if not matches:
+            if spans_quarantine:
+                reason = "candidate-spans-quarantine"
+            elif not has_plain_placement:
+                reason = "no-plain-placement"
+            elif not has_complete_selection:
+                reason = "selection-not-complete"
+            elif not has_matching_style:
+                reason = "style-mismatch"
+            elif shadows:
+                reason = "no-supported-candidate"
+            else:
+                reason = "no-canonical-candidate"
+            return MatchResult.failure(reason)
         candidate, placement, text = matches[0]
         if any(
             shadow_placement == placement
@@ -1924,7 +2070,7 @@ def match_complete_provider_block(
             and shadow.style_rows == candidate.style_rows
             for shadow, shadow_placement in shadows
         ):
-            return MatchResult.failure("unsupported-provider-alias")
+            return MatchResult.failure("no-canonical-candidate")
         return MatchResult(
             True,
             text=text,
@@ -1935,7 +2081,7 @@ def match_complete_provider_block(
             source_end=candidate.source_end,
         )
     except Exception:
-        return MatchResult.failure("provider-match-failed")
+        return MatchResult.failure("no-canonical-candidate")
 
 
 def _unsupported_text_collision_cannot_be_excluded(
@@ -1999,8 +2145,6 @@ def authoritative_provider_match(
             ),
             None,
         )
-        if selected_quarantine is not None:
-            raise ProviderAuthorityError(selected_quarantine)
         if style_rows is not None:
             if len(style_rows) != len(normalized_plain_rows):
                 raise ProviderAuthorityError("styled-row-geometry")
@@ -2015,8 +2159,9 @@ def authoritative_provider_match(
                 ):
                     raise ProviderAuthorityError("styled-row-geometry")
         candidates = []
-        render_failed_texts: list[str] = []
-        for record in records:
+        unsupported_collision_texts: list[str] = []
+        render_failed_record_indexes: list[int] = []
+        for record_index, record in enumerate(records):
             try:
                 rendered, unsupported_texts = _render_record_candidates(
                     record,
@@ -2025,9 +2170,11 @@ def authoritative_provider_match(
                     profile=profile,
                 )
                 candidates.extend(rendered)
-                render_failed_texts.extend(unsupported_texts)
+                unsupported_collision_texts.extend(unsupported_texts)
             except ProviderAuthorityError:
-                render_failed_texts.append(record.text)
+                render_failed_record_indexes.append(record_index)
+        if not candidates:
+            return MatchResult.failure("no-renderable-records")
         result = match_complete_provider_block(
             tuple(candidates),
             normalized_plain_rows,
@@ -2036,6 +2183,11 @@ def authoritative_provider_match(
             style_rows=style_rows,
         )
         if not result.matched:
+            if (
+                selected_quarantine is not None
+                and result.internal_reason != "candidate-spans-quarantine"
+            ):
+                return MatchResult.failure(selected_quarantine)
             return result
         matched_candidate = next(
             (
@@ -2050,9 +2202,15 @@ def authoritative_provider_match(
         )
         if matched_candidate is None or any(
             _unsupported_text_collision_cannot_be_excluded(text, matched_candidate)
-            for text in render_failed_texts
+            for text in unsupported_collision_texts
+        ) or any(
+            _unsupported_text_collision_cannot_be_excluded(
+                records[record_index].text,
+                matched_candidate,
+            )
+            for record_index in render_failed_record_indexes
         ):
-            return MatchResult.failure("unsupported-provider-alias")
+            return MatchResult.failure("no-canonical-candidate")
         if before_final_revalidation is not None:
             before_final_revalidation()
         validate_binding_process(
@@ -2081,6 +2239,7 @@ _TRANSCRIPT_INDEXES: OrderedDict[tuple[str, Path, int], TranscriptIndex] = Order
 _PROVIDER_SELECTION_LOCK = threading.Lock()
 _PROVIDER_DIAGNOSTIC_LOCK = threading.Lock()
 _PROVIDER_DIAGNOSTICS: OrderedDict[tuple[str, str, str], int] = OrderedDict()
+_PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN: set[str] = set()
 _PROVIDER_DIAGNOSTIC_TOTAL = 0
 
 
@@ -2120,20 +2279,24 @@ def _record_provider_diagnostic(mode: str, decision: str, reason: str) -> None:
         mode = "invalid"
     if decision not in ("matched", "unowned", "fallback", "rejected"):
         decision = "invalid"
-    if not re.fullmatch(r"[a-z0-9-]{1,64}", reason):
+    if not isinstance(reason, str) or reason not in _PROVIDER_DIAGNOSTIC_REASONS:
         reason = "invalid-reason"
     key = (mode, decision, reason)
     flush = False
+    immediate = False
     with _PROVIDER_DIAGNOSTIC_LOCK:
+        if decision == "rejected" and reason not in _PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN:
+            _PROVIDER_DIAGNOSTIC_REJECTIONS_SEEN.add(reason)
+            immediate = True
         if (
             key not in _PROVIDER_DIAGNOSTICS
             and len(_PROVIDER_DIAGNOSTICS) >= MAX_PROVIDER_DIAGNOSTIC_REASONS - 1
         ):
-            key = ("aggregate", "overflow", "other-reason")
+            key = ("invalid", "invalid", "invalid-reason")
         _PROVIDER_DIAGNOSTICS[key] = _PROVIDER_DIAGNOSTICS.get(key, 0) + 1
         _PROVIDER_DIAGNOSTIC_TOTAL += 1
         flush = _PROVIDER_DIAGNOSTIC_TOTAL >= PROVIDER_DIAGNOSTIC_FLUSH_EVERY
-    if decision == "rejected":
+    if immediate:
         _emit_provider_diagnostics(
             [{"mode": mode, "decision": decision, "reason": reason, "count": 1}]
         )
@@ -2417,7 +2580,7 @@ def _provider_selection_locked(
             ),
         )
         if not result.matched:
-            raise ProviderAuthorityError(result.internal_reason or "provider-match-failed")
+            raise ProviderAuthorityError(result.internal_reason or "no-canonical-candidate")
         return decision(True, "canonical-match", result.text)
     except ProviderAuthorityError as exc:
         if mode == "shadow":
