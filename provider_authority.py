@@ -140,6 +140,22 @@ class OwnershipRange:
 
 
 @dataclass(frozen=True)
+class _QuarantinedCapturedRow:
+    reason: str
+
+
+_CAPTURED_ROW_QUARANTINE_REASONS = frozenset(
+    {
+        "unsafe-captured-wide-cell",
+        "invalid-captured-cell",
+        "captured-row-overflow",
+        "unsupported-styled-row",
+        "styled-row-text-mismatch",
+    }
+)
+
+
+@dataclass(frozen=True)
 class MatchResult:
     matched: bool
     text: str | None = None
@@ -1624,13 +1640,16 @@ def normalize_styled_rows(
 
 
 def normalize_plain_rows(
-    plain_rows: Sequence[str],
+    plain_rows: Sequence[str | _QuarantinedCapturedRow],
     cols: int,
-) -> tuple[str, ...]:
+) -> tuple[str | _QuarantinedCapturedRow, ...]:
     if cols <= 0:
         raise ProviderAuthorityError("invalid-captured-geometry")
     normalized = []
     for row in plain_rows:
+        if isinstance(row, _QuarantinedCapturedRow):
+            normalized.append(row)
+            continue
         if not isinstance(row, str):
             raise ProviderAuthorityError("invalid-captured-row")
         width = 0
@@ -1642,6 +1661,36 @@ def normalize_plain_rows(
                 raise ProviderAuthorityError("captured-row-overflow")
         normalized.append(row + " " * (cols - width))
     return tuple(normalized)
+
+
+def _normalize_captured_rows(
+    styled_rows: Sequence[str],
+    plain_rows: Sequence[str],
+    cols: int,
+) -> tuple[
+    tuple[str | _QuarantinedCapturedRow, ...],
+    tuple[tuple[tuple[int, int, str], ...] | _QuarantinedCapturedRow, ...],
+]:
+    if len(styled_rows) != len(plain_rows):
+        raise ProviderAuthorityError("styled-row-geometry")
+    normalized_plain = []
+    normalized_styles = []
+    for styled, plain in zip(styled_rows, plain_rows):
+        if not isinstance(plain, str):
+            raise ProviderAuthorityError("invalid-captured-row")
+        try:
+            styles = normalize_styled_rows((styled,), (plain,))[0]
+            normalized = normalize_plain_rows((plain,), cols)[0]
+        except ProviderAuthorityError as exc:
+            if exc.reason not in _CAPTURED_ROW_QUARANTINE_REASONS:
+                raise
+            sentinel = _QuarantinedCapturedRow(exc.reason)
+            normalized_plain.append(sentinel)
+            normalized_styles.append(sentinel)
+            continue
+        normalized_plain.append(normalized)
+        normalized_styles.append(styles)
+    return tuple(normalized_plain), tuple(normalized_styles)
 
 
 def _style_satisfies(expected: str, actual: str) -> bool:
@@ -1658,14 +1707,19 @@ def _style_satisfies(expected: str, actual: str) -> bool:
 
 def _candidate_styles_match(
     candidate: RenderCandidate,
-    actual_rows: Sequence[Sequence[tuple[int, int, str]]],
+    actual_rows: Sequence[
+        Sequence[tuple[int, int, str]] | _QuarantinedCapturedRow
+    ],
     placement: int,
 ) -> bool:
     if placement + len(candidate.style_rows) > len(actual_rows):
         return False
     for row_index, expected_spans in enumerate(candidate.style_rows):
+        actual_row = actual_rows[placement + row_index]
+        if isinstance(actual_row, _QuarantinedCapturedRow):
+            return False
         actual_cells: dict[int, str] = {}
-        for start, end, style in actual_rows[placement + row_index]:
+        for start, end, style in actual_row:
             if start < 0 or end <= start:
                 return False
             for column in range(start, end):
@@ -1678,7 +1732,10 @@ def _candidate_styles_match(
     return True
 
 
-def exact_plain_row_placements(candidate: RenderCandidate, plain_rows: Sequence[str]) -> tuple[int, ...]:
+def exact_plain_row_placements(
+    candidate: RenderCandidate,
+    plain_rows: Sequence[str | _QuarantinedCapturedRow],
+) -> tuple[int, ...]:
     height = len(candidate.plain_rows)
     if not height or height > len(plain_rows):
         return ()
@@ -1820,11 +1877,14 @@ def _candidate_selection_text(
 
 def match_complete_provider_block(
     candidates: Sequence[RenderCandidate],
-    plain_rows: Sequence[str],
+    plain_rows: Sequence[str | _QuarantinedCapturedRow],
     selection_start: tuple[int, int],
     selection_end: tuple[int, int],
     *,
-    style_rows: Sequence[Sequence[tuple[int, int, str]]] | None = None,
+    style_rows: Sequence[
+        Sequence[tuple[int, int, str]] | _QuarantinedCapturedRow
+    ]
+    | None = None,
 ) -> MatchResult:
     try:
         matches: list[tuple[RenderCandidate, int, str]] = []
@@ -1904,10 +1964,13 @@ def authoritative_provider_match(
     *,
     transcript_root: Path | str,
     cols: int,
-    plain_rows: Sequence[str],
+    plain_rows: Sequence[str | _QuarantinedCapturedRow],
     selection_start: tuple[int, int],
     selection_end: tuple[int, int],
-    style_rows: Sequence[Sequence[tuple[int, int, str]]] | None = None,
+    style_rows: Sequence[
+        Sequence[tuple[int, int, str]] | _QuarantinedCapturedRow
+    ]
+    | None = None,
     owner_uid: int | None = None,
     proc_start_reader: Callable[[int], str] = _read_proc_start,
     proc_environ_reader: Callable[[int], Mapping[str, str]] = _read_proc_environ,
@@ -1924,13 +1987,33 @@ def authoritative_provider_match(
         records = index.update(fence, binding)
         profile = renderer_profile(binding.provider, binding.version)
         normalized_plain_rows = normalize_plain_rows(plain_rows, cols)
+        selected_quarantine = next(
+            (
+                row.reason
+                for row in normalized_plain_rows[
+                    max(0, selection_start[0]) : min(
+                        len(normalized_plain_rows), selection_end[0] + 1
+                    )
+                ]
+                if isinstance(row, _QuarantinedCapturedRow)
+            ),
+            None,
+        )
+        if selected_quarantine is not None:
+            raise ProviderAuthorityError(selected_quarantine)
         if style_rows is not None:
-            if len(style_rows) != len(normalized_plain_rows) or any(
-                start < 0 or end <= start or end > cols
-                for row in style_rows
-                for start, end, _ in row
-            ):
+            if len(style_rows) != len(normalized_plain_rows):
                 raise ProviderAuthorityError("styled-row-geometry")
+            for row_index, row in enumerate(style_rows):
+                if isinstance(normalized_plain_rows[row_index], _QuarantinedCapturedRow):
+                    if not isinstance(row, _QuarantinedCapturedRow):
+                        raise ProviderAuthorityError("styled-row-geometry")
+                    continue
+                if isinstance(row, _QuarantinedCapturedRow) or any(
+                    start < 0 or end <= start or end > cols
+                    for start, end, _ in row
+                ):
+                    raise ProviderAuthorityError("styled-row-geometry")
         candidates = []
         render_failed_texts: list[str] = []
         for record in records:
@@ -2313,7 +2396,11 @@ def _provider_selection_locked(
         owned = _selection_is_owned(binding, cache, snapshot, start_row, end_row)
         if not owned:
             return decision(False, "selection-unowned")
-        style_rows = normalize_styled_rows(snapshot.physical_rows, snapshot.plain_physical_rows)
+        normalized_plain_rows, style_rows = _normalize_captured_rows(
+            snapshot.physical_rows,
+            snapshot.plain_physical_rows,
+            snapshot.cols,
+        )
         key = (binding.provider, binding.transcript_path.absolute(), binding.generation)
         index = _transcript_index(key)
         result = authoritative_provider_match(
@@ -2321,7 +2408,7 @@ def _provider_selection_locked(
             index,
             transcript_root=_transcript_root(binding, provider_home),
             cols=snapshot.cols,
-            plain_rows=snapshot.plain_physical_rows,
+            plain_rows=normalized_plain_rows,
             selection_start=(start_row + snapshot.seed_history, start_x),
             selection_end=(end_row + snapshot.seed_history, end_x),
             style_rows=style_rows,

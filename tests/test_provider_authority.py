@@ -1267,6 +1267,164 @@ class RuntimeBindingCacheTest(unittest.TestCase):
         self.assertEqual(styles[0][2], (2, 3, "strong"))
 
 
+class ProviderSelectionQuarantineTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.home = Path(self.temporary.name)
+        self.root = self.home / ".claude" / "projects"
+        self.path = self.root / f"{SESSION_ID}.jsonl"
+        self.source = "wrapped Claude response exactly"
+        write_jsonl(self.path, [claude_text(self.source)])
+        self.binding = binding("claude", self.path)
+        self.cols = 16
+        self.candidate = render_semantic_candidate(
+            AssistantTextRecord(
+                "claude",
+                f"claude:{SESSION_ID}:msg_1",
+                f"claude:{SESSION_ID}:msg_1:record-1",
+                self.source,
+                1,
+            ),
+            version="2.1.241",
+            cols=self.cols,
+        )
+        self.assertGreater(len(self.candidate.plain_rows), 1)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def select(self, plain_rows, styled_rows, start, end):
+        snapshot = SimpleNamespace(
+            pane_id="%9",
+            alternate=True,
+            cols=self.cols,
+            seed_history=0,
+            physical_rows=list(styled_rows),
+            plain_physical_rows=list(plain_rows),
+        )
+
+        def match(*args, **kwargs):
+            kwargs["proc_start_reader"] = lambda pid: "77"
+            kwargs["proc_environ_reader"] = lambda pid: {"TMUX_PANE": "%9"}
+            return authoritative_provider_match(*args, **kwargs)
+
+        with patch.dict(
+            os.environ,
+            {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "enforce"},
+        ), patch(
+            "provider_authority.resolve_provider_binding",
+            return_value=(self.binding, None),
+        ), patch(
+            "provider_authority.authoritative_provider_match",
+            side_effect=match,
+        ):
+            return provider_selection(
+                snapshot,
+                start[1],
+                start[0],
+                end[1],
+                end[0],
+                home=self.home,
+            )
+
+    def candidate_selection(self, placement):
+        return (
+            (
+                placement + self.candidate.selection_start[0],
+                self.candidate.selection_start[1],
+            ),
+            (
+                placement + self.candidate.selection_end[0],
+                self.candidate.selection_end[1],
+            ),
+        )
+
+    def assert_rejected(self, plain, styled, reason):
+        rows = (plain, *self.candidate.plain_rows)
+        styles = (styled, *verified_styled_rows(self.candidate))
+        with self.assertRaises(ProviderAuthorityError) as raised:
+            self.select(rows, styles, (0, 0), (0, 1))
+        self.assertEqual(raised.exception.reason, reason)
+
+    def test_wrapped_candidate_matches_with_unsafe_rows_before_and_after(self):
+        for grapheme in ("✳", "⏺", "😀", "©"):
+            for position in ("before", "after"):
+                with self.subTest(grapheme=grapheme, position=position):
+                    if position == "before":
+                        rows = (grapheme, *self.candidate.plain_rows)
+                        styles = (grapheme, *verified_styled_rows(self.candidate))
+                        placement = 1
+                    else:
+                        rows = (*self.candidate.plain_rows, grapheme)
+                        styles = (*verified_styled_rows(self.candidate), grapheme)
+                        placement = 0
+                    start, end = self.candidate_selection(placement)
+                    result = self.select(rows, styles, start, end)
+                    self.assertTrue(result.owned)
+                    self.assertEqual(result.text, self.source)
+                    self.assertEqual(result.text, self.candidate.copy_text)
+
+    def test_each_captured_row_failure_is_quarantined_off_selection(self):
+        ordinary = "ordinary".ljust(self.cols)
+        cases = (
+            ("✳", "✳", "unsafe-captured-wide-cell"),
+            ("́", "́", "invalid-captured-cell"),
+            (" " * (self.cols - 1) + "界", " " * (self.cols - 1) + "界", "captured-row-overflow"),
+            (ordinary, "\x1b[999m" + ordinary, "unsupported-styled-row"),
+            (ordinary, "different".ljust(self.cols), "styled-row-text-mismatch"),
+        )
+        for plain, styled, reason in cases:
+            with self.subTest(reason=reason):
+                rows = (plain, *self.candidate.plain_rows)
+                styles = (styled, *verified_styled_rows(self.candidate))
+                start, end = self.candidate_selection(1)
+                result = self.select(rows, styles, start, end)
+                self.assertTrue(result.owned)
+                self.assertEqual(result.text, self.candidate.copy_text)
+
+    def test_selecting_quarantined_row_propagates_original_reason(self):
+        ordinary = "ordinary".ljust(self.cols)
+        for plain, styled, reason in (
+            ("✳", "✳", "unsafe-captured-wide-cell"),
+            ("́", "́", "invalid-captured-cell"),
+            (" " * (self.cols - 1) + "界", " " * (self.cols - 1) + "界", "captured-row-overflow"),
+            (ordinary, "\x1b[999m" + ordinary, "unsupported-styled-row"),
+            (ordinary, "different".ljust(self.cols), "styled-row-text-mismatch"),
+        ):
+            with self.subTest(reason=reason):
+                self.assert_rejected(plain, styled, reason)
+
+    def test_quarantine_inside_candidate_blocks_spanning_placement(self):
+        plain_rows = list(self.candidate.plain_rows)
+        styled_rows = list(verified_styled_rows(self.candidate))
+        plain_rows[1] = "✳"
+        styled_rows[1] = "✳"
+        with self.assertRaises(ProviderAuthorityError) as raised:
+            self.select(
+                plain_rows,
+                styled_rows,
+                (self.candidate.selection_start[0], self.candidate.selection_start[1]),
+                (0, self.cols),
+            )
+        self.assertEqual(
+            raised.exception.reason,
+            "no-unique-canonical-provider-block",
+        )
+
+    def test_duplicate_candidate_remains_ambiguous_with_quarantine(self):
+        plain_rows = (
+            *self.candidate.plain_rows,
+            "✳",
+            *self.candidate.plain_rows,
+        )
+        styled_candidate = verified_styled_rows(self.candidate)
+        styled_rows = (*styled_candidate, "✳", *styled_candidate)
+        start, end = self.candidate_selection(0)
+        with self.assertRaises(ProviderAuthorityError) as raised:
+            self.select(plain_rows, styled_rows, start, end)
+        self.assertEqual(raised.exception.reason, "ambiguous-provider-block")
+
+
 class CodexOwnershipTest(unittest.TestCase):
     def setUp(self):
         self.binding = binding("codex", Path("/approved/session.jsonl"))
