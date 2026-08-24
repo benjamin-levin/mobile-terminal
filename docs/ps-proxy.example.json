@@ -28,10 +28,9 @@
     {
       "id": "behuman",
       "label": "bh",
-      "backend": "ws://127.0.0.1:8091",
-      "internalTokenEnv": "MOBILE_TERMINAL_INTERNAL_TOKEN_BEHUMAN",
-      "osUser": "behuman",
       "authRealm": "mine",
+      "status": "down",
+      "statusMessage": "Behuman is not a managed Mobile Terminal backend",
       "accent": "#7ee7b3"
     }
   ]

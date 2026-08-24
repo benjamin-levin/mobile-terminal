@@ -1,5 +1,5 @@
 [Unit]
-Description=Mobile Terminal profile proxy (gen/bh) + passkeys
+Description=Mobile Terminal profile proxy (Powerhouse + Behuman stub) + passkeys
 Documentation=file:///home/powerhouse/mobile-terminal/ps-proxy-up.sh
 Wants=network-online.target
 After=network-online.target
@@ -11,13 +11,13 @@ Type=simple
 WorkingDirectory=/home/powerhouse/mobile-terminal
 UMask=0077
 ExecStartPre=/usr/bin/test -x /home/powerhouse/mobile-terminal/ps-proxy-up.sh
-ExecStart=/home/powerhouse/mobile-terminal/ps-proxy-up.sh
+ExecStart=/home/powerhouse/mobile-terminal/ps-proxy-up.sh --apply
 Restart=always
 RestartSec=3
 TimeoutStopSec=15
 # process (not control-group): stopping the proxy must NOT kill tmux servers or
 # shells that were spawned under the backend cgroup. The script's own trap reaps
-# the three python processes on SIGTERM.
+# the two python processes on SIGTERM.
 KillMode=process
 StandardOutput=journal
 StandardError=journal

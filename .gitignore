@@ -10,3 +10,8 @@ mobile-terminal-usage.json
 mobile-terminal-users.json
 state/
 .gstack/
+.pytest_cache/
+.codex
+.venv.pre-migration-*/
+requirements.txt.pre-*
+*.bak-deploy

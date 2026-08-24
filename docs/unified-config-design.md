@@ -1,6 +1,13 @@
 # Unified mobile-terminal: one codebase, two deployment shapes
 
-Status: design, approved-in-principle 2026-08-19. Author decisions locked (see §1).
+> **Historical design snapshot, not current deployment topology.** This document records the
+> proposal approved in principle on 2026-08-19. In particular, every Behuman backend, OS-user,
+> service, and two-live-profile diagram below is proposed/historical: Behuman is currently an
+> unavailable proxy stub and is not a managed Mobile Terminal deployment target. See
+> [`deployment.md`](deployment.md) for the authoritative fleet and service topology and
+> [`profiles-proxy-integration.md`](profiles-proxy-integration.md) for the shipped proxy shape.
+
+Status: historical design, approved-in-principle 2026-08-19. Author decisions locked (see §1).
 Implementation details are documented in `profiles-proxy-integration.md`; the authenticator
 contract is documented in `../INTEGRATION-proxy-auth.md`. Those documents are authoritative
 where this design sketch differs from the shipped configuration.

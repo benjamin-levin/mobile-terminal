@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from install_provider_hooks import BACKUP_SUFFIX, SOURCE_TAG, install_provider_hooks
-from provider_binding_hook import _provider_process, update_binding
+from provider_binding_hook import _pane_coordinates, _provider_process, update_binding
 
 
 SESSION_ID = "12345678-1234-4123-8123-123456789abc"
@@ -151,8 +151,13 @@ class InstallScriptProviderHooksTest(unittest.TestCase):
         python.parent.mkdir(parents=True)
         python.write_text(
             "#!/bin/sh\n"
-            'printf "%s\\n" "$*" >>"$HOME/provider-hook-calls"\n'
-            'exit "${PROVIDER_HOOK_EXIT:-0}"\n'
+            'case "$*" in\n'
+            '  *install_provider_hooks.py*)\n'
+            '    printf "%s\\n" "$*" >>"$HOME/provider-hook-calls"\n'
+            '    exit "${PROVIDER_HOOK_EXIT:-0}"\n'
+            '    ;;\n'
+            '  *token_urlsafe*) printf "test-bootstrap-secret\\n" ;;\n'
+            'esac\n'
         )
         python.chmod(0o755)
         environment = {
@@ -162,7 +167,7 @@ class InstallScriptProviderHooksTest(unittest.TestCase):
             "PROVIDER_HOOK_EXIT": str(hook_exit),
         }
         return subprocess.run(
-            ["bash", str(root / "install.sh"), *arguments, "--service", "none"],
+            ["bash", str(root / "install.sh"), "--apply", *arguments, "--service", "none"],
             cwd=root,
             env=environment,
             capture_output=True,
@@ -355,12 +360,49 @@ class ProviderBindingHookTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _provider_process("codex", "%7", proc_root, start_pid=100)
 
+    def test_tmux_probe_subprocess_removes_mobile_terminal_secrets(self):
+        result = subprocess.CompletedProcess(
+            [],
+            0,
+            "%7\t12\t100\t3\t24\t0\n",
+            "",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "TMUX": "/private/socket,1,0",
+                "TMUX_PANE": "%7",
+                "MOBILE_TERMINAL_TOKEN": "external-secret",
+                "MOBILE_TERMINAL_INTERNAL_TOKEN_POWERHOUSE": "internal-secret",
+                "MOBILE_TERMINAL_CONFIG": "/real/config.json",
+            },
+            clear=False,
+        ), patch("provider_binding_hook.subprocess.run", return_value=result) as run:
+            self.assertEqual(_pane_coordinates("%7")["history"], 12)
+
+        child_environment = run.call_args.kwargs["env"]
+        self.assertEqual(child_environment["TMUX_PANE"], "%7")
+        self.assertNotIn("MOBILE_TERMINAL_TOKEN", child_environment)
+        self.assertNotIn(
+            "MOBILE_TERMINAL_INTERNAL_TOKEN_POWERHOUSE",
+            child_environment,
+        )
+        self.assertNotIn("MOBILE_TERMINAL_CONFIG", child_environment)
+
     def test_malformed_hook_input_is_provider_safe(self):
         script = Path(__file__).resolve().parents[1] / "provider_binding_hook.py"
         result = subprocess.run(
             [sys.executable, str(script), "--provider", "claude", "--version", "2.1.241"],
             input=b"not-json",
-            env={**os.environ, "HOME": str(self.home), "TMUX_PANE": "%7"},
+            env={
+                **{
+                    name: value
+                    for name, value in os.environ.items()
+                    if not name.startswith("MOBILE_TERMINAL_")
+                },
+                "HOME": str(self.home),
+                "TMUX_PANE": "%7",
+            },
             capture_output=True,
             timeout=3,
         )

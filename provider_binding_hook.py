@@ -73,6 +73,14 @@ def _provider_process(
     raise ValueError
 
 
+def _tmux_environment() -> dict[str, str]:
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("MOBILE_TERMINAL_")
+    }
+
+
 def _pane_coordinates(pane_id: str) -> dict[str, int | bool]:
     result = subprocess.run(
         [
@@ -87,6 +95,7 @@ def _pane_coordinates(pane_id: str) -> dict[str, int | bool]:
         capture_output=True,
         text=True,
         timeout=1,
+        env=_tmux_environment(),
     )
     fields = result.stdout.rstrip("\n").split("\t")
     if len(fields) != 6 or fields[0] != pane_id:

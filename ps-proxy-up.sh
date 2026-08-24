@@ -2,16 +2,25 @@
 # ps-proxy-up.sh — run the profiles proxy WITH passkeys on ps (this box).
 #
 # Runs the "powerhouse" backend on loopback:8090 and the proxy on :8085. The
-# "behuman" backend is a separately provisioned system service on loopback:8091,
-# running as the behuman OS user. The public funnel already points 443 ->
+# "behuman" profile is an unavailable stub; this script does not manage or assume
+# a Behuman backend or service. The public funnel already points 443 ->
 # 127.0.0.1:8085, so no funnel change is needed.
-# Foreground process: Ctrl-C stops the powerhouse backend and proxy; the isolated
-# behuman backend stays running. Revert to normal any time by restarting the systemd
-# service (see the message this script prints if port 8085 is busy).
+# Foreground process: Ctrl-C stops the powerhouse backend and proxy. Revert to
+# normal any time by restarting the exact user service (see the message this
+# script prints if port 8085 is busy).
 #
 # This script starts processes but touches NO systemd units. You stop the standalone
 # service yourself first; you restart it yourself to revert.
 set -euo pipefail
+
+if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
+  echo "Usage: ./ps-proxy-up.sh --apply"
+  exit 0
+fi
+if [[ $# -ne 1 || $1 != "--apply" ]]; then
+  echo "Refusing to start proxy processes without explicit --apply confirmation" >&2
+  exit 2
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
@@ -19,9 +28,7 @@ PY="$ROOT/.venv/bin/python"
 CANONICAL_CONFIG="$ROOT/docs/ps-proxy.example.json"
 RUNTIME_CONFIG="$ROOT/state/proxy/ps-proxy.runtime.json"
 PUBLIC_HOSTNAME=powerspec.tailbfd3d7.ts.net
-BH_PROXY_ENV="${MOBILE_TERMINAL_BH_PROXY_ENV:-$HOME/.config/mobile-terminal/behuman-proxy.env}"
 BACKEND_PORT=8090
-BH_PORT=8091
 PROXY_PORT=8085
 
 [ -x "$PY" ] || { echo "ERROR: venv python not found at $PY"; exit 1; }
@@ -90,38 +97,22 @@ if [ -f "$ROOT/mobile-terminal.env" ]; then set -a; . "$ROOT/mobile-terminal.env
 : "${MOBILE_TERMINAL_TOKEN:?MOBILE_TERMINAL_TOKEN not set — put it in mobile-terminal.env}"
 
 # 3. Internal hop tokens (proxy <-> backend). The co-launched powerhouse backend
-#    gets an ephemeral token. The independently provisioned behuman backend uses
-#    a persistent token shared through an owner-only environment file.
+#    gets an ephemeral token; the unavailable Behuman stub has no backend token.
 HOP_POWERHOUSE="$("$PY" -c 'import secrets;print(secrets.token_urlsafe(24))')"
-[ -f "$BH_PROXY_ENV" ] || {
-  echo "ERROR: behuman proxy environment not found: $BH_PROXY_ENV"
-  echo "Run the bh account deployment first (see BH-DEPLOY-README.md)."
-  exit 1
-}
-[ "$(stat -c '%u' "$BH_PROXY_ENV")" = "$(id -u)" ] || {
-  echo "ERROR: $BH_PROXY_ENV must be owned by $(id -un)."
-  exit 1
-}
-[ "$(stat -c '%a' "$BH_PROXY_ENV")" = "600" ] || {
-  echo "ERROR: $BH_PROXY_ENV must have mode 600."
-  exit 1
-}
-set -a
-# shellcheck disable=SC1090
-. "$BH_PROXY_ENV"
-set +a
-: "${MOBILE_TERMINAL_INTERNAL_TOKEN_BEHUMAN:?missing from $BH_PROXY_ENV}"
-HOP_BEHUMAN="$MOBILE_TERMINAL_INTERNAL_TOKEN_BEHUMAN"
-case "$HOP_BEHUMAN" in
-  *[!A-Za-z0-9_-]*|'') echo "ERROR: invalid behuman internal token in $BH_PROXY_ENV"; exit 1 ;;
-esac
 export MOBILE_TERMINAL_INTERNAL_TOKEN="$("$PY" -c 'import secrets;print(secrets.token_urlsafe(24))')"
 export MOBILE_TERMINAL_INTERNAL_TOKEN_POWERHOUSE="$HOP_POWERHOUSE"
-export MOBILE_TERMINAL_INTERNAL_TOKEN_BEHUMAN="$HOP_BEHUMAN"
 
 # 4. Launch the powerhouse backend: loopback-only, validate the proxy's hop token,
 #    no user token (the proxy is the only auth surface). MOBILE_TERMINAL_CONFIG is
-#    unset here so server.py runs as a plain backend, not the proxy.
+#    unset here so server.py runs as a plain backend, not the proxy. Start from an
+#    allowlist so the sourced bootstrap token and unrelated service secrets cannot
+#    reach the backend or its terminal children.
+BACKEND_ENV=(env -i)
+for name in HOME PATH USER LOGNAME SHELL TERM COLORTERM LANG LC_ALL LC_CTYPE TMPDIR TMUX_TMPDIR XDG_RUNTIME_DIR SSH_AUTH_SOCK; do
+  if [[ -v $name ]]; then
+    BACKEND_ENV+=("$name=${!name}")
+  fi
+done
 BACKEND_PID=""
 PROXY_PID=""
 CLEANED_UP=false
@@ -137,7 +128,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-env -u MOBILE_TERMINAL_CONFIG \
+"${BACKEND_ENV[@]}" \
     MOBILE_TERMINAL_HOST=127.0.0.1 \
     MOBILE_TERMINAL_PORT="$BACKEND_PORT" \
     MOBILE_TERMINAL_SESSION=mt-powerhouse \
@@ -148,8 +139,7 @@ env -u MOBILE_TERMINAL_CONFIG \
 BACKEND_PID=$!
 echo "backend (powerhouse) pid ${BACKEND_PID} -> 127.0.0.1:${BACKEND_PORT}"
 
-# Wait for the co-launched backend and the separately managed behuman backend to
-# listen before starting the proxy.
+# Wait for the co-launched backend before starting the proxy.
 for _ in $(seq 1 20); do
   ss -tlnp 2>/dev/null | grep -q "127.0.0.1:${BACKEND_PORT} " && break
   sleep 0.25
@@ -157,19 +147,6 @@ done
 if ! ss -tlnp 2>/dev/null | grep -q "127.0.0.1:${BACKEND_PORT} "; then
   echo "ERROR: powerhouse backend did not come up on ${BACKEND_PORT} — see its output above."
   exit 1
-fi
-# The behuman backend is a separate system service; if it is down the proxy must
-# still start so the gen profile stays up (the bh profile just shows unavailable).
-for _ in $(seq 1 20); do
-  ss -tlnp 2>/dev/null | grep -q "127.0.0.1:${BH_PORT} " && break
-  sleep 0.25
-done
-if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:${BH_PORT} "; then
-  echo "backend (behuman system service) -> 127.0.0.1:${BH_PORT}"
-else
-  echo "WARNING: behuman backend not listening on ${BH_PORT}; the bh profile will show"
-  echo "         'unavailable' until: sudo systemctl start mobile-terminal@behuman.service"
-  echo "         Starting the proxy anyway so the gen profile stays up."
 fi
 
 # 5. Launch the proxy and supervise its co-launched powerhouse backend.

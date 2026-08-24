@@ -1,20 +1,18 @@
 import asyncio
 import copy
-import fcntl
 import json
 import os
 import shutil
-import signal
-import struct
 import subprocess
-import tempfile
-import termios
 import threading
 import unittest
 import uuid
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
+
+import server
+from tests.tmux_harness import TmuxHarness
 
 from server import (
     AcceptedCommand,
@@ -774,73 +772,110 @@ class ComposerProvenanceLifecycleTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TmuxIsolationTripwireTest(unittest.TestCase):
+    def test_server_tmux_argv_seam_targets_only_the_requested_socket(self):
+        socket_args = ("-S", "/sentinel/private-tmux")
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            mock.patch("server.tmux_client_options", return_value=socket_args),
+            mock.patch("server.subprocess.run", return_value=completed) as run,
+        ):
+            server.ensure_session("sentinel", "/bin/sh", "/")
+            self.assertTrue(server.session_exists("sentinel"))
+
+        self.assertGreater(len(run.call_args_list), 1)
+        for call in run.call_args_list:
+            self.assertEqual(
+                tuple(call.args[0][:3]),
+                ("tmux", "-S", socket_args[1]),
+            )
+
+    def test_private_session_absence_on_default_is_proved_with_a_fake_tmux(self):
+        private = ("-S", "/sentinel/private-tmux")
+
+        def fake_run(argv, **_kwargs):
+            return subprocess.CompletedProcess(
+                argv,
+                0 if argv[1:3] == list(private) else 1,
+                "",
+                "",
+            )
+
+        with mock.patch("server.subprocess.run", side_effect=fake_run):
+            with mock.patch("server.tmux_client_options", return_value=private):
+                self.assertTrue(server.session_exists("private-only"))
+            with mock.patch("server.tmux_client_options", return_value=()):
+                self.assertFalse(server.session_exists("private-only"))
+
+
+class TmuxHarnessLifecycleIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_setup_cleanup_is_immediate_and_idempotent(self):
+        harness = TmuxHarness(self, prefix="mtc-")
+        harness.start_session("partial-setup")
+        self.assertTrue(Path(harness.socket_path).exists())
+
+        harness.close()
+        harness.close()
+
+        self.assertFalse(Path(harness.socket_path).exists())
+
+    async def test_create_if_missing_false_cannot_create_a_session(self):
+        harness = TmuxHarness(self, prefix="mtf-")
+        bridge = harness.register_async_close(
+            TmuxBridge(
+                RecordingConnection(),
+                "must-not-exist",
+                "/bin/sh",
+                "/",
+                create_if_missing=False,
+            )
+        )
+
+        with self.assertRaises((RuntimeError, asyncio.TimeoutError)):
+            await bridge.open()
+
+        harness.close()
+        self.assertFalse(Path(harness.socket_path).exists())
+
+    async def test_ensure_session_creates_only_on_the_private_socket(self):
+        harness = TmuxHarness(self, prefix="mte-")
+        bridge = harness.register_async_close(
+            TmuxBridge(
+                RecordingConnection(),
+                "private-created",
+                "/bin/sh",
+                "/",
+            )
+        )
+        await bridge.open()
+
+        self.assertEqual(
+            harness.run("has-session", "-t", "private-created"),
+            "",
+        )
+
+
 class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        if not shutil.which("tmux") or not shutil.which("zsh"):
-            self.skipTest("tmux and zsh are required")
-        self.tmux_temp_dir = tempfile.TemporaryDirectory(prefix="mt-provenance-")
-        self.tmux_socket_fd = os.open(self.tmux_temp_dir.name, os.O_RDONLY)
-        fd_root = "/proc/self/fd" if Path("/proc/self/fd").is_dir() else "/dev/fd"
-        self.tmux_socket_path = f"{fd_root}/{self.tmux_socket_fd}/socket"
-        original_popen = subprocess.Popen
-        self.tmux_environment = mock.patch.dict(os.environ)
-        self.tmux_environment.start()
-        os.environ.pop("TMUX", None)
-
-        def isolated_popen(args, *popen_args, **kwargs):
-            if isinstance(args, (list, tuple)) and args and args[0] == "tmux":
-                args = ["tmux", "-S", self.tmux_socket_path, *args[1:]]
-                pass_fds = set(kwargs.pop("pass_fds", ()))
-                pass_fds.add(self.tmux_socket_fd)
-                kwargs["pass_fds"] = tuple(pass_fds)
-            return original_popen(args, *popen_args, **kwargs)
-
-        self.tmux_popen_patch = mock.patch("server.subprocess.Popen", side_effect=isolated_popen)
-        self.tmux_popen_patch.start()
+        if not shutil.which("zsh"):
+            self.skipTest("zsh is required")
+        self.tmux = TmuxHarness(self, prefix="mtp-")
         self.session_name = f"mt-provenance-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        subprocess.run(
-            [
-                "tmux",
-                "new-session",
-                "-d",
-                "-x",
-                "36",
-                "-y",
-                "8",
-                "-s",
-                self.session_name,
-                "env PS1='$ ' zsh -f",
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        self.tmux.run(
+            "new-session",
+            "-d",
+            "-x",
+            "36",
+            "-y",
+            "8",
+            "-s",
+            self.session_name,
+            "env PS1='$ ' zsh -f",
         )
-        ordinary_master_fd, ordinary_slave_fd = os.openpty()
-        fcntl.ioctl(
-            ordinary_slave_fd,
-            termios.TIOCSWINSZ,
-            struct.pack("HHHH", 8, 36, 0, 0),
+        self.tmux.run("set-option", "-t", self.session_name, "status", "off")
+        self.ordinary_client, self.ordinary_master_fd = (
+            await self.tmux.attach_ordinary_client(self.session_name, 36, 8)
         )
-        self.ordinary_master_fd = ordinary_master_fd
-        try:
-            self.ordinary_client = subprocess.Popen(
-                [
-                    "tmux",
-                    "-S",
-                    self.tmux_socket_path,
-                    "attach-session",
-                    "-t",
-                    self.session_name,
-                ],
-                stdin=ordinary_slave_fd,
-                stdout=ordinary_slave_fd,
-                stderr=ordinary_slave_fd,
-                pass_fds=(self.tmux_socket_fd,),
-                start_new_session=True,
-            )
-        finally:
-            os.close(ordinary_slave_fd)
-        await self._wait_for_ordinary_client()
 
         self.app = object.__new__(AppServer)
         self.app.mobile_composer_states = {}
@@ -850,15 +885,17 @@ class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.app.terminal_write_locks = {self.session_name: asyncio.Lock()}
         self.app.scroll_states = {}
         self.connection = RecordingConnection()
-        self.bridge = TmuxBridge(
-            self.connection,
-            self.session_name,
-            "/bin/zsh",
-            "/",
-            create_if_missing=False,
-            initial_size=(36, 8),
-            provenance_state=self.app.command_provenance_state(self.session_name),
-            write_lock=self.app.terminal_write_lock(self.session_name),
+        self.bridge = self.tmux.register_async_close(
+            TmuxBridge(
+                self.connection,
+                self.session_name,
+                "/bin/zsh",
+                "/",
+                create_if_missing=False,
+                initial_size=(36, 8),
+                provenance_state=self.app.command_provenance_state(self.session_name),
+                write_lock=self.app.terminal_write_lock(self.session_name),
+            )
         )
         self.connection.bridge = self.bridge
         await self.bridge.open()
@@ -866,78 +903,11 @@ class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await self.bridge.quiet(0.08)
         self.state = {"session": self.session_name, "user": ""}
 
-    async def asyncTearDown(self):
-        bridge = getattr(self, "bridge", None)
-        if bridge is not None:
-            await bridge.close()
-        ordinary_client = getattr(self, "ordinary_client", None)
-        if ordinary_client is not None and ordinary_client.poll() is None:
-            ordinary_client.terminate()
-            try:
-                await asyncio.wait_for(asyncio.to_thread(ordinary_client.wait), timeout=1)
-            except asyncio.TimeoutError:
-                ordinary_client.kill()
-                await asyncio.to_thread(ordinary_client.wait)
-        ordinary_master_fd = getattr(self, "ordinary_master_fd", None)
-        if ordinary_master_fd is not None:
-            os.close(ordinary_master_fd)
-        session_name = getattr(self, "session_name", "")
-        if session_name:
-            subprocess.run(
-                ["tmux", "kill-session", "-t", session_name],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        tmux_popen_patch = getattr(self, "tmux_popen_patch", None)
-        if tmux_popen_patch is not None:
-            tmux_popen_patch.stop()
-        tmux_environment = getattr(self, "tmux_environment", None)
-        if tmux_environment is not None:
-            tmux_environment.stop()
-        tmux_socket_fd = getattr(self, "tmux_socket_fd", None)
-        if tmux_socket_fd is not None:
-            os.close(tmux_socket_fd)
-        tmux_temp_dir = getattr(self, "tmux_temp_dir", None)
-        if tmux_temp_dir is not None:
-            tmux_temp_dir.cleanup()
-
-    async def _wait_for_ordinary_client(self):
-        deadline = asyncio.get_running_loop().time() + 3
-        while asyncio.get_running_loop().time() < deadline:
-            result = subprocess.run(
-                [
-                    "tmux",
-                    "list-clients",
-                    "-t",
-                    self.session_name,
-                    "-F",
-                    "#{client_control_mode}",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if "0" in result.stdout.splitlines():
-                return
-            await asyncio.sleep(0.03)
-        self.fail("ordinary tmux client did not attach")
-
     def _assert_ordinary_client_remains_attached(self):
-        result = subprocess.run(
-            [
-                "tmux",
-                "list-clients",
-                "-t",
-                self.session_name,
-                "-F",
-                "#{client_control_mode}",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
+        self.tmux.assert_ordinary_client(
+            self.session_name,
+            self.ordinary_client.pid,
         )
-        self.assertIn("0", result.stdout.splitlines())
 
     async def _send_native_paste_syncs(self, value):
         for revision in (1, 2):
@@ -1063,12 +1033,13 @@ class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        rendered = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-J", "-t", self.bridge.pane_id],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
+        rendered = self.tmux.run(
+            "capture-pane",
+            "-p",
+            "-J",
+            "-t",
+            self.bridge.pane_id,
+        )
         self.assertIn("TAINTED-", rendered)
         self.assertIsNone(self.bridge.provenance_state.active)
         self.assertEqual(self.bridge.provenance_state.unavailable.draft, exact)
@@ -1292,29 +1263,9 @@ class GeometryAuthorityTest(unittest.IsolatedAsyncioTestCase):
 
 class IsolatedTmuxGeometryAuthorityIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        if not shutil.which("tmux"):
-            self.skipTest("tmux is required")
-        self.temp_dir = tempfile.TemporaryDirectory(prefix="mt-geometry-")
-        self.socket_fd = os.open(self.temp_dir.name, os.O_RDONLY)
-        fd_root = "/proc/self/fd" if Path("/proc/self/fd").is_dir() else "/dev/fd"
-        self.socket_path = f"{fd_root}/{self.socket_fd}/socket"
-        self.original_popen = subprocess.Popen
-        self.environment = mock.patch.dict(os.environ)
-        self.environment.start()
-        os.environ.pop("TMUX", None)
-
-        def isolated_popen(args, *popen_args, **kwargs):
-            if isinstance(args, (list, tuple)) and args and args[0] == "tmux":
-                args = ["tmux", "-S", self.socket_path, *args[1:]]
-                pass_fds = set(kwargs.pop("pass_fds", ()))
-                pass_fds.add(self.socket_fd)
-                kwargs["pass_fds"] = tuple(pass_fds)
-            return self.original_popen(args, *popen_args, **kwargs)
-
-        self.popen_patch = mock.patch("server.subprocess.Popen", side_effect=isolated_popen)
-        self.popen_patch.start()
+        self.tmux = TmuxHarness(self, prefix="mtg-")
         self.session_name = f"mt-geometry-{uuid.uuid4().hex[:8]}"
-        self.run_tmux(
+        self.tmux.run(
             "new-session",
             "-d",
             "-x",
@@ -1324,116 +1275,55 @@ class IsolatedTmuxGeometryAuthorityIntegrationTest(unittest.IsolatedAsyncioTestC
             "-s",
             self.session_name,
         )
+        self.tmux.run("set-option", "-t", self.session_name, "status", "off")
         self.run_tmux("new-window", "-d", "-t", f"{self.session_name}:", "-n", "other")
         self.connection = RecordingConnection()
-        self.bridge = TmuxBridge(
-            self.connection,
-            self.session_name,
-            "/bin/sh",
-            "/",
-            create_if_missing=False,
-            initial_size=(80, 24),
+        self.bridge = self.tmux.register_async_close(
+            TmuxBridge(
+                self.connection,
+                self.session_name,
+                "/bin/sh",
+                "/",
+                create_if_missing=False,
+                initial_size=(80, 24),
+            )
         )
         self.connection.bridge = self.bridge
         await self.bridge.open()
         self.bridge.phase = "forward"
 
-    async def asyncTearDown(self):
-        bridge = getattr(self, "bridge", None)
-        if bridge is not None:
-            await bridge.close()
-        desktop_process = getattr(self, "desktop_process", None)
-        if desktop_process is not None and desktop_process.poll() is None:
-            desktop_process.terminate()
-            try:
-                await asyncio.wait_for(asyncio.to_thread(desktop_process.wait), timeout=1)
-            except asyncio.TimeoutError:
-                desktop_process.kill()
-                await asyncio.to_thread(desktop_process.wait)
-        desktop_master_fd = getattr(self, "desktop_master_fd", None)
-        if desktop_master_fd is not None:
-            os.close(desktop_master_fd)
-        if hasattr(self, "socket_path"):
-            self.run_tmux("kill-server", check=False)
-        if hasattr(self, "popen_patch"):
-            self.popen_patch.stop()
-        if hasattr(self, "environment"):
-            self.environment.stop()
-        if hasattr(self, "socket_fd"):
-            os.close(self.socket_fd)
-        if hasattr(self, "temp_dir"):
-            self.temp_dir.cleanup()
-
     def run_tmux(self, *args, check=True):
-        process = self.original_popen(
-            ["tmux", "-S", self.socket_path, *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=os.environ,
-            pass_fds=(self.socket_fd,),
-        )
-        stdout, stderr = process.communicate(timeout=5)
-        if check and process.returncode != 0:
-            raise subprocess.CalledProcessError(process.returncode, args, stdout, stderr)
-        return stdout.rstrip("\n")
+        return self.tmux.run(*args, check=check)
 
     async def attach_desktop(self, cols, rows):
-        master_fd, slave_fd = os.openpty()
-        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-        self.desktop_master_fd = master_fd
-        try:
-            self.desktop_process = self.original_popen(
-                ["tmux", "-S", self.socket_path, "attach-session", "-t", self.session_name],
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                env=os.environ,
-                pass_fds=(self.socket_fd,),
-                start_new_session=True,
-            )
-        finally:
-            os.close(slave_fd)
-
-        deadline = asyncio.get_running_loop().time() + 3
-        while asyncio.get_running_loop().time() < deadline:
-            clients = self.run_tmux(
-                "list-clients",
-                "-t",
+        self.desktop_process, self.desktop_master_fd = (
+            await self.tmux.attach_ordinary_client(
                 self.session_name,
-                "-F",
-                "#{client_name}\t#{client_control_mode}",
+                cols,
+                rows,
             )
-            for client in clients.splitlines():
-                name, control = client.split("\t")
-                if control == "0":
-                    self.desktop_client = name
-                    return
-            await asyncio.sleep(0.03)
-        self.fail("ordinary tmux client did not attach")
+        )
 
     def set_desktop_size(self, cols, rows):
-        fcntl.ioctl(
+        self.tmux.set_pty_size(
             self.desktop_master_fd,
-            termios.TIOCSWINSZ,
-            struct.pack("HHHH", rows, cols, 0, 0),
+            self.desktop_process,
+            cols,
+            rows,
         )
-        os.kill(self.desktop_process.pid, signal.SIGWINCH)
 
     async def wait_for_window_size(self, expected):
-        deadline = asyncio.get_running_loop().time() + 3
-        while asyncio.get_running_loop().time() < deadline:
-            actual = self.run_tmux(
+        await self.tmux.wait_for(
+            lambda: self.run_tmux(
                 "display-message",
                 "-p",
                 "-t",
                 self.bridge.pane_id,
                 "#{window_width}x#{window_height}",
-            )
-            if actual == expected:
-                return
-            await asyncio.sleep(0.03)
-        self.fail(f"tmux window remained {actual}, expected {expected}")
+            ),
+            expected,
+            description="tmux window size",
+        )
 
     async def test_ordinary_desktop_and_mobile_transfer_authority_repeatedly(self):
         initial_epoch = self.bridge.epoch_state["epoch"]
@@ -1794,7 +1684,7 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
 
         bridge.read_loop = read_forever
         with (
-            mock.patch("server.subprocess.Popen", return_value=process),
+            mock.patch("server.open_tmux_control_client", return_value=process),
             mock.patch("server.os.set_blocking"),
             mock.patch("server.pane_metadata", side_effect=RuntimeError("open failed")),
         ):

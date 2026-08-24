@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import contextlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -154,12 +156,23 @@ class StubPasskeys:
 
 
 class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="mt-proxy-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.test_root = Path(self.temporary.name).resolve()
+        self.state_dir = self.test_root / "state"
+        self.static_root = self.test_root / "static"
+        self.node_modules_root = self.test_root / "node_modules"
+        self.static_root.mkdir()
+        self.node_modules_root.mkdir()
+
     async def receive_json(self, connection):
         message = await connection.recv()
         self.assertIsInstance(message, str)
         return json.loads(message)
 
-    def passkey_proxy(self, passkeys, authenticate=None, state_dir=Path("state")):
+    def passkey_proxy(self, passkeys, authenticate=None, state_dir=None):
+        state_dir = self.state_dir if state_dir is None else Path(state_dir).resolve()
         profile = ProfileConfig(
             id="powerhouse",
             label="Powerhouse",
@@ -167,7 +180,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
             backend="ws://127.0.0.1:8090",
         )
         config = ProxyConfig(
-            path=Path("config.json"),
+            path=self.test_root / "config.json",
             host="127.0.0.1",
             port=8085,
             state_dir=state_dir,
@@ -188,8 +201,8 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
         )
         proxy = ProxyServer(
             config,
-            static_root=Path("static"),
-            node_modules_root=Path("node_modules"),
+            static_root=self.static_root,
+            node_modules_root=self.node_modules_root,
             render_icon=lambda _label, _size: b"",
             authenticate=authenticate,
             passkeys=passkeys,
@@ -238,6 +251,30 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proxy.passkeys.store_filename, "passkeys.json")
         self.assertEqual(proxy.passkeys.rp_id, "example.ts.net")
         self.assertEqual(proxy.passkeys.expected_origin, "https://terminal.example.ts.net")
+
+    def test_default_state_root_is_absolute_and_ignores_repo_sentinel(self):
+        repository = self.test_root / "repository"
+        sentinel = repository / "state" / "sentinel"
+        sentinel.parent.mkdir(parents=True)
+        sentinel.write_text("untouched")
+        _private_key, public_key, _signature = device_key_pair_and_signature(b"test")
+
+        with contextlib.chdir(repository):
+            proxy, _profile = self.passkey_proxy(StubPasskeys())
+            self.assertTrue(proxy.config.state_dir.is_absolute())
+            self.assertTrue(
+                proxy.device_keys.register(
+                    "mine",
+                    "device-id",
+                    public_key,
+                    "ben",
+                    "test",
+                )
+            )
+
+        self.assertEqual(sentinel.read_text(), "untouched")
+        self.assertEqual(list(sentinel.parent.iterdir()), [sentinel])
+        self.assertTrue((self.state_dir / "realms" / "mine" / "device-keys.json").is_file())
 
     async def test_passkey_authentication_precedes_token_bootstrap(self):
         passkeys = StubPasskeys([{"credentialId": "credential", "principal": "ben"}])
@@ -837,10 +874,10 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                 backend=f"ws://127.0.0.1:{backend_port}",
             )
             config = ProxyConfig(
-                path=Path("config.json"),
+                path=self.test_root / "rotation-config.json",
                 host="127.0.0.1",
                 port=8085,
-                state_dir=Path("state"),
+                state_dir=self.test_root / "rotation-state",
                 label="ps",
                 auth_realms={
                     "mine": AuthRealmConfig(
@@ -883,10 +920,10 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
             backend="ws://127.0.0.1:8090",
         )
         config = ProxyConfig(
-            path=Path("config.json"),
+            path=self.test_root / "config.json",
             host="127.0.0.1",
             port=8085,
-            state_dir=Path("state"),
+            state_dir=self.test_root / "identity-state",
             label="ps",
             auth_realms={
                 "mine": AuthRealmConfig(id="mine", trust_identity=True, principal="ben")
@@ -897,8 +934,8 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
         )
         proxy = ProxyServer(
             config,
-            static_root=Path("static"),
-            node_modules_root=Path("node_modules"),
+            static_root=self.static_root,
+            node_modules_root=self.node_modules_root,
             render_icon=lambda _label, _size: b"",
         )
         connection = SimpleNamespace(

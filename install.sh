@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$ROOT_DIR/mobile-terminal.env"
@@ -16,12 +17,18 @@ NO_TOKEN_VALUE=""
 ALLOW_CLIENTS_VALUE=""
 SERVICE_MODE="auto"
 PROVIDER_HOOKS_MODE="auto"
+AUTH_MIGRATION="passkey-bootstrap-v1"
+MIGRATE_TOKEN_AUTH=0
+APPLY=0
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [options]
+Usage: ./install.sh --apply [options]
+
+Installation is non-mutating unless --apply is provided.
 
 Options:
+  --apply                    Confirm dependency, config, hook, and service changes
   --port <port>              Default port for generated mobile-terminal.env
   --session <name>           Default tmux session name
   --cwd <path>               Default working directory for new tmux sessions
@@ -34,12 +41,18 @@ Options:
                              Choose how to install the long-running service
   --provider-hooks auto|off|required
                              Install provider lifecycle hooks (default: auto)
+  --migrate-token-auth       Rotate an existing token-mode env to a generated
+                             bootstrap token and record readiness (value hidden)
   --help                     Show this help
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --apply)
+      APPLY=1
+      shift
+      ;;
     --port)
       PORT="$2"
       shift 2
@@ -85,6 +98,10 @@ while [[ $# -gt 0 ]]; do
       PROVIDER_HOOKS_MODE="$2"
       shift 2
       ;;
+    --migrate-token-auth)
+      MIGRATE_TOKEN_AUTH=1
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -107,6 +124,11 @@ case "$PROVIDER_HOOKS_MODE" in
     ;;
 esac
 
+if [[ "$APPLY" != 1 ]]; then
+  echo "Refusing installation without --apply; no changes made" >&2
+  exit 2
+fi
+
 log() {
   printf '[install] %s\n' "$*"
 }
@@ -125,6 +147,46 @@ run_privileged() {
 
 shell_quote() {
   printf '%q' "$1"
+}
+
+env_file_value() {
+  local value=$1
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "Environment values cannot contain newlines" >&2
+    return 1
+  fi
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//\$/\\\$}
+  value=${value//\`/\\\`}
+  printf '"%s"' "$value"
+}
+
+write_env_entry() {
+  local key=$1 value=$2
+  printf '%s=' "$key"
+  env_file_value "$value"
+  printf '\n'
+}
+
+existing_auth_migration_ready() {
+  grep -Eiq '^[[:space:]]*MOBILE_TERMINAL_AUTH_MIGRATION[[:space:]]*=[[:space:]]*("passkey-bootstrap-v1"|'"'"'passkey-bootstrap-v1'"'"'|passkey-bootstrap-v1)[[:space:]]*$' "$ENV_FILE"
+}
+
+existing_no_token_mode() {
+  grep -Eiq '^[[:space:]]*MOBILE_TERMINAL_NO_TOKEN[[:space:]]*=[[:space:]]*("(1|true|yes)"|'"'"'(1|true|yes)'"'"'|(1|true|yes))[[:space:]]*$' "$ENV_FILE"
+}
+
+preflight_existing_auth_migration() {
+  if [[ ! -f "$ENV_FILE" ]] || existing_no_token_mode || existing_auth_migration_ready; then
+    return 0
+  fi
+  if [[ "$MIGRATE_TOKEN_AUTH" == 1 ]]; then
+    return 0
+  fi
+  echo "Existing token-mode env is not marked ready for bootstrap-only authentication." >&2
+  echo "Re-run with --apply --migrate-token-auth to replace it without parsing or printing the old token." >&2
+  exit 1
 }
 
 detect_linux_package_manager() {
@@ -272,11 +334,11 @@ install_provider_hooks() {
       ;;
     required)
       log "Installing provider lifecycle hooks"
-      "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/install_provider_hooks.py"
+      "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/install_provider_hooks.py" --apply
       ;;
     auto)
       log "Installing provider lifecycle hooks"
-      if "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/install_provider_hooks.py"; then
+      if "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/install_provider_hooks.py" --apply; then
         log "Provider lifecycle hooks installed"
       else
         log "Provider lifecycle hook installation failed; continuing (--provider-hooks auto)"
@@ -286,31 +348,110 @@ install_provider_hooks() {
 }
 
 write_env_file() {
+  local action generated_token=""
   if [[ -f "$ENV_FILE" ]]; then
     chmod 600 "$ENV_FILE"
-    log "Keeping existing $ENV_FILE (mode 0600)"
+    if existing_no_token_mode; then
+      if existing_auth_migration_ready; then
+        log "Keeping existing $ENV_FILE (mode 0600)"
+        return 0
+      fi
+      action="mark"
+    elif [[ "$MIGRATE_TOKEN_AUTH" == 1 ]]; then
+      action="rotate"
+    else
+      log "Keeping existing $ENV_FILE (mode 0600)"
+      return 0
+    fi
+
+    action="$("${ROOT_DIR}/.venv/bin/python" - "$ENV_FILE" "$action" "$AUTH_MIGRATION" <<'PY'
+import os
+import secrets
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+action = sys.argv[2]
+auth_migration = sys.argv[3]
+auth_key = "MOBILE_TERMINAL_AUTH_MIGRATION"
+token_key = "MOBILE_TERMINAL_TOKEN"
+
+
+def encode(value):
+    escaped = "".join(f"\\{character}" if character in '\\\"$`' else character for character in value)
+    return f'"{escaped}"'
+
+
+updated = []
+with path.open(encoding="utf-8") as stream:
+    for line in stream:
+        stripped = line.rstrip("\n")
+        key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
+        if key == auth_key or (action == "rotate" and key == token_key):
+            continue
+        updated.append(stripped)
+if action == "rotate":
+    updated.append(f"{token_key}={encode(secrets.token_urlsafe(32))}")
+updated.append(f"{auth_key}={encode(auth_migration)}")
+
+fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(updated) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+print(action)
+PY
+)"
+    if [[ "$action" == "rotate" ]]; then
+      log "Rotated the bootstrap token and recorded auth readiness (value hidden)"
+    else
+      log "Recorded no-token auth readiness in the existing env file"
+    fi
     return 0
   fi
 
   log "Creating $ENV_FILE"
   {
     echo "# Generated by install.sh"
-    echo "MOBILE_TERMINAL_PORT=$PORT"
-    echo "MOBILE_TERMINAL_SESSION=$SESSION"
-    echo "MOBILE_TERMINAL_CWD=$CWD_VALUE"
-    echo "MOBILE_TERMINAL_SHELL=$SHELL_VALUE"
+    write_env_entry MOBILE_TERMINAL_PORT "$PORT"
+    write_env_entry MOBILE_TERMINAL_SESSION "$SESSION"
+    write_env_entry MOBILE_TERMINAL_CWD "$CWD_VALUE"
+    write_env_entry MOBILE_TERMINAL_SHELL "$SHELL_VALUE"
     if [[ -n "$HOST_VALUE" ]]; then
-      echo "MOBILE_TERMINAL_HOST=$HOST_VALUE"
+      write_env_entry MOBILE_TERMINAL_HOST "$HOST_VALUE"
     fi
     if [[ -n "$TAILSCALE_VALUE" ]]; then
-      echo "MOBILE_TERMINAL_TAILSCALE=$TAILSCALE_VALUE"
+      write_env_entry MOBILE_TERMINAL_TAILSCALE "$TAILSCALE_VALUE"
     fi
     if [[ -n "$NO_TOKEN_VALUE" ]]; then
-      echo "MOBILE_TERMINAL_NO_TOKEN=$NO_TOKEN_VALUE"
+      write_env_entry MOBILE_TERMINAL_NO_TOKEN "$NO_TOKEN_VALUE"
+    else
+      generated_token="$("${ROOT_DIR}/.venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(32))')"
+      write_env_entry MOBILE_TERMINAL_TOKEN "$generated_token"
     fi
     if [[ -n "$ALLOW_CLIENTS_VALUE" ]]; then
-      echo "MOBILE_TERMINAL_ALLOW_CLIENTS=$ALLOW_CLIENTS_VALUE"
+      write_env_entry MOBILE_TERMINAL_ALLOW_CLIENTS "$ALLOW_CLIENTS_VALUE"
     fi
+    write_env_entry MOBILE_TERMINAL_AUTH_MIGRATION "$AUTH_MIGRATION"
   } >"$ENV_FILE"
   chmod 600 "$ENV_FILE"
 }
@@ -323,11 +464,11 @@ install_systemd_service() {
   local user_dir service_path python_path workdir env_path
   user_dir="${HOME}/.config/systemd/user"
   service_path="${user_dir}/mobile-terminal.service"
-  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
-    python_path="${ROOT_DIR}/.venv/bin/python"
-  else
-    python_path="$(command -v python3)"
-  fi
+  python_path="${ROOT_DIR}/.venv/bin/python"
+  [[ -x "$python_path" ]] || {
+    echo "Required repository interpreter is missing: $python_path" >&2
+    exit 1
+  }
   workdir="$ROOT_DIR"
   env_path="$ENV_FILE"
 
@@ -350,11 +491,11 @@ install_launchd_service() {
   plist_path="${launch_agents_dir}/com.mobile-terminal.server.plist"
   wrapper_path="${ROOT_DIR}/mobile-terminal-launchd.sh"
   log_dir="${HOME}/Library/Logs/mobile-terminal"
-  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
-    python_path="${ROOT_DIR}/.venv/bin/python"
-  else
-    python_path="$(command -v python3)"
-  fi
+  python_path="${ROOT_DIR}/.venv/bin/python"
+  [[ -x "$python_path" ]] || {
+    echo "Required repository interpreter is missing: $python_path" >&2
+    exit 1
+  }
   uid_value="$(id -u)"
   root_quoted="$(shell_quote "$ROOT_DIR")"
   env_quoted="$(shell_quote "$ENV_FILE")"
@@ -428,6 +569,7 @@ install_service() {
 }
 
 main() {
+  preflight_existing_auth_migration
   ensure_runtime_dependencies
   ensure_node_modules
   ensure_python_env

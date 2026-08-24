@@ -28,13 +28,12 @@ MOBILE_TERMINAL_CONFIG=/absolute/path/to/docs/ps-proxy.example.json
 MOBILE_TERMINAL_TOKEN=<external-login-token>
 MOBILE_TERMINAL_INTERNAL_TOKEN=<legacy-shared-default-token>
 MOBILE_TERMINAL_INTERNAL_TOKEN_POWERHOUSE=<powerhouse-only-random-internal-token>
-MOBILE_TERMINAL_INTERNAL_TOKEN_BEHUMAN=<behuman-only-random-internal-token>
 ```
 
 `docs/ps-proxy.example.json` intentionally leaves Behuman as a down/stub profile. It stays
-visible in the dropdown and can be selected without dropping the browser connection. Add
-its loopback backend URL after a Mobile Terminal backend is running as the `behuman` OS
-user.
+visible in the dropdown and can be selected without dropping the browser connection. This
+repository does not define or manage a Behuman backend target or service. Establish and review
+that separate OS-user boundary before adding a loopback backend URL and distinct internal token.
 
 Relative `stateDir` values resolve from the directory containing the JSON config. The proxy
 stores global UI settings in `stateDir/settings.json`; open terminal tabs and the active
@@ -45,8 +44,9 @@ The root `internalToken` / `internalTokenEnv` remains the shared default for com
 Set `internalToken` or `internalTokenEnv` on each profile to isolate backend hops; explicit
 overrides must differ from the root token and from every other profile override. Each backend's
 standard `MOBILE_TERMINAL_INTERNAL_TOKEN` must equal only its profile's effective token. The
-example uses distinct environment variables even for the down Behuman stub so enabling it later
-does not silently reuse Powerhouse's credential. Tokens can be supplied directly, but environment
+example uses a distinct environment variable for the managed Powerhouse backend. If the Behuman
+stub is replaced later, its backend must use a different variable and credential so it cannot
+silently reuse Powerhouse's token. Tokens can be supplied directly, but environment
 references keep secrets out of JSON. If a JSON file does contain direct tokens, the loader reduces
 its mode to `0600`; environment files must also be owner-only:
 
@@ -54,9 +54,7 @@ its mode to `0600`; environment files must also be owner-only:
 chmod 600 /path/to/proxy-config.json /path/to/proxy.env /path/to/backend.env
 ```
 
-Terminal and tmux child processes do not receive `MOBILE_TERMINAL_INTERNAL_TOKEN`. This applies
-to newly created sessions; restart any sessions that predate this protection if they may have
-inherited the variable.
+Terminal and tmux child processes do not receive access tokens or `MOBILE_TERMINAL_INTERNAL_TOKEN*` values. This applies to newly created sessions; restart any sessions that predate this protection if they may have inherited one.
 
 ## systemd template
 
@@ -65,10 +63,13 @@ inherited the variable.
 `@ENV_DIR@/<user>.env`, forces the backend listener to `127.0.0.1`, and requires a non-empty
 `MOBILE_TERMINAL_INTERNAL_TOKEN` before `server.py` starts:
 
+For a separately reviewed managed backend, instantiate only its exact unit, for example:
+
 ```sh
 systemctl enable --now mobile-terminal@powerhouse.service
-systemctl enable --now mobile-terminal@behuman.service
 ```
+
+This repository does not currently define or manage a Behuman instance.
 
 The proxy may use the existing single-process service template with
 `MOBILE_TERMINAL_CONFIG` set in its environment file. Tailscale Serve should target the

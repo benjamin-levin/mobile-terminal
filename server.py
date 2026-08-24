@@ -205,21 +205,53 @@ def internal_token_environment_names() -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
+def terminal_secret_environment_names() -> tuple[str, ...]:
+    names = set(internal_token_environment_names())
+    names.add("MOBILE_TERMINAL_TOKEN")
+    names.update(name for name in os.environ if name.startswith("MOBILE_TERMINAL_TOKEN_"))
+    return tuple(sorted(names))
+
+
 def terminal_child_environment() -> dict[str, str]:
     env = os.environ.copy()
-    for name in internal_token_environment_names():
+    for name in terminal_secret_environment_names():
         env.pop(name, None)
     return env
 
 
 def terminal_command(command: str) -> str:
-    unset = " ".join(f"-u {shlex.quote(name)}" for name in internal_token_environment_names())
+    unset = " ".join(f"-u {shlex.quote(name)}" for name in terminal_secret_environment_names())
     return f"env {unset} {command}"
+
+
+def tmux_client_options() -> tuple[str, ...]:
+    return ()
+
+
+def tmux_argv(*args: str) -> list[str]:
+    return ["tmux", *tmux_client_options(), *args]
+
+
+def open_tmux_control_client(
+    session_name: str,
+    cwd: str,
+    env: dict[str, str],
+) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        tmux_argv("-C", "attach-session", "-t", session_name),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+        close_fds=True,
+    )
 
 
 def tmux_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["tmux", *args],
+        tmux_argv(*args),
         cwd=ROOT,
         capture_output=True,
         check=check,
@@ -233,7 +265,7 @@ def send_pane_bytes(target: str, data: bytes) -> None:
         return
     buffer_name = f"mobile-terminal-{os.getpid()}-{time.time_ns()}"
     loaded = subprocess.run(
-        ["tmux", "load-buffer", "-b", buffer_name, "-"],
+        tmux_argv("load-buffer", "-b", buffer_name, "-"),
         cwd=ROOT,
         input=data,
         capture_output=True,
@@ -261,6 +293,7 @@ def tailscale_capture(*args: str, check: bool = True) -> subprocess.CompletedPro
         capture_output=True,
         check=check,
         text=True,
+        env=terminal_child_environment(),
     )
 
 
@@ -331,10 +364,10 @@ def request_origin_matches_host(connection: ServerConnection) -> bool:
 
 
 def ensure_session(session_name: str, shell: str, cwd: str) -> None:
-    for name in internal_token_environment_names():
+    for name in terminal_secret_environment_names():
         tmux_capture("set-environment", "-g", "-u", name, check=False)
     has_session = subprocess.run(
-        ["tmux", "has-session", "-t", session_name],
+        tmux_argv("has-session", "-t", session_name),
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -360,7 +393,7 @@ def ensure_session(session_name: str, shell: str, cwd: str) -> None:
 
 def session_exists(session_name: str) -> bool:
     result = subprocess.run(
-        ["tmux", "has-session", "-t", session_name],
+        tmux_argv("has-session", "-t", session_name),
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -2192,6 +2225,7 @@ def ssh_file_payload(host: str, operation: str, remote_path: str, content: Any =
             capture_output=True,
             check=False,
             timeout=SSH_FS_TIMEOUT_SECONDS,
+            env=terminal_child_environment(),
         )
 
     try:
@@ -2498,15 +2532,10 @@ class TmuxBridge:
             env = terminal_child_environment()
             env["TERM"] = "xterm-256color"
             env["COLORTERM"] = "truecolor"
-            self.process = subprocess.Popen(
-                ["tmux", "-C", "attach-session", "-t", self.session_name],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                cwd=self.cwd,
-                env=env,
-                start_new_session=True,
-                close_fds=True,
+            self.process = open_tmux_control_client(
+                self.session_name,
+                self.cwd,
+                env,
             )
             self.provenance_state.owner_pids.add(self.process.pid)
             assert self.process.stdout is not None
@@ -3427,6 +3456,14 @@ class TmuxBridge:
                             except (asyncio.CancelledError, Exception):
                                 pass
                 finally:
+                    if process is not None:
+                        for stream in (
+                            getattr(process, "stdin", None),
+                            getattr(process, "stdout", None),
+                            getattr(process, "stderr", None),
+                        ):
+                            if stream is not None:
+                                stream.close()
                     if owner_pid is not None:
                         self.provenance_state.owner_pids.discard(owner_pid)
 
@@ -5735,7 +5772,7 @@ class AppServer:
                 print(f"users: {', '.join(sorted(self.users))}")
                 print(f"access token: {'per-user' if self.require_token else 'disabled'}")
             elif self.require_token:
-                print(f"access token: {self.token}")
+                print("access token: configured (value hidden)")
             else:
                 print("access token: disabled")
             print("")
@@ -5812,7 +5849,11 @@ def main() -> None:
     if args.no_token and not args.tailscale and not allowed_clients and args.host not in ("127.0.0.1", "::1", "localhost"):
         raise SystemExit("--no-token requires --tailscale, --allow-client, or a loopback-only host")
     require_token = not args.no_token
-    token = (args.token or secrets.token_urlsafe(16)) if require_token else None
+    if require_token and not args.token:
+        raise SystemExit(
+            "MOBILE_TERMINAL_TOKEN must be configured; startup never prints generated secrets"
+        )
+    token = args.token if require_token else None
     internal_token = os.environ.get("MOBILE_TERMINAL_INTERNAL_TOKEN", "").strip() or None
     require_internal_token = os.environ.get("MOBILE_TERMINAL_REQUIRE_INTERNAL_TOKEN", "").lower() in (
         "1",

@@ -4,8 +4,9 @@
   "description": "Mobile-friendly browser terminal that attaches to tmux",
   "main": "server.py",
   "scripts": {
-    "start": "python3 server.py",
-    "check": "python3 -m py_compile server.py"
+    "start": "./run.sh",
+    "test": "scripts/test.sh",
+    "check": "scripts/test.sh --syntax"
   },
   "keywords": [],
   "author": "",

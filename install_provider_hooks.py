@@ -210,7 +210,10 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--claude-version")
     parser.add_argument("--codex-version")
+    parser.add_argument("--apply", action="store_true")
     arguments = parser.parse_args()
+    if not arguments.apply:
+        parser.error("refusing hook installation without explicit --apply confirmation")
     install_provider_hooks(
         arguments.home.resolve(),
         arguments.root.resolve(),
