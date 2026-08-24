@@ -43,11 +43,12 @@ tar -czf "$LOCAL_WORK/closure.tar.gz" -C "$ROOT" "${DEPLOY_FILES[@]}" "${DEPLOY_
 cat >"$LOCAL_WORK/remote-deploy.sh" <<'REMOTE'
 set -euo pipefail
 STAMP="$1"
+PAYLOAD_DIR="${2:-$HOME}"
 umask 077
 WORK=$(mktemp -d "/tmp/mt-lat-deploy.XXXXXX")
-trap 'rm -rf -- "$WORK" "$HOME/.mt-lat-closure.tar.gz" "$HOME/.mt-lat-remote-deploy.sh"' EXIT
+trap 'rm -rf -- "$WORK" "$PAYLOAD_DIR/.mt-lat-closure.tar.gz" "$PAYLOAD_DIR/.mt-lat-remote-deploy.sh"' EXIT
 mkdir -p "$WORK/closure"
-tar -xzf "$HOME/.mt-lat-closure.tar.gz" -C "$WORK/closure"
+tar -xzf "$PAYLOAD_DIR/.mt-lat-closure.tar.gz" -C "$WORK/closure"
 
 deploy_user() {
   local user=$1 port=$2
@@ -143,4 +144,4 @@ REMOTE
 scp -q "$LOCAL_WORK/closure.tar.gz" "$ADMIN_USER@$LAT_HOST:.mt-lat-closure.tar.gz"
 scp -q "$LOCAL_WORK/remote-deploy.sh" "$ADMIN_USER@$LAT_HOST:.mt-lat-remote-deploy.sh"
 echo "Connected to $ADMIN_USER@$LAT_HOST - you will be prompted once for the sudo password."
-ssh -t "$ADMIN_USER@$LAT_HOST" "bash \$HOME/.mt-lat-remote-deploy.sh '$STAMP'"
+ssh -t "$ADMIN_USER@$LAT_HOST" "bash \$HOME/.mt-lat-remote-deploy.sh '$STAMP' \$HOME"
