@@ -2001,6 +2001,17 @@ _PROVIDER_DIAGNOSTICS: OrderedDict[tuple[str, str, str], int] = OrderedDict()
 _PROVIDER_DIAGNOSTIC_TOTAL = 0
 
 
+def _emit_provider_diagnostics(counters: list[dict[str, Any]]) -> None:
+    try:
+        print(
+            "provider authority diagnostics "
+            + json.dumps(counters, separators=(",", ":"), sort_keys=True),
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 def _flush_provider_diagnostics() -> None:
     global _PROVIDER_DIAGNOSTIC_TOTAL
     with _PROVIDER_DIAGNOSTIC_LOCK:
@@ -2017,17 +2028,15 @@ def _flush_provider_diagnostics() -> None:
         ]
         _PROVIDER_DIAGNOSTICS.clear()
         _PROVIDER_DIAGNOSTIC_TOTAL = 0
-    try:
-        print(
-            "provider authority diagnostics "
-            + json.dumps(counters, separators=(",", ":"), sort_keys=True)
-        )
-    except Exception:
-        pass
+    _emit_provider_diagnostics(counters)
 
 
 def _record_provider_diagnostic(mode: str, decision: str, reason: str) -> None:
     global _PROVIDER_DIAGNOSTIC_TOTAL
+    if mode not in ("off", "shadow", "enforce"):
+        mode = "invalid"
+    if decision not in ("matched", "unowned", "fallback", "rejected"):
+        decision = "invalid"
     if not re.fullmatch(r"[a-z0-9-]{1,64}", reason):
         reason = "invalid-reason"
     key = (mode, decision, reason)
@@ -2041,6 +2050,10 @@ def _record_provider_diagnostic(mode: str, decision: str, reason: str) -> None:
         _PROVIDER_DIAGNOSTICS[key] = _PROVIDER_DIAGNOSTICS.get(key, 0) + 1
         _PROVIDER_DIAGNOSTIC_TOTAL += 1
         flush = _PROVIDER_DIAGNOSTIC_TOTAL >= PROVIDER_DIAGNOSTIC_FLUSH_EVERY
+    if decision == "rejected":
+        _emit_provider_diagnostics(
+            [{"mode": mode, "decision": decision, "reason": reason, "count": 1}]
+        )
     if flush:
         _flush_provider_diagnostics()
 

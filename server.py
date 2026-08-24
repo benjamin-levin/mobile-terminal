@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import atexit
 import base64
 import datetime
 import gzip
@@ -15,6 +16,7 @@ import secrets
 import signal
 import shlex
 import subprocess
+import threading
 import time
 import unicodedata
 from collections import deque
@@ -448,6 +450,97 @@ def current_path(session_name: str, fallback: str) -> str:
 CONNECT_HISTORY_LINES = 2000
 MAX_HISTORY_SEED_LINES = 20000
 TMUX_INPUT_CHUNK_BYTES = 1024
+AUTHORITATIVE_SELECTION_DIAGNOSTIC_FLUSH_EVERY = 128
+AUTHORITATIVE_SELECTION_REJECTION_REASONS = frozenset(
+    {
+        "payload-parse",
+        "payload-identity",
+        "revision-phase",
+        "provenance-unavailable",
+        "client-selection-check",
+        "output-changed",
+        "snapshot-capture",
+        "geometry-buffer-base-mismatch",
+        "stability-recheck",
+        "provider-tmux-exception",
+        "verification-changed",
+        "invalid-reason",
+    }
+)
+MAX_AUTHORITATIVE_SELECTION_REJECTION_REASONS = len(
+    AUTHORITATIVE_SELECTION_REJECTION_REASONS
+)
+_AUTHORITATIVE_SELECTION_DIAGNOSTIC_LOCK = threading.Lock()
+_AUTHORITATIVE_SELECTION_DIAGNOSTICS: dict[str, int] = {}
+_AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN: set[str] = set()
+_AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL = 0
+
+
+def _emit_authoritative_selection_diagnostics(counters: list[dict[str, Any]]) -> None:
+    try:
+        print(
+            "authoritative selection diagnostics "
+            + json.dumps(counters, separators=(",", ":"), sort_keys=True),
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def _flush_authoritative_selection_diagnostics() -> None:
+    global _AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL
+    with _AUTHORITATIVE_SELECTION_DIAGNOSTIC_LOCK:
+        if not _AUTHORITATIVE_SELECTION_DIAGNOSTICS:
+            return
+        counters = [
+            {
+                "mode": "authoritative-selection",
+                "decision": "rejected",
+                "reason": reason,
+                "count": count,
+            }
+            for reason, count in _AUTHORITATIVE_SELECTION_DIAGNOSTICS.items()
+        ]
+        _AUTHORITATIVE_SELECTION_DIAGNOSTICS.clear()
+        _AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL = 0
+    _emit_authoritative_selection_diagnostics(counters)
+
+
+def _record_authoritative_selection_rejection(reason: str) -> None:
+    global _AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL
+    if reason not in AUTHORITATIVE_SELECTION_REJECTION_REASONS:
+        reason = "invalid-reason"
+    immediate = False
+    flush = False
+    with _AUTHORITATIVE_SELECTION_DIAGNOSTIC_LOCK:
+        if reason not in _AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN:
+            _AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN.add(reason)
+            immediate = True
+        else:
+            _AUTHORITATIVE_SELECTION_DIAGNOSTICS[reason] = (
+                _AUTHORITATIVE_SELECTION_DIAGNOSTICS.get(reason, 0) + 1
+            )
+            _AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL += 1
+            flush = (
+                _AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL
+                >= AUTHORITATIVE_SELECTION_DIAGNOSTIC_FLUSH_EVERY
+            )
+    if immediate:
+        _emit_authoritative_selection_diagnostics(
+            [
+                {
+                    "mode": "authoritative-selection",
+                    "decision": "rejected",
+                    "reason": reason,
+                    "count": 1,
+                }
+            ]
+        )
+    elif flush:
+        _flush_authoritative_selection_diagnostics()
+
+
+atexit.register(_flush_authoritative_selection_diagnostics)
 
 
 @dataclass(frozen=True)
@@ -3273,6 +3366,11 @@ class TmuxBridge:
     async def authoritative_selection(self, payload: dict[str, Any]) -> tuple[str | None, str | None]:
         request_id = str(payload.get("requestId", ""))
         stale_message = "Terminal changed; select again."
+
+        def reject(reason: str) -> tuple[None, str]:
+            _record_authoritative_selection_rejection(reason)
+            return None, stale_message
+
         try:
             epoch = int(payload.get("epoch", -1))
             revision = int(payload.get("revision", -1))
@@ -3286,7 +3384,7 @@ class TmuxBridge:
             start_x, start_y = int(start["x"]), int(start["y"])
             end_x, end_y = int(end["x"]), int(end["y"])
         except (KeyError, TypeError, ValueError):
-            return None, stale_message
+            return reject("payload-parse")
         if (
             payload.get("session") != self.session_name
             or payload.get("profile", "") != self.profile_id
@@ -3295,7 +3393,7 @@ class TmuxBridge:
             or cutoff != self.cutoff
             or layout_generation != self.epoch_state["layout"]
         ):
-            return None, stale_message
+            return reject("payload-identity")
 
         await self.settle_active_provenance_fence()
         async with self.seed_lock:
@@ -3308,7 +3406,7 @@ class TmuxBridge:
                         or cutoff != self.cutoff
                         or layout_generation != self.epoch_state["layout"]
                     ):
-                        return None, stale_message
+                        return reject("revision-phase")
                     unavailable = self.provenance_state.unavailable
                     if (
                         unavailable is not None
@@ -3317,7 +3415,7 @@ class TmuxBridge:
                         and unavailable.layout_generation
                         == self.provenance_state.layout_generation
                     ):
-                        return None, stale_message
+                        return reject("provenance-unavailable")
                     self.phase = "hold"
                     self.held = []
                     stable_offset = self.offset
@@ -3327,31 +3425,35 @@ class TmuxBridge:
                     ack_payload: dict[str, Any] = {}
                     self.selection_acks[request_id] = (event, ack_payload)
                     await self._send_json({"type": "selection-check", "requestId": request_id})
+                exception_reason = "client-selection-check"
                 try:
                     await asyncio.wait_for(event.wait(), timeout=5)
                     if ack_payload.get("unchanged") is not True:
-                        return None, stale_message
+                        return reject("client-selection-check")
+                    exception_reason = "provider-tmux-exception"
                     self.last_output_at = time.monotonic()
                     await self.quiet(0.1)
                     if self.offset != stable_offset:
-                        return None, stale_message
+                        return reject("output-changed")
+                    exception_reason = "snapshot-capture"
                     snapshot = await asyncio.to_thread(
                         capture_pane_snapshot,
                         self.session_name,
                         self.pane_id,
                         max(base_y, self.seed_history, CONNECT_HISTORY_LINES),
                     )
+                    exception_reason = "provider-tmux-exception"
                     self.last_output_at = time.monotonic()
                     await self.quiet(0.05)
                     if self.offset != stable_offset:
-                        return None, stale_message
+                        return reject("output-changed")
                     if snapshot.cols != client_cols or snapshot.rows != client_rows:
-                        return None, stale_message
+                        return reject("geometry-buffer-base-mismatch")
                     if snapshot.alternate != (payload.get("bufferType") == "alternate"):
-                        return None, stale_message
+                        return reject("geometry-buffer-base-mismatch")
                     expected_base = 0 if snapshot.alternate else snapshot.seed_history
                     if base_y != expected_base:
-                        return None, stale_message
+                        return reject("geometry-buffer-base-mismatch")
                     relative_start_row = start_y - base_y
                     relative_end_row = end_y - base_y
                     identity = self.provenance_state.row_tracker.observe(snapshot, stable_offset)
@@ -3366,7 +3468,7 @@ class TmuxBridge:
                         or self.session_name != payload.get("session")
                         or self.pane_id != snapshot.pane_id
                     ):
-                        return None, stale_message
+                        return reject("stability-recheck")
                     matched, exact_text = exact_provenance_selection(
                         snapshot,
                         self.session_name,
@@ -3388,12 +3490,14 @@ class TmuxBridge:
                         end_x,
                         relative_end_row,
                     )
+                    exception_reason = "snapshot-capture"
                     verification_snapshot = await asyncio.to_thread(
                         capture_pane_snapshot,
                         self.session_name,
                         self.pane_id,
                         max(base_y, self.seed_history, CONNECT_HISTORY_LINES),
                     )
+                    exception_reason = "provider-tmux-exception"
                     if (
                         verification_snapshot != snapshot
                         or self.offset != stable_offset
@@ -3402,7 +3506,7 @@ class TmuxBridge:
                         or self.session_name != payload.get("session")
                         or self.pane_id != snapshot.pane_id
                     ):
-                        return None, stale_message
+                        return reject("verification-changed")
                     if provider.owned:
                         return provider.text or "", None
                     selected_text = extract_authoritative_selection(
@@ -3414,7 +3518,7 @@ class TmuxBridge:
                     )
                     return selected_text, None
                 except (RuntimeError, ValueError, asyncio.TimeoutError):
-                    return None, stale_message
+                    return reject(exception_reason)
                 finally:
                     self.selection_acks.pop(request_id, None)
                     await self._flush_selection_hold()

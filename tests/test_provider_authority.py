@@ -1159,7 +1159,7 @@ class RuntimeBindingCacheTest(unittest.TestCase):
             ), patch.dict(os.environ, {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "shadow"}):
                 self.assertFalse(provider_selection(snapshot, 0, 0, 0, 0, home=home).owned)
 
-    def test_provider_diagnostics_are_bounded_aggregate_reason_codes(self):
+    def test_provider_rejection_is_immediate_before_aggregate_threshold(self):
         with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
             saved = provider_authority_module._PROVIDER_DIAGNOSTICS.copy()
             saved_total = provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL
@@ -1167,22 +1167,59 @@ class RuntimeBindingCacheTest(unittest.TestCase):
             provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = 0
         try:
             provider_authority_module._record_provider_diagnostic(
-                "shadow",
-                "fallback",
-                "secret/path?credential=value",
-            )
-            for index in range(MAX_TRANSCRIPT_INDEXES * 3):
-                provider_authority_module._record_provider_diagnostic(
-                    "enforce",
-                    "rejected",
-                    f"reason-{index}",
-                )
-            self.assertLessEqual(
-                len(provider_authority_module._PROVIDER_DIAGNOSTICS),
-                provider_authority_module.MAX_PROVIDER_DIAGNOSTIC_REASONS,
+                "shadow", "matched", "canonical-match"
             )
             with patch("builtins.print") as output:
+                provider_authority_module._record_provider_diagnostic(
+                    "enforce", "rejected", "binding-cache-stale"
+                )
+            self.assertEqual(provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL, 2)
+            output.assert_called_once()
+            self.assertTrue(output.call_args.kwargs["flush"])
+            diagnostic = output.call_args.args[0]
+            counters = json.loads(diagnostic.removeprefix("provider authority diagnostics "))
+            self.assertEqual(
+                counters,
+                [
+                    {
+                        "count": 1,
+                        "decision": "rejected",
+                        "mode": "enforce",
+                        "reason": "binding-cache-stale",
+                    }
+                ],
+            )
+        finally:
+            with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
+                provider_authority_module._PROVIDER_DIAGNOSTICS.clear()
+                provider_authority_module._PROVIDER_DIAGNOSTICS.update(saved)
+                provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = saved_total
+
+    def test_provider_diagnostics_are_bounded_aggregate_reason_codes(self):
+        with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
+            saved = provider_authority_module._PROVIDER_DIAGNOSTICS.copy()
+            saved_total = provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL
+            provider_authority_module._PROVIDER_DIAGNOSTICS.clear()
+            provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = 0
+        try:
+            with patch("builtins.print") as output:
+                provider_authority_module._record_provider_diagnostic(
+                    "shadow",
+                    "fallback",
+                    "secret/path?credential=value",
+                )
+                for index in range(MAX_TRANSCRIPT_INDEXES * 3):
+                    provider_authority_module._record_provider_diagnostic(
+                        "enforce",
+                        "rejected",
+                        f"reason-{index}",
+                    )
+                self.assertLessEqual(
+                    len(provider_authority_module._PROVIDER_DIAGNOSTICS),
+                    provider_authority_module.MAX_PROVIDER_DIAGNOSTIC_REASONS,
+                )
                 provider_authority_module._flush_provider_diagnostics()
+            self.assertTrue(all(call.kwargs["flush"] for call in output.call_args_list))
             diagnostic = output.call_args.args[0]
             self.assertIn("invalid-reason", diagnostic)
             self.assertNotIn("secret", diagnostic)

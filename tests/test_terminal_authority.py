@@ -2588,6 +2588,162 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(text)
         self.assertEqual(error, "Terminal changed; select again.")
 
+    async def test_rejection_stage_is_immediate_sanitized_and_request_safe(self):
+        with server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_LOCK:
+            saved = server._AUTHORITATIVE_SELECTION_DIAGNOSTICS.copy()
+            saved_seen = server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN.copy()
+            saved_total = server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL
+            server._AUTHORITATIVE_SELECTION_DIAGNOSTICS.clear()
+            server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN.clear()
+            server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL = 0
+        try:
+            bridge = TmuxBridge(
+                RecordingConnection(),
+                "session",
+                "/bin/sh",
+                "/",
+                profile_id="profile",
+            )
+            bridge.pane_id = "%1"
+            payload = {
+                "requestId": "sentinel-request-id",
+                "profile": "/sentinel/private/path",
+                "session": "sentinel-secret-session",
+                "paneId": "%999999",
+                "epoch": 0,
+                "revision": 0,
+                "cutoff": 0,
+                "layoutGeneration": 0,
+                "cols": 5,
+                "rows": 1,
+                "baseY": 0,
+                "bufferType": "normal",
+                "selection": {
+                    "start": {"x": 0, "y": 0, "text": "sentinel-selected-text"},
+                    "end": {"x": 1, "y": 0},
+                },
+            }
+            with mock.patch("builtins.print") as output:
+                text, error = await bridge.authoritative_selection(payload)
+
+            self.assertIsNone(text)
+            self.assertEqual(error, "Terminal changed; select again.")
+            output.assert_called_once()
+            self.assertTrue(output.call_args.kwargs["flush"])
+            diagnostic = output.call_args.args[0]
+            counters = json.loads(
+                diagnostic.removeprefix("authoritative selection diagnostics ")
+            )
+            self.assertEqual(
+                counters,
+                [
+                    {
+                        "count": 1,
+                        "decision": "rejected",
+                        "mode": "authoritative-selection",
+                        "reason": "payload-identity",
+                    }
+                ],
+            )
+            for sentinel in (
+                "sentinel-request-id",
+                "/sentinel/private/path",
+                "sentinel-secret-session",
+                "%999999",
+                "sentinel-selected-text",
+            ):
+                self.assertNotIn(sentinel, diagnostic)
+        finally:
+            with server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_LOCK:
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTICS.clear()
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTICS.update(saved)
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN.clear()
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN.update(saved_seen)
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL = saved_total
+
+    async def test_rejection_diagnostics_are_bounded_and_rate_limited(self):
+        with server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_LOCK:
+            saved = server._AUTHORITATIVE_SELECTION_DIAGNOSTICS.copy()
+            saved_seen = server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN.copy()
+            saved_total = server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL
+            server._AUTHORITATIVE_SELECTION_DIAGNOSTICS.clear()
+            server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN.clear()
+            server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL = 0
+        try:
+            with mock.patch("builtins.print") as output:
+                for _ in range(20):
+                    server._record_authoritative_selection_rejection("payload-parse")
+                for index in range(50):
+                    server._record_authoritative_selection_rejection(
+                        f"sentinel-secret-path-id-{index}"
+                    )
+            self.assertEqual(output.call_count, 2)
+            self.assertTrue(all(call.kwargs["flush"] for call in output.call_args_list))
+            self.assertLessEqual(
+                len(server._AUTHORITATIVE_SELECTION_DIAGNOSTICS),
+                server.MAX_AUTHORITATIVE_SELECTION_REJECTION_REASONS,
+            )
+            self.assertLessEqual(
+                len(server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN),
+                server.MAX_AUTHORITATIVE_SELECTION_REJECTION_REASONS,
+            )
+            self.assertEqual(
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTICS,
+                {"payload-parse": 19, "invalid-reason": 49},
+            )
+            diagnostics = "\n".join(call.args[0] for call in output.call_args_list)
+            self.assertNotIn("sentinel", diagnostics)
+            self.assertNotIn("secret", diagnostics)
+            self.assertNotIn("path", diagnostics)
+        finally:
+            with server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_LOCK:
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTICS.clear()
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTICS.update(saved)
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN.clear()
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_SEEN.update(saved_seen)
+                server._AUTHORITATIVE_SELECTION_DIAGNOSTIC_TOTAL = saved_total
+
+    async def test_successful_selection_does_not_emit_rejection_diagnostic(self):
+        connection = RecordingConnection()
+        bridge = TmuxBridge(connection, "session", "/bin/sh", "/")
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.quiet = mock.AsyncMock()
+        pane = snapshot(
+            cols=12,
+            authored_lines=["provider"],
+            plain_physical_rows=["provider    "],
+            rows=1,
+        )
+        payload = {
+            "requestId": "successful-provider",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 12,
+            "rows": 1,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {"start": {"x": 0, "y": 0}, "end": {"x": 8, "y": 0}},
+        }
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch(
+                "server.provider_selection",
+                return_value=mock.Mock(owned=True, text="exact provider source"),
+            ),
+            mock.patch("server._record_authoritative_selection_rejection") as diagnostic,
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertEqual((text, error), ("exact provider source", None))
+        diagnostic.assert_not_called()
+
     async def test_stale_selection_contract_has_one_exact_error(self):
         bridge = TmuxBridge(RecordingConnection(), "session", "/bin/sh", "/", profile_id="profile")
         bridge.pane_id = "%1"
