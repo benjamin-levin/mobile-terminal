@@ -28,6 +28,7 @@ class ResumeReconnectWiringTest(unittest.TestCase):
             'const STORAGE_PASSKEY_AUTH_MODE_KEY = "mobile-terminal.passkey-auth-mode";',
             'const STORAGE_PASSKEY_IDLE_MINUTES_KEY = "mobile-terminal.passkey-idle-minutes";',
             'const STORAGE_PASSKEY_BACKGROUNDED_AT_KEY = "mobile-terminal.passkey-backgrounded-at";',
+            'const STORAGE_PASSKEY_LAST_INTERACTION_AT_KEY = "mobile-terminal.passkey-last-interaction-at";',
             'return scope === "standalone" ? base : `${base}.${encodeURIComponent(scope)}`;',
             'return `realm:${realm}`;',
         ):
@@ -149,7 +150,7 @@ class ResumeReconnectWiringTest(unittest.TestCase):
                 "const authenticationIdleControl = {classList: {toggle: () => {}}};",
                 "const authenticationOverlay = {classList: {add: () => {}}};",
                 "const values = {}; const localStorage = {getItem: () => '', setItem: (key, value) => { values[key] = value; }};",
-                "const seeds = []; const writeBackgroundedAt = (realm) => { seeds.push(realm); return true; };",
+                "const seeds = []; const recordUserInteraction = (realm) => { seeds.push(realm); return true; };",
                 "let applyCount = 0; const applyAuthenticationScope = () => { applyCount += 1; authenticationSettings = draftAuthenticationSettings; };",
                 "let hostSaves = 0; const saveHostSettings = () => { hostSaves += 1; };",
                 "const setPasskeyLocked = () => {}; const reconnectSocket = () => {};",
@@ -183,9 +184,10 @@ class ResumeReconnectWiringTest(unittest.TestCase):
             self.source,
         )
 
+
     def test_passkey_policy_matrix_fails_closed_at_idle_threshold(self):
         parse = re.search(
-            r"  function parseBackgroundedAt\(.*?\n  \}",
+            r"  function parseAuthenticationTimestamp\(.*?\n  \}",
             self.source,
             re.DOTALL,
         )
@@ -206,16 +208,16 @@ class ResumeReconnectWiringTest(unittest.TestCase):
                 "const now = 2000000;",
                 "const threshold = 15 * 60 * 1000;",
                 "const results = {",
-                "  off: passkeyRequiredAfterBackground(off, Number.NaN, true, now),",
-                "  everyInitial: passkeyRequiredAfterBackground(every, 0, true, now),",
-                "  everyNoMarker: passkeyRequiredAfterBackground(every, 0, false, now),",
-                "  everyMarker: passkeyRequiredAfterBackground(every, now - 1, false, now),",
-                "  idleMissing: passkeyRequiredAfterBackground(idle, parseBackgroundedAt(null), false, now),",
-                '  idleMalformed: passkeyRequiredAfterBackground(idle, parseBackgroundedAt("junk"), false, now),',
-                "  idleUnder: passkeyRequiredAfterBackground(idle, now - threshold + 1, false, now),",
-                "  idleExact: passkeyRequiredAfterBackground(idle, now - threshold, false, now),",
-                "  idleOver: passkeyRequiredAfterBackground(idle, now - threshold - 1, false, now),",
-                "  idleFuture: passkeyRequiredAfterBackground(idle, now + 1, false, now),",
+                "  off: passkeyRequiredAfterBackground(off, Number.NaN, Number.NaN, true, now),",
+                "  everyInitial: passkeyRequiredAfterBackground(every, 0, 0, true, now),",
+                "  everyNoMarker: passkeyRequiredAfterBackground(every, 0, now, false, now),",
+                "  everyMarker: passkeyRequiredAfterBackground(every, now - 1, now, false, now),",
+                "  idleMissing: passkeyRequiredAfterBackground(idle, now, parseAuthenticationTimestamp(null), false, now),",
+                '  idleMalformed: passkeyRequiredAfterBackground(idle, now, parseAuthenticationTimestamp("junk"), false, now),',
+                "  idleUnder: passkeyRequiredAfterBackground(idle, now, now - threshold + 1, false, now),",
+                "  idleExact: passkeyRequiredAfterBackground(idle, now, now - threshold, false, now),",
+                "  idleOver: passkeyRequiredAfterBackground(idle, now, now - threshold - 1, false, now),",
+                "  idleFuture: passkeyRequiredAfterBackground(idle, now, now + 1, false, now),",
                 "};",
                 "process.stdout.write(JSON.stringify(results));",
             )
@@ -251,35 +253,29 @@ class ResumeReconnectWiringTest(unittest.TestCase):
         )
         self.assertIn('window.addEventListener("pagehide", recordBackgrounded);', self.source)
 
-    def test_visible_idle_checkpoint_is_guarded_and_does_not_mark_background(self):
-        functions = []
-        for name in ("writeBackgroundedAt", "recordVisibleIdleCheckpoint"):
-            match = re.search(rf"  function {name}\(.*?\n  \}}", self.source, re.DOTALL)
-            self.assertIsNotNone(match)
-            functions.append(match.group(0))
+
+    def test_real_interaction_is_realm_scoped_and_persisted_without_a_timer(self):
+        match = re.search(
+            r"  function recordUserInteraction\(.*?\n  \}",
+            self.source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
         script = "\n".join(
             (
-                "let loginRealm = 'alpha'; let resumeHandlingReady = true; let initialResumeDecisionMade = false;",
-                "let waitingForProxyAuth = false; let passkeyRequiredScope = ''; let terminalReadyWhileHidden = false;",
-                "let backgroundRecordedScope = 'unchanged'; let mode = 'idle';",
-                "const document = {visibilityState: 'visible'};",
+                "let loginRealm = 'alpha'; let initialResumeDecisionMade = true;",
+                "let passkeyRequiredScope = ''; let terminalReadyWhileHidden = false;",
                 "const authenticationScope = (realm = loginRealm) => `realm:${realm}`;",
-                "const authenticationStorageKey = (_base, realm) => `marker:${realm}`;",
-                "const STORAGE_PASSKEY_BACKGROUNDED_AT_KEY = 'backgrounded';",
-                "const loadAuthenticationSettings = () => ({mode, idleMinutes: 15});",
+                "const authenticationStorageKey = (_base, realm) => `interaction:${realm}`;",
+                "const STORAGE_PASSKEY_LAST_INTERACTION_AT_KEY = 'last-interaction';",
                 "const writes = []; const localStorage = {setItem: (key, value) => writes.push([key, value])};",
-                "Date.now = () => 700;",
-                *functions,
-                "const results = [];",
-                "results.push(recordVisibleIdleCheckpoint());",
-                "initialResumeDecisionMade = true; document.visibilityState = 'hidden'; results.push(recordVisibleIdleCheckpoint());",
-                "document.visibilityState = 'visible'; waitingForProxyAuth = true; results.push(recordVisibleIdleCheckpoint());",
-                "waitingForProxyAuth = false; passkeyRequiredScope = 'realm:alpha'; results.push(recordVisibleIdleCheckpoint());",
-                "passkeyRequiredScope = ''; terminalReadyWhileHidden = true; results.push(recordVisibleIdleCheckpoint());",
-                "terminalReadyWhileHidden = false; mode = 'off'; results.push(recordVisibleIdleCheckpoint());",
-                "mode = 'idle'; results.push(recordVisibleIdleCheckpoint());",
-                "results.push(writeBackgroundedAt('beta', 701)); results.push(writeBackgroundedAt('alpha', Number.NaN));",
-                "process.stdout.write(JSON.stringify({results, writes, backgroundRecordedScope}));",
+                match.group(0),
+                "const results = [",
+                "  recordUserInteraction('beta', 700),",
+                "  recordUserInteraction('alpha', Number.NaN),",
+                "  recordUserInteraction('alpha', 701),",
+                "];",
+                "process.stdout.write(JSON.stringify({results, writes}));",
             )
         )
         result = subprocess.run(
@@ -290,30 +286,37 @@ class ResumeReconnectWiringTest(unittest.TestCase):
         )
         self.assertEqual(
             result.stdout,
-            '{"results":[false,false,false,false,false,false,true,false,false],'
-            '"writes":[["marker:alpha","700"]],"backgroundRecordedScope":"unchanged"}',
+            '{"results":[false,false,true],"writes":[["interaction:alpha","701"]]}',
         )
-        self.assertEqual(
-            self.source.count("window.setInterval(recordVisibleIdleCheckpoint, 15000);"),
-            1,
+        self.assertNotIn("recordVisibleIdleCheckpoint", self.source)
+        self.assertNotIn("setInterval(recordVisibleIdleCheckpoint", self.source)
+        self.assertIn(
+            'document.addEventListener("keydown", () => recordUserInteraction(), { capture: true });',
+            self.source,
+        )
+        self.assertIn(
+            'document.addEventListener("paste", () => recordUserInteraction(), { capture: true });',
+            self.source,
         )
 
-    def test_idle_marker_is_seeded_after_unlocked_resume_and_ready(self):
+
+    def test_system_resume_ready_and_focus_do_not_extend_idle_grace(self):
         decision = re.search(
             r"  async function runResumeDecision\(\).*?\n  \}",
             self.source,
             re.DOTALL,
         )
         self.assertIsNotNone(decision)
-        self.assertIn(
-            'if (!requiresPasskey && settings.mode === "idle" && !passkeyRequiredScope)',
-            decision.group(0),
-        )
+        self.assertNotIn("recordUserInteraction", decision.group(0))
+        self.assertNotIn("writeBackgroundedAt", decision.group(0))
+
         ready_start = self.source.index('if (payload.type === "ready")')
         ready_end = self.source.index('if (payload.type === "tabs")', ready_start)
         ready = self.source[ready_start:ready_end]
-        self.assertIn('loadAuthenticationSettings(loginRealm).mode === "idle"', ready)
-        self.assertIn("writeBackgroundedAt(loginRealm, Date.now());", ready)
+        self.assertIn("if (completedPasskeyInteraction)", ready)
+        self.assertIn("recordUserInteraction(loginRealm, Date.now(), true);", ready)
+        self.assertNotIn("writeBackgroundedAt", ready)
+        self.assertIn('reportForcedActivity(false);', self.source)
 
     def test_authoritative_realm_resets_and_reruns_resume_decision(self):
         scope = re.search(r"  function authenticationScope\(.*?\n  \}", self.source, re.DOTALL)
@@ -495,6 +498,7 @@ class ResumeReconnectWiringTest(unittest.TestCase):
                 "let draftAuthenticationRealm = 'old'; let draftAuthenticationScope = 'realm:old';",
                 "let passkeyRequiredScope = 'realm:old';",
                 "let passkeyRetryPending = true;",
+                "let passkeyInteractionPending = true;",
                 "let passkeyCeremonyController = {abort: () => {}};",
                 "const cancelPasskeyCeremony = () => { passkeyCeremonyController = null; };",
                 "let resumeDecisionPromise = Promise.resolve();",
@@ -508,7 +512,7 @@ class ResumeReconnectWiringTest(unittest.TestCase):
                 "let applied = 0; const applyAuthenticationScope = () => { applied += 1; };",
                 match.group(0),
                 "resetAuthenticationLifecycle();",
-                "process.stdout.write(JSON.stringify({authenticationByRealm, hostAuthenticationDefault, authenticationSettings, draftAuthenticationSettings, draftAuthenticationRealm, draftAuthenticationScope, passkeyRequiredScope, passkeyRetryPending, resumeDecisionPromise, initialResumeDecisionMade, handledResumeMarker, backgroundRecordedScope, hasDeviceKey, lockState, applied}));",
+                "process.stdout.write(JSON.stringify({authenticationByRealm, hostAuthenticationDefault, authenticationSettings, draftAuthenticationSettings, draftAuthenticationRealm, draftAuthenticationScope, passkeyRequiredScope, passkeyRetryPending, passkeyInteractionPending, resumeDecisionPromise, initialResumeDecisionMade, handledResumeMarker, backgroundRecordedScope, hasDeviceKey, lockState, applied}));",
             )
         )
         result = subprocess.run(
@@ -523,7 +527,8 @@ class ResumeReconnectWiringTest(unittest.TestCase):
             '"authenticationSettings":{"mode":"every-open","idleMinutes":15},'
             '"draftAuthenticationSettings":{"mode":"every-open","idleMinutes":15},'
             '"draftAuthenticationRealm":"","draftAuthenticationScope":"","passkeyRequiredScope":"",'
-            '"passkeyRetryPending":false,"resumeDecisionPromise":null,"initialResumeDecisionMade":false,'
+            '"passkeyRetryPending":false,"passkeyInteractionPending":false,"resumeDecisionPromise":null,'
+            '"initialResumeDecisionMade":false,'
             '"handledResumeMarker":"","backgroundRecordedScope":"","hasDeviceKey":false,"lockState":true,"applied":1}',
         )
         self.assertGreaterEqual(self.source.count("resetAuthenticationLifecycle();"), 2)
@@ -541,10 +546,12 @@ class ResumeReconnectWiringTest(unittest.TestCase):
                 "const STORAGE_PASSKEY_AUTH_MODE_KEY = 'auth-mode';",
                 "const STORAGE_PASSKEY_IDLE_MINUTES_KEY = 'idle-minutes';",
                 "const STORAGE_PASSKEY_BACKGROUNDED_AT_KEY = 'backgrounded-at';",
+                "const STORAGE_PASSKEY_LAST_INTERACTION_AT_KEY = 'last-interaction-at';",
                 "const values = new Map([",
                 "  ['auth-mode', 'off'], ['auth-mode.realm%3Aone', 'idle'],",
                 "  ['idle-minutes.realm%3Aone', '15'], ['idle-minutes.realm%3Atwo', '30'],",
-                "  ['backgrounded-at.user%3Aone', '123'], ['unrelated', 'keep'],",
+                "  ['backgrounded-at.user%3Aone', '123'], ['last-interaction-at.user%3Aone', '124'],",
+                "  ['unrelated', 'keep'],",
                 "]);",
                 "const localStorage = {",
                 "  get length() { return values.size; },",

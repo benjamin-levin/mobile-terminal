@@ -52,7 +52,7 @@ class TouchSelectionUITest(unittest.TestCase):
         )
         self.run_node_source(script)
 
-    def test_activity_reports_throttle_keyboard_but_force_pointer_and_focus(self):
+    def test_activity_reports_throttle_keyboard_and_record_only_user_interaction(self):
         script = "\n".join(
             [
                 'const assert = require("node:assert/strict");',
@@ -65,17 +65,23 @@ class TouchSelectionUITest(unittest.TestCase):
                 "let socket = { readyState: WebSocket.OPEN, send: (value) => sent.push(JSON.parse(value)) };",
                 "let lastActivityReportAt = -Infinity;",
                 "let lastForcedActivityReportAt = -Infinity;",
+                "let recordedInteractions = 0;",
+                "function recordUserInteraction() { recordedInteractions += 1; }",
                 extract_function("reportActivity"),
                 extract_function("reportForcedActivity"),
                 "assert.equal(reportActivity(), true);",
                 'assert.deepEqual(sent, [{ type: "activity" }]);',
                 "now = 200; assert.equal(reportForcedActivity(), true);",
                 'assert.deepEqual(sent[1], { type: "activity", force: true });',
+                "assert.equal(recordedInteractions, 1);",
                 "now = 300; assert.equal(reportForcedActivity(), false);",
-                "now = 450; assert.equal(reportForcedActivity(), true);",
+                "assert.equal(recordedInteractions, 2);",
+                "now = 450; assert.equal(reportForcedActivity(false), true);",
+                "assert.equal(recordedInteractions, 2);",
                 "now = 1099; assert.equal(reportActivity(), false);",
                 "now = 1450; assert.equal(reportActivity(), true);",
                 "socket.readyState = 0; now = 2500; assert.equal(reportForcedActivity(), false);",
+                "assert.equal(recordedInteractions, 3);",
                 "assert.equal(sent.length, 4);",
             ]
         )
@@ -109,7 +115,7 @@ class TouchSelectionUITest(unittest.TestCase):
             '  window.addEventListener("focus", () => {',
             '  document.addEventListener("visibilitychange",',
         )
-        self.assertIn("reportForcedActivity();", focus_handler)
+        self.assertIn("reportForcedActivity(false);", focus_handler)
 
     def test_overlay_bounds_intersect_terminal_screen_viewport_and_safe_area(self):
         self.run_node(

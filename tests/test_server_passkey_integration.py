@@ -455,6 +455,39 @@ class StandalonePasskeyIntegrationTest(unittest.IsolatedAsyncioTestCase):
         register.assert_called_once_with("", "device-id", public_key, "device")
         self.assertIsNone(state["enrollment"])
 
+    async def test_killing_active_session_switches_on_authenticated_socket(self):
+        app = self.app(StubPasskeys())
+        connection = StubConnection()
+        bridge = SimpleNamespace()
+        switch_session = mock.AsyncMock()
+        sessions = [
+            {"name": "mobile-terminal", "attached": 1, "windows": 1},
+            {"name": "fallback", "attached": 0, "windows": 1},
+        ]
+
+        with (
+            mock.patch("server.list_sessions", return_value=sessions),
+            mock.patch("server.tmux_capture") as tmux,
+        ):
+            await app.handle_command(
+                connection,
+                bridge,
+                {"session": "mobile-terminal", "user": ""},
+                {"type": "kill-session", "session": "mobile-terminal"},
+                switch_session=switch_session,
+            )
+
+        self.assertEqual(connection.sent[0]["type"], "session-closing")
+        self.assertEqual(connection.sent[0]["nextSession"], "fallback")
+        switch_session.assert_awaited_once_with("fallback")
+        self.assertIsNone(connection.closed)
+        tmux.assert_called_once_with(
+            "kill-session",
+            "-t",
+            "mobile-terminal",
+            check=False,
+        )
+
     def test_environment_overrides_rp_id_and_origin(self):
         app = self.app(StubPasskeys())
         app.passkeys = None

@@ -261,13 +261,22 @@ class PasskeyAuthTest(unittest.TestCase):
         with self.assertRaises(PasskeyChallengeError):
             self.auth.finish_authentication("mine", options["challengeId"], assertion)
 
-    def test_failed_verification_also_consumes_challenge(self):
+    def test_failed_verification_consumes_challenge_and_fresh_retry_succeeds(self):
         options = self.auth.begin_registration("mine", principal="ben")
         with mock.patch("webauthn_auth.verify_registration_response", side_effect=ValueError("bad")):
             with self.assertRaises(PasskeyVerificationError):
                 self.auth.finish_registration("mine", options["challengeId"], {})
         with self.assertRaises(PasskeyChallengeError):
             self.auth.finish_registration("mine", options["challengeId"], {})
+
+        retry = self.auth.begin_registration("mine", principal="ben")
+        self.assertNotEqual(retry["challengeId"], options["challengeId"])
+        with mock.patch(
+            "webauthn_auth.verify_registration_response",
+            return_value=registration_result(),
+        ):
+            record = self.auth.finish_registration("mine", retry["challengeId"], {})
+        self.assertEqual(record["credentialId"], CREDENTIAL_ID_B64)
 
     def test_expired_or_cross_realm_challenges_are_rejected(self):
         current_time = [10.0]

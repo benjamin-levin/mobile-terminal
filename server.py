@@ -5442,6 +5442,8 @@ class AppServer:
         bridge: TmuxBridge,
         state: dict[str, Any],
         payload: dict[str, Any],
+        *,
+        switch_session: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         session_name = state["session"]
         user = state.get("user", "")
@@ -5972,7 +5974,10 @@ class AppServer:
             self.terminal_write_locks.pop(target_name, None)
             self.release_session(user, target_name)
             if target_name == session_name:
-                await connection.close(code=1012, reason="session killed")
+                if switch_session is None:
+                    await connection.close(code=1012, reason="session killed")
+                else:
+                    await switch_session(fallback)
                 return
             await self.send_tabs(connection, user, session_name)
             await self.send_sessions(connection, user, session_name)
@@ -6408,7 +6413,13 @@ class AppServer:
                     data = payload.get("data", "")
                     if isinstance(data, str) and ("\r" in data or "\n" in data):
                         session_summary["commandsRun"] += data.count("\r") + data.count("\n")
-                await self.handle_command(connection, bridge, state, payload)
+                await self.handle_command(
+                    connection,
+                    bridge,
+                    state,
+                    payload,
+                    switch_session=switch_session,
+                )
         except ConnectionClosed:
             pass
         finally:

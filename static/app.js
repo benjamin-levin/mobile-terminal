@@ -17,6 +17,7 @@
   const STORAGE_PASSKEY_AUTH_MODE_KEY = "mobile-terminal.passkey-auth-mode";
   const STORAGE_PASSKEY_IDLE_MINUTES_KEY = "mobile-terminal.passkey-idle-minutes";
   const STORAGE_PASSKEY_BACKGROUNDED_AT_KEY = "mobile-terminal.passkey-backgrounded-at";
+  const STORAGE_PASSKEY_LAST_INTERACTION_AT_KEY = "mobile-terminal.passkey-last-interaction-at";
   const STORAGE_EDITOR_TABS_KEY = "mobile-terminal.editor-tabs";
   const STORAGE_BTOP_ZOOM_KEY = "mobile-terminal.btop-zoom";
   const BTOP_SESSION_PREFIX = "btop-";
@@ -113,6 +114,7 @@
   const userField = document.getElementById("userField");
   const tokenInput = document.getElementById("tokenInput");
   const tokenFieldLabel = document.getElementById("tokenFieldLabel");
+  const passkeyLoginButton = document.getElementById("passkeyLoginButton");
   const loginSubmitButton = document.getElementById("loginSubmitButton");
   const loginMessage = document.getElementById("loginMessage");
   const accountButton = document.getElementById("accountButton");
@@ -229,6 +231,7 @@
   let draftAuthenticationScope = "";
   let passkeyRequiredScope = "";
   let passkeyRetryPending = false;
+  let passkeyInteractionPending = false;
   let passkeyCeremonyController = null;
   let resumeDecisionPromise = null;
   let resumeHandlingReady = false;
@@ -279,6 +282,7 @@
       STORAGE_PASSKEY_AUTH_MODE_KEY,
       STORAGE_PASSKEY_IDLE_MINUTES_KEY,
       STORAGE_PASSKEY_BACKGROUNDED_AT_KEY,
+      STORAGE_PASSKEY_LAST_INTERACTION_AT_KEY,
     ];
     try {
       const keys = [];
@@ -362,6 +366,7 @@
     draftAuthenticationScope = "";
     passkeyRequiredScope = "";
     passkeyRetryPending = false;
+    passkeyInteractionPending = false;
     resumeDecisionPromise = null;
     initialResumeDecisionMade = false;
     handledResumeMarker = "";
@@ -4506,7 +4511,10 @@
     return true;
   }
 
-  function reportForcedActivity() {
+  function reportForcedActivity(userInteraction = true) {
+    if (userInteraction) {
+      recordUserInteraction();
+    }
     return reportActivity(true);
   }
 
@@ -7035,20 +7043,29 @@
     }
   }
 
-  function recordVisibleIdleCheckpoint() {
-    const realm = loginRealm;
+  function recordUserInteraction(
+    realm = loginRealm,
+    interactedAt = Date.now(),
+    authenticated = false,
+  ) {
     if (
-      !resumeHandlingReady ||
-      !initialResumeDecisionMade ||
-      document.visibilityState !== "visible" ||
-      waitingForProxyAuth ||
-      passkeyRequiredScope ||
-      terminalReadyWhileHidden ||
-      loadAuthenticationSettings(realm).mode !== "idle"
+      (!authenticated &&
+        (!initialResumeDecisionMade || passkeyRequiredScope || terminalReadyWhileHidden)) ||
+      authenticationScope(realm) !== authenticationScope() ||
+      !Number.isSafeInteger(interactedAt) ||
+      interactedAt <= 0
     ) {
       return false;
     }
-    return writeBackgroundedAt(realm, Date.now());
+    try {
+      localStorage.setItem(
+        authenticationStorageKey(STORAGE_PASSKEY_LAST_INTERACTION_AT_KEY, realm),
+        String(interactedAt),
+      );
+      return true;
+    } catch (_error) {
+      return false;
+    }
   }
 
   function recordBackgrounded(event) {
@@ -7066,12 +7083,12 @@
       setPasskeyLocked(true);
     }
     backgroundRecordedScope = scope;
-    // A failed write leaves an unknown marker, which fails closed for idle and
-    // every-open policies.
+    // Background time identifies a new resume. Idle time is measured from the
+    // separate last-interaction marker so system events never extend the grace period.
     writeBackgroundedAt(realm, backgroundedAt);
   }
 
-  function parseBackgroundedAt(raw) {
+  function parseAuthenticationTimestamp(raw) {
     if (raw === null) {
       return 0;
     }
@@ -7082,17 +7099,27 @@
     return Number.isSafeInteger(value) && value > 0 ? value : Number.NaN;
   }
 
-  function passkeyRequiredAfterBackground(settings, backgroundedAt, initial, now = Date.now()) {
+  function passkeyRequiredAfterBackground(
+    settings,
+    backgroundedAt,
+    lastInteractionAt,
+    initial,
+    now = Date.now(),
+  ) {
     if (settings.mode === "off") {
       return false;
     }
     if (settings.mode === "every-open") {
       return initial || backgroundedAt !== 0;
     }
-    if (backgroundedAt === 0 || !Number.isFinite(backgroundedAt) || !Number.isFinite(now)) {
+    if (
+      lastInteractionAt === 0 ||
+      !Number.isFinite(lastInteractionAt) ||
+      !Number.isFinite(now)
+    ) {
       return true;
     }
-    const elapsed = now - backgroundedAt;
+    const elapsed = now - lastInteractionAt;
     return elapsed < 0 || elapsed >= settings.idleMinutes * 60 * 1000;
   }
 
@@ -7103,11 +7130,17 @@
       STORAGE_PASSKEY_BACKGROUNDED_AT_KEY,
       realm,
     );
+    const interactionKey = authenticationStorageKey(
+      STORAGE_PASSKEY_LAST_INTERACTION_AT_KEY,
+      realm,
+    );
     let rawBackgroundMarker = null;
+    let rawLastInteraction = null;
     try {
       rawBackgroundMarker = localStorage.getItem(backgroundKey);
+      rawLastInteraction = localStorage.getItem(interactionKey);
     } catch (_error) {
-      // Treat unavailable storage as an unknown marker and fail closed.
+      // Treat unavailable storage as unknown markers and fail closed.
     }
     const resumeMarker = `${scope}:${rawBackgroundMarker ?? "initial"}`;
     const initial = !initialResumeDecisionMade;
@@ -7123,7 +7156,8 @@
     const settings = loadAuthenticationSettings(realm);
     const requiresPasskey = passkeyRequiredAfterBackground(
       settings,
-      parseBackgroundedAt(rawBackgroundMarker),
+      parseAuthenticationTimestamp(rawBackgroundMarker),
+      parseAuthenticationTimestamp(rawLastInteraction),
       initial,
     );
     if (requiresPasskey) {
@@ -7136,9 +7170,6 @@
     await refreshDeviceKeyFlag(realm);
     if (scope !== authenticationScope()) {
       return;
-    }
-    if (!requiresPasskey && settings.mode === "idle" && !passkeyRequiredScope) {
-      writeBackgroundedAt(realm, Date.now());
     }
     if (requiresPasskey) {
       if (!initial) {
@@ -7362,7 +7393,16 @@
         window.setTimeout(connect, 80);
         return;
       }
-      if (passkeyRetryPending && passkeyRequiredScope) {
+      if (passkeyRetryPending) {
+        passkeyInteractionPending = false;
+        const passkeyEnrolled = Boolean(passkeyRequiredScope);
+        setPasskeyRetryUi(passkeyEnrolled);
+        loginOverlay.classList.remove("hidden");
+        if (!loginMessage.textContent) {
+          loginMessage.textContent = passkeyEnrolled
+            ? "Passkey authentication was interrupted. Tap Use passkey to try again."
+            : "Passkey setup was interrupted. Enter the access token to try again.";
+        }
         return;
       }
       if (event.code === 4001) {
@@ -7382,13 +7422,15 @@
     });
   }
 
-  function setPasskeyRetryUi(retry) {
-    tokenFieldLabel.classList.toggle("hidden", retry);
-    tokenInput.classList.toggle("hidden", retry);
+  function setPasskeyRetryUi(passkeyEnrolled) {
+    passkeyLoginButton.classList.toggle("hidden", !passkeyEnrolled);
+    tokenFieldLabel.textContent = passkeyEnrolled ? "Or enter access token" : "Access token";
+    tokenFieldLabel.classList.remove("hidden");
+    tokenInput.classList.remove("hidden");
     if (userField) {
-      userField.classList.toggle("hidden", retry || !serverConfig.multiTenant);
+      userField.classList.toggle("hidden", !serverConfig.multiTenant);
     }
-    loginSubmitButton.textContent = retry ? "Retry passkey" : "Connect";
+    loginSubmitButton.textContent = "Connect";
   }
 
   function showProxySignIn(payload, message) {
@@ -7507,6 +7549,11 @@
       } else {
         loginRealm = authenticationRealm;
       }
+      const authenticatingExistingPasskey = payload.type === "webauthn-auth-options";
+      if (authenticatingExistingPasskey) {
+        passkeyRequiredScope = passkeyRequiredScope || authenticationScope(loginRealm);
+      }
+      passkeyRetryPending = true;
       const authenticationSocket = socket;
       cancelPasskeyCeremony();
       const ceremonyController =
@@ -7529,19 +7576,21 @@
             ceremonyController?.signal,
           )
         ) {
+          passkeyInteractionPending = true;
           return;
         }
       } catch (_error) {
+        passkeyInteractionPending = false;
         if (authenticationSocket !== socket) {
           return;
         }
-        passkeyRequiredScope = passkeyRequiredScope || authenticationScope(loginRealm);
-        passkeyRetryPending = true;
         waitingForProxyAuth = false;
         setPasskeyLocked(true);
-        setPasskeyRetryUi(true);
+        setPasskeyRetryUi(authenticatingExistingPasskey);
         loginOverlay.classList.remove("hidden");
-        loginMessage.textContent = "A passkey is required to reveal the terminal. Tap Retry passkey to try again.";
+        loginMessage.textContent = authenticatingExistingPasskey
+          ? "A passkey is required to reveal the terminal. Tap Use passkey to try again."
+          : "Passkey setup was not completed. Enter the access token to try again.";
         try {
           authenticationSocket?.close(4000, "passkey retry");
         } catch (_closeError) {
@@ -7610,11 +7659,13 @@
         pendingProfileId = "";
       }
       waitingForProxyAuth = false;
+      const completedPasskeyInteraction = passkeyInteractionPending;
+      passkeyInteractionPending = false;
       passkeyRequiredScope = "";
       passkeyRetryPending = false;
       setPasskeyRetryUi(false);
-      if (!readyIsHidden && loadAuthenticationSettings(loginRealm).mode === "idle") {
-        writeBackgroundedAt(loginRealm, Date.now());
+      if (completedPasskeyInteraction) {
+        recordUserInteraction(loginRealm, Date.now(), true);
       }
       if (serverConfig.profileMode && loginSupportsPasskey()) {
         localStorage.removeItem(tokenStorageKey(activeProfile()?.authRealm || loginRealm));
@@ -7881,12 +7932,12 @@
           activeTabKey = terminalTabKey(nextSession);
         }
         persistActiveSession(nextSession);
-        reconnectForSessionSwitch = !serverConfig.profileMode;
       }
       return;
     }
     if (payload.type === "auth-error") {
       waitingForProxyAuth = false;
+      passkeyInteractionPending = false;
       if (passkeyRequiredScope) {
         passkeyRetryPending = true;
         setPasskeyRetryUi(true);
@@ -8689,7 +8740,7 @@
       String(draftAuthenticationSettings.idleMinutes),
     );
     if (draftAuthenticationSettings.mode === "idle") {
-      writeBackgroundedAt(realm, Date.now());
+      recordUserInteraction(realm);
     }
     applyAuthenticationScope(realm);
     saveHostSettings(realm);
@@ -9273,15 +9324,18 @@
     focusTerminal();
   });
 
-  loginForm.addEventListener("submit", (event) => {
-    event.preventDefault();
-    if (passkeyRetryPending && passkeyRequiredScope) {
-      passkeyRetryPending = false;
-      loginMessage.textContent = "";
-      loginOverlay.classList.add("hidden");
-      reconnectSocket();
+  passkeyLoginButton.addEventListener("click", () => {
+    if (!passkeyRequiredScope) {
       return;
     }
+    passkeyRetryPending = false;
+    loginMessage.textContent = "";
+    loginOverlay.classList.add("hidden");
+    reconnectSocket();
+  });
+
+  loginForm.addEventListener("submit", (event) => {
+    event.preventDefault();
     const token = tokenInput.value.trim();
     const userName = userInput ? userInput.value.trim() : "";
     if (serverConfig.multiTenant && !userName) {
@@ -9293,6 +9347,7 @@
       loginMessage.textContent = "Enter the access token first.";
       return;
     }
+    passkeyRetryPending = false;
     if (serverConfig.multiTenant) {
       const ownerChanged = currentUser !== userName;
       currentUser = userName;
@@ -9914,7 +9969,7 @@
     scheduleViewportSettlePasses();
   });
   window.addEventListener("focus", () => {
-    reportForcedActivity();
+    reportForcedActivity(false);
     updateViewportMetrics();
     resumeApplication();
   });
@@ -9926,7 +9981,8 @@
     }
   });
   window.addEventListener("pagehide", recordBackgrounded);
-  window.setInterval(recordVisibleIdleCheckpoint, 15000);
+  document.addEventListener("keydown", () => recordUserInteraction(), { capture: true });
+  document.addEventListener("paste", () => recordUserInteraction(), { capture: true });
   window.addEventListener("online", () => resumeApplication());
   window.addEventListener("pageshow", () => {
     resumeApplication();
