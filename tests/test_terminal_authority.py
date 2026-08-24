@@ -17,6 +17,7 @@ from tests.tmux_harness import TmuxHarness
 from server import (
     AcceptedCommand,
     AppServer,
+    AuthoritativeSelectionResult,
     CommandProvenance,
     CommandProvenanceState,
     PaneRowTracker,
@@ -2308,6 +2309,108 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
             text, error = await bridge.authoritative_selection(payload)
         self.assertIsNone(text)
         self.assertEqual(error, "Terminal changed; select again.")
+
+    async def test_provider_authority_indicator_distinguishes_exact_fallback_and_unowned(self):
+        connection = RecordingConnection()
+        bridge = TmuxBridge(
+            connection,
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=CommandProvenanceState(),
+        )
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.quiet = mock.AsyncMock()
+        pane = snapshot(
+            cols=12,
+            authored_lines=["provider"],
+            plain_physical_rows=["provider    "],
+            rows=1,
+        )
+        payload = {
+            "requestId": "provider-indicator",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 12,
+            "rows": 1,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {"start": {"x": 0, "y": 0}, "end": {"x": 8, "y": 0}},
+        }
+        cases = (
+            (
+                mock.Mock(owned=True, text="exact provider source", authority="provider-exact"),
+                "exact provider source",
+                "provider-exact",
+            ),
+            (
+                mock.Mock(owned=False, text=None, authority="terminal-raw"),
+                "provider",
+                "terminal-raw",
+            ),
+            (
+                mock.Mock(owned=False, text=None, authority=None),
+                "provider",
+                None,
+            ),
+        )
+        for index, (provider, expected_text, expected_authority) in enumerate(cases):
+            with self.subTest(authority=expected_authority), mock.patch(
+                "server.capture_pane_snapshot",
+                return_value=pane,
+            ), mock.patch("server.provider_selection", return_value=provider):
+                payload["requestId"] = f"provider-indicator-{index}"
+                result = await bridge.authoritative_selection_result(payload)
+            self.assertEqual(result.text, expected_text)
+            self.assertIsNone(result.error)
+            self.assertEqual(result.authority, expected_authority)
+
+    async def test_selection_result_protocol_exposes_only_sanitized_authority(self):
+        app = object.__new__(AppServer)
+        app.send_json = mock.AsyncMock()
+        bridge = mock.Mock()
+        bridge.authoritative_selection_result = mock.AsyncMock()
+        state = {"session": "session", "user": ""}
+        payload = {"type": "selection-request", "requestId": "request"}
+        cases = (
+            (
+                AuthoritativeSelectionResult("exact", authority="provider-exact"),
+                {"text": "exact", "authority": "provider-exact"},
+            ),
+            (
+                AuthoritativeSelectionResult("raw", authority="terminal-raw"),
+                {"text": "raw", "authority": "terminal-raw"},
+            ),
+            (
+                AuthoritativeSelectionResult("ordinary"),
+                {"text": "ordinary"},
+            ),
+            (
+                AuthoritativeSelectionResult("unsafe", authority="private-reason"),
+                {"text": "unsafe"},
+            ),
+        )
+        for result, expected in cases:
+            with self.subTest(authority=result.authority):
+                app.send_json.reset_mock()
+                bridge.authoritative_selection_result.return_value = result
+                await app.handle_command(mock.Mock(), bridge, state, payload)
+                response = app.send_json.await_args.args[1]
+                self.assertEqual(
+                    response,
+                    {
+                        "type": "selection-result",
+                        "requestId": "request",
+                        **expected,
+                    },
+                )
 
     async def test_client_selection_check_false_has_distinct_sanitized_reason(self):
         connection = QueuedConnection()

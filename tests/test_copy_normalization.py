@@ -168,6 +168,45 @@ const term = {
             self.assertNotIn(forbidden, selection_check)
         self.assertNotIn("sameTerminalSelectionState", APP_JS)
 
+    def test_selection_result_preserves_only_sanitized_authority(self):
+        self.run_node(
+            ["pendingSelectionRequestIsCurrent", "handleServerMessage"],
+            r'''
+const pendingSelectionRequests = new Map();
+global.window = { clearTimeout() {} };
+
+async function resolveResult(payload) {
+  let resolved;
+  pendingSelectionRequests.set("request", {
+    timer: 1,
+    resolve(value) { resolved = value; },
+  });
+  await handleServerMessage({
+    type: "selection-result",
+    requestId: "request",
+    text: "selected",
+    ...payload,
+  });
+  return resolved;
+}
+
+(async () => {
+  assert.deepEqual(
+    await resolveResult({ authority: "terminal-raw" }),
+    { text: "selected", authority: "terminal-raw" },
+  );
+  assert.deepEqual(
+    await resolveResult({ authority: "provider-exact" }),
+    { text: "selected", authority: "provider-exact" },
+  );
+  assert.deepEqual(
+    await resolveResult({ authority: "private-provider-reason" }),
+    { text: "selected", authority: undefined },
+  );
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+''',
+        )
+
     def test_copy_to_tab_and_native_copy_share_authoritative_request(self):
         copy = app_section(
             "  async function copyTerminalSelection()",
@@ -186,6 +225,7 @@ const term = {
         )
         self.assertIn("const result = await requestAuthoritativeSelection();", pending)
         self.assertIn("text: normalizeTerminalCopyText(result.text),", pending)
+        self.assertIn('authority: result.authority === "terminal-raw"', pending)
         self.assertIn("if (result.error)", pending)
         self.assertNotIn("if (!result.text)", pending)
 
@@ -256,6 +296,50 @@ const term = {
   await copyTerminalSelection();
   assert.ok(capturedBlob instanceof Blob);
   assert.equal(await capturedBlob.text(), "");
+  assert.deepEqual(toasts, ["Copied terminal selection."]);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+''',
+        )
+
+    def test_raw_terminal_copy_has_distinct_non_blocking_warning(self):
+        self.run_node(
+            [
+                "normalizeTerminalCopyText",
+                "beginAuthoritativeClipboardWrite",
+                "copyTextWithFallback",
+                "copyClipboardTextWithFallback",
+                "copyTerminalSelection",
+            ],
+            r'''
+(async () => {
+  Object.defineProperty(global, "ClipboardItem", { value: undefined, configurable: true });
+  Object.defineProperty(global, "navigator", {
+    value: { clipboard: { async writeText() {} } },
+    configurable: true,
+  });
+  const toasts = [];
+  global.showToast = (message) => { toasts.push(message); };
+
+  global.requestAuthoritativeSelection = () => Promise.resolve({
+    text: "raw terminal text",
+    authority: "terminal-raw",
+  });
+  await copyTerminalSelection();
+  assert.deepEqual(toasts, [
+    "Copied raw terminal text — line breaks and spaces may be included.",
+  ]);
+
+  toasts.length = 0;
+  global.requestAuthoritativeSelection = () => Promise.resolve({
+    text: "provider text",
+    authority: "provider-exact",
+  });
+  await copyTerminalSelection();
+  assert.deepEqual(toasts, ["Copied terminal selection."]);
+
+  toasts.length = 0;
+  global.requestAuthoritativeSelection = () => Promise.resolve({ text: "ordinary" });
+  await copyTerminalSelection();
   assert.deepEqual(toasts, ["Copied terminal selection."]);
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 ''',

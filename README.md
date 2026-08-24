@@ -20,7 +20,7 @@ Read [`docs/RUNBOOK.md`](docs/RUNBOOK.md) before changing a running installation
 
 - [`docs/deployment.md`](docs/deployment.md) — fleet topology, exact service boundaries, rollout gates, and rollback.
 - [`docs/tmux-sizing.md`](docs/tmux-sizing.md) — latest-interactive-client geometry and private-socket testing.
-- [`docs/provider-authority.md`](docs/provider-authority.md) — transcript-backed Copy/To-tab authority and shadow/enforce rollout.
+- [`docs/provider-authority.md`](docs/provider-authority.md) — transcript-backed Copy/To-tab authority and shadow/prefer/enforce rollout.
 
 Use `scripts/verify-runtime.sh` for redacted, read-only local verification and `scripts/provider-mode.sh` for provider-mode previews and explicitly applied changes. `deploy.sh` requires `--dry-run` or `--apply` plus exact per-user targets and explicit ph/ps acceptance gates; see the deployment guide.
 

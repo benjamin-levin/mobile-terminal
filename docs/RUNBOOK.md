@@ -60,16 +60,18 @@ Use [`scripts/provider-mode.sh`](../scripts/provider-mode.sh), not an ad hoc env
 ```bash
 scripts/provider-mode.sh status
 scripts/provider-mode.sh shadow --apply
+scripts/provider-mode.sh prefer --apply
 scripts/provider-mode.sh enforce --apply --confirm-enforce
 scripts/provider-mode.sh off --apply
 ```
 
 Rules:
 
-- Start in `shadow`.
+- Start in `shadow` for diagnostic validation.
 - Validate reason counters and a real ph/iPhone selection.
-- Enable `enforce` only after shadow passes.
-- If valid Copy and To-tab requests fail closed, immediately return to `shadow` while diagnosing.
+- Move to `prefer` for provider-exact results with a visible raw-terminal fallback warning.
+- Enable `enforce` only after prefer passes live acceptance and fail-closed behavior is required.
+- If valid Copy and To-tab requests fail closed, immediately return to `prefer` while diagnosing.
 - Copy and To-tab intentionally use the same authority request; a shared failure is one backend problem, not two frontend bugs.
 
 Without `--apply`, a requested mode change is a non-mutating preview. With `--apply`, the script backs up the env file in place, atomically updates only `MOBILE_TERMINAL_PROVIDER_AUTHORITY`, restarts only `mobile-terminal.service`, waits for both active service state and loopback `/health`, and restores the old env if verification fails.
@@ -105,10 +107,10 @@ Common examples:
 
 ## Rollback
 
-Code rollback is a reviewed prior commit for ph. Remote `deploy.sh` targets retain timestamped copies of the complete manifest closure under `.mobile-terminal-deploy-backups` and automatically restore files plus service health when activation fails. Provider-mode rollback is:
+Code rollback is a reviewed prior commit for ph. Remote `deploy.sh` targets retain timestamped copies of the complete manifest closure under `.mobile-terminal-deploy-backups` and automatically restore files plus service health when activation fails. Provider-mode rollback from enforcement is:
 
 ```bash
-scripts/provider-mode.sh shadow --apply
+scripts/provider-mode.sh prefer --apply
 ```
 
 A rollback must restart only the Mobile Terminal service and must be followed by:

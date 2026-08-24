@@ -545,6 +545,13 @@ atexit.register(_flush_authoritative_selection_diagnostics)
 
 
 @dataclass(frozen=True)
+class AuthoritativeSelectionResult:
+    text: str | None = None
+    error: str | None = None
+    authority: str | None = None
+
+
+@dataclass(frozen=True)
 class CommandProvenance:
     session_name: str
     pane_id: str
@@ -3364,13 +3371,16 @@ class TmuxBridge:
             for record in pending:
                 await self._send_output(record, "selection-held")
 
-    async def authoritative_selection(self, payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    async def authoritative_selection_result(
+        self,
+        payload: dict[str, Any],
+    ) -> AuthoritativeSelectionResult:
         request_id = str(payload.get("requestId", ""))
         stale_message = "Terminal changed; select again."
 
-        def reject(reason: str) -> tuple[None, str]:
+        def reject(reason: str) -> AuthoritativeSelectionResult:
             _record_authoritative_selection_rejection(reason)
-            return None, stale_message
+            return AuthoritativeSelectionResult(error=stale_message)
 
         try:
             epoch = int(payload.get("epoch", -1))
@@ -3485,7 +3495,7 @@ class TmuxBridge:
                         terminal_revision=stable_offset,
                     )
                     if matched:
-                        return exact_text or "", None
+                        return AuthoritativeSelectionResult(text=exact_text or "")
                     provider = await asyncio.to_thread(
                         provider_selection,
                         snapshot,
@@ -3512,7 +3522,10 @@ class TmuxBridge:
                     ):
                         return reject("verification-changed")
                     if provider.owned:
-                        return provider.text or "", None
+                        return AuthoritativeSelectionResult(
+                            text=provider.text or "",
+                            authority="provider-exact",
+                        )
                     selected_text = extract_authoritative_selection(
                         snapshot,
                         start_x,
@@ -3520,12 +3533,25 @@ class TmuxBridge:
                         end_x,
                         relative_end_row,
                     )
-                    return selected_text, None
+                    authority = getattr(provider, "authority", None)
+                    if authority != "terminal-raw":
+                        authority = None
+                    return AuthoritativeSelectionResult(
+                        text=selected_text,
+                        authority=authority,
+                    )
                 except (RuntimeError, ValueError, asyncio.TimeoutError):
                     return reject(exception_reason)
                 finally:
                     self.selection_acks.pop(request_id, None)
                     await self._flush_selection_hold()
+
+    async def authoritative_selection(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[str | None, str | None]:
+        result = await self.authoritative_selection_result(payload)
+        return result.text, result.error
 
     async def close(self) -> None:
         self.closing = True
@@ -4991,15 +5017,17 @@ class AppServer:
             return
 
         if message_type == "selection-request":
-            text, error = await bridge.authoritative_selection(payload)
+            result = await bridge.authoritative_selection_result(payload)
             response: dict[str, Any] = {
                 "type": "selection-result",
                 "requestId": str(payload.get("requestId", "")),
             }
-            if error:
-                response["error"] = error
+            if result.error:
+                response["error"] = result.error
             else:
-                response["text"] = text or ""
+                response["text"] = result.text or ""
+                if result.authority in ("provider-exact", "terminal-raw"):
+                    response["authority"] = result.authority
             await self.send_json(connection, response)
             return
 

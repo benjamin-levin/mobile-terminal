@@ -2477,6 +2477,7 @@ def authoritative_provider_match(
 class ProviderSelectionResult:
     owned: bool
     text: str | None = None
+    authority: str | None = None
 
 
 _TRANSCRIPT_INDEXES: OrderedDict[tuple[str, Path, int], TranscriptIndex] = OrderedDict()
@@ -2519,7 +2520,7 @@ def _flush_provider_diagnostics() -> None:
 
 def _record_provider_diagnostic(mode: str, decision: str, reason: str) -> None:
     global _PROVIDER_DIAGNOSTIC_TOTAL
-    if mode not in ("off", "shadow", "enforce"):
+    if mode not in ("off", "shadow", "prefer", "enforce"):
         mode = "invalid"
     if decision not in ("matched", "unowned", "fallback", "rejected"):
         decision = "invalid"
@@ -2567,7 +2568,7 @@ def _transcript_index(key: tuple[str, Path, int]) -> TranscriptIndex:
 
 def provider_authority_mode() -> str:
     value = os.environ.get("MOBILE_TERMINAL_PROVIDER_AUTHORITY", "off").lower()
-    return value if value in ("off", "shadow", "enforce") else "off"
+    return value if value in ("off", "shadow", "prefer", "enforce") else "off"
 
 
 def _binding_cache_path(home: Path, pane_id: str) -> Path:
@@ -2770,39 +2771,48 @@ def _provider_selection_locked(
     if mode == "off":
         return ProviderSelectionResult(False)
 
-    def decision(owned: bool, reason: str, text: str | None = None) -> ProviderSelectionResult:
-        _record_provider_diagnostic(mode, "matched" if owned else "unowned", reason)
-        return ProviderSelectionResult(owned, text)
+    def decision(
+        name: str,
+        owned: bool,
+        reason: str,
+        text: str | None = None,
+        authority: str | None = None,
+    ) -> ProviderSelectionResult:
+        _record_provider_diagnostic(mode, name, reason)
+        return ProviderSelectionResult(owned, text, authority)
 
     provider_home = Path(home) if home is not None else Path.home()
     cache: Mapping[str, Any] | None = None
     cached: ProviderBinding | None = None
     owned = False
+    provider_signal = False
     try:
         cache = _load_binding_cache(provider_home, snapshot.pane_id)
         if cache is not None:
+            provider_signal = True
             cached = _cache_binding(cache, require_active=False)
             if cached.provider == "codex":
                 owned = _selection_is_owned(cached, cache, snapshot, start_row, end_row)
                 if not cache["active"]:
                     if owned:
                         raise ProviderAuthorityError("binding-cache-stale")
-                    return decision(False, "inactive-unowned")
+                    return decision("unowned", False, "inactive-unowned")
             elif not cache["active"]:
                 if bool(snapshot.alternate):
                     raise ProviderAuthorityError("binding-cache-stale")
-                return decision(False, "inactive-unowned")
+                return decision("unowned", False, "inactive-unowned")
         try:
             binding, cache = resolve_provider_binding(snapshot.pane_id, home=provider_home)
         except ProviderAuthorityError:
             if cached is not None and cached.provider == "claude" and not bool(snapshot.alternate):
-                return decision(False, "inactive-unowned")
+                return decision("unowned", False, "inactive-unowned")
             raise
         if binding is None:
-            return decision(False, "binding-unavailable")
+            return decision("unowned", False, "binding-unavailable")
+        provider_signal = True
         owned = _selection_is_owned(binding, cache, snapshot, start_row, end_row)
         if not owned:
-            return decision(False, "selection-unowned")
+            return decision("unowned", False, "selection-unowned")
         normalized_plain_rows, style_rows = _normalize_captured_rows(
             snapshot.physical_rows,
             snapshot.plain_physical_rows,
@@ -2825,17 +2835,33 @@ def _provider_selection_locked(
         )
         if not result.matched:
             raise ProviderAuthorityError(result.internal_reason or "no-canonical-candidate")
-        return decision(True, "canonical-match", result.text)
+        return decision(
+            "matched",
+            True,
+            "canonical-match",
+            result.text,
+            "provider-exact",
+        )
     except ProviderAuthorityError as exc:
         if mode == "shadow":
             _record_provider_diagnostic(mode, "fallback", exc.reason)
             return ProviderSelectionResult(False)
+        if mode == "prefer":
+            _record_provider_diagnostic(mode, "fallback", exc.reason)
+            return ProviderSelectionResult(False, authority="terminal-raw")
         _record_provider_diagnostic(mode, "rejected", exc.reason)
         raise
     except Exception as exc:
-        if mode == "shadow":
+        if mode in ("shadow", "prefer"):
             _record_provider_diagnostic(mode, "fallback", "provider-internal-failure")
-            return ProviderSelectionResult(False)
+            return ProviderSelectionResult(
+                False,
+                authority=(
+                    "terminal-raw"
+                    if mode == "prefer" and provider_signal
+                    else None
+                ),
+            )
         _record_provider_diagnostic(mode, "rejected", "provider-internal-failure")
         raise ProviderAuthorityError("provider-internal-failure") from exc
 

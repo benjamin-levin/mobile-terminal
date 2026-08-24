@@ -113,7 +113,7 @@ printf 'tmux_window_size=%s\nmanual_windows=%s\nclaude_hook_events=%s\ncodex_hoo
 [[ "$STATE" == "active" ]] || FAILED=1
 [[ "$HEALTH" == "200" ]] || FAILED=1
 [[ "$TMUX_POLICY" == "latest" ]] || FAILED=1
-[[ "$MODE" == "off" || "$MODE" == "shadow" || "$MODE" == "enforce" ]] || FAILED=1
+[[ "$MODE" == "off" || "$MODE" == "shadow" || "$MODE" == "prefer" || "$MODE" == "enforce" ]] || FAILED=1
 [[ "$ERROR_COUNT" == "0" ]] || FAILED=1
 
 exit "$FAILED"

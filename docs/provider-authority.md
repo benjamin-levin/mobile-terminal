@@ -15,7 +15,7 @@ Authority order is:
 2. Provider transcript authority.
 3. Ordinary tmux output outside provider-owned regions.
 
-Copy and To-tab intentionally call the same authoritative selection request. Direct PTY paste flattening is a separate safety boundary. A provider-owned failure must never fall through to raw tmux text; the public failure is exactly:
+Copy and To-tab intentionally call the same authoritative selection request. Direct PTY paste flattening is a separate safety boundary. In `enforce`, a provider-owned failure must never fall through to raw tmux text; the public failure is exactly:
 
 ```text
 Terminal changed; select again.
@@ -27,6 +27,7 @@ Terminal changed; select again.
 
 - `off`: provider authority disabled;
 - `shadow`: evaluate mappings and bounded reason counters without making provider failures block ordinary operation;
+- `prefer`: return provider source for a unique supported mapping, otherwise fall back to exact tmux cell extraction and visibly identify the result as raw terminal text;
 - `enforce`: return provider source for unique supported mappings and fail closed for provider-owned failures.
 
 Use the checked-in mode tool:
@@ -34,26 +35,30 @@ Use the checked-in mode tool:
 ```bash
 scripts/provider-mode.sh status
 scripts/provider-mode.sh shadow --apply
+scripts/provider-mode.sh prefer --apply
 scripts/provider-mode.sh enforce --apply --confirm-enforce
 scripts/provider-mode.sh off --apply
 ```
 
-Without `--apply`, mode changes are previews. Enforcement is deliberately gated from `shadow` and requires the additional `--confirm-enforce` acknowledgement. A successful test suite is not a substitute for a real ph/iPhone selection.
+Without `--apply`, mode changes are previews. Enforcement is deliberately gated from `prefer` and requires the additional `--confirm-enforce` acknowledgement. Moving directly from `off` to `prefer` is allowed, but `shadow` remains the diagnostic rollout gate before live use. A successful test suite is not a substitute for a real ph/iPhone selection.
+
+In `prefer`, every provider-side rejection falls back to the same exact tmux extraction used for ordinary output. A provider binding or ownership signal makes the response carry only the sanitized `terminal-raw` indicator; Copy and To-tab use it for a non-blocking warning that line breaks and spaces may be terminal-rendered. A canonical transcript match carries `provider-exact`. Ordinary unowned selections carry no provider indicator, and no response exposes provider reason codes, transcript identifiers, or content beyond the selected result.
 
 ## Rollout gate
 
 1. Deploy code and hooks to ph with mode `shadow`.
 2. Verify bindings, transcript fences, candidate counts, reason counters, service health, and actual Claude/Codex output at the current terminal width.
 3. Confirm on iPhone that source hard breaks remain, visual wraps disappear, and provider gutters are omitted.
-4. Enable `enforce` on ph.
-5. Repeat Copy and To-tab tests.
-6. Only after explicit acceptance deploy the managed `ps-powerhouse` target, then `lat-ben` and `lat-bperritt` in order. Behuman is not a managed deployment target.
+4. Enable `prefer` on ph and verify both exact provider selections and the visible raw-terminal fallback warning.
+5. Enable `enforce` on ph only if fail-closed operation is required and prefer has passed live acceptance.
+6. Repeat Copy and To-tab tests.
+7. Only after explicit acceptance deploy the managed `ps-powerhouse` target, then `lat-ben` and `lat-bperritt` in order. Behuman is not a managed deployment target.
 
-If valid Copy and To-tab requests both fail in enforce, return to shadow immediately. They share a backend path, so debugging the buttons independently wastes time.
+If valid Copy and To-tab requests both fail in enforce, return to `prefer` immediately so users receive warned exact-terminal fallback while diagnosis continues. They share a backend path, so debugging the buttons independently wastes time.
 
 ## Fail-closed boundaries
 
-Renderer support is provider/version gated. Unsupported or ambiguous content remains fail-closed, including renderer/theme-dependent constructs, transformed messages, clipping, mixed ownership, repeated placements, stale bindings, transcript mutation, and uncertain grapheme geometry.
+Renderer support is provider/version gated. The provider matcher rejects unsupported or ambiguous content, including renderer/theme-dependent constructs, transformed messages, clipping, mixed ownership, repeated placements, stale bindings, transcript mutation, and uncertain grapheme geometry. `enforce` exposes that rejection as the stale public error; `prefer` converts it to the warned raw-terminal fallback without weakening the matcher.
 
 Supported selections inside a larger record must be compiled as source-offset-preserving supported islands. A selection wholly inside exactly one supported island may succeed; a selection touching or crossing unsupported material must fail. Unsupported material must still poison aliases that would otherwise make a supported placement ambiguous.
 

@@ -1,0 +1,30 @@
+  item 23: retained history row twenty-three                                                        
+  item 24: retained history row twenty-four                                                         
+  item 25: retained history row twenty-five                                                         
+  item 26: retained history row twenty-six                                                          
+  item 27: retained history row twenty-seven      
+  item 28: retained history row twenty-eight                                                        
+  item 29: retained history row twenty-nine                                                         
+  item 30: retained history row thirty                                                              
+  item 31: retained history row thirty-one                                                          
+  item 32: retained history row thirty-two        
+  item 33: retained history row thirty-three                                                        
+  item 34: retained history row thirty-four                                                         
+  item 35: retained history row thirty-five                                                         
+  item 36: retained history row thirty-six                                                          
+  item 37: retained history row thirty-seven      
+  item 38: retained history row thirty-eight                                                        
+  item 39: retained history row thirty-nine                                                         
+  item 40: retained history row forty                                                               
+                                                                                                    
+  Selections that start above the visible viewport must still resolve to their exact authored source
+  once the pane scrolls, because retained rows keep their original width forever.                   
+                                                                                                    
+  FIXTURE-HISTORY-END                             
+
+✻ Brewed for 7s                                                                                     
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                                                                   
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← 5 agents                                                 

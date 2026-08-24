@@ -1627,17 +1627,21 @@
       return;
     }
     const text = normalizeTerminalCopyText(result.text);
+    const successMessage =
+      result.authority === "terminal-raw"
+        ? "Copied raw terminal text — line breaks and spaces may be included."
+        : "Copied terminal selection.";
     if (clipboardWritePromise) {
       try {
         await clipboardWritePromise;
-        showToast("Copied terminal selection.");
+        showToast(successMessage);
         return;
       } catch (_error) {
         // A delayed write may still work in browsers without promised ClipboardItem support.
       }
     }
     if (await copyClipboardTextWithFallback(text)) {
-      showToast("Copied terminal selection.");
+      showToast(successMessage);
       return;
     }
     showToast("Clipboard copy is blocked by this browser.");
@@ -1686,6 +1690,7 @@
     pendingPasteAfterSwitch = {
       session: target,
       text: normalizeTerminalCopyText(result.text),
+      authority: result.authority === "terminal-raw" ? "terminal-raw" : undefined,
       ready: false,
     };
     dismissTerminalSelection();
@@ -1716,7 +1721,11 @@
       return false;
     }
     pendingPasteAfterSwitch = null;
-    showToast("Pasted into this tab.");
+    showToast(
+      pending.authority === "terminal-raw"
+        ? "Pasted raw terminal text — line breaks and spaces may be included."
+        : "Pasted into this tab.",
+    );
     return true;
   }
 
@@ -1754,7 +1763,11 @@
       return false;
     }
     pendingPasteAfterSwitch = null;
-    showToast("Pasted into this tab.");
+    showToast(
+      pending.authority === "terminal-raw"
+        ? "Pasted raw terminal text — line breaks and spaces may be included."
+        : "Pasted into this tab.",
+    );
     return true;
   }
 
@@ -7306,7 +7319,15 @@
       if (pending) {
         window.clearTimeout(pending.timer);
         pendingSelectionRequests.delete(requestId);
-        pending.resolve(payload.error ? { error: payload.error } : { text: String(payload.text || "") });
+        const authority =
+          payload.authority === "provider-exact" || payload.authority === "terminal-raw"
+            ? payload.authority
+            : undefined;
+        pending.resolve(
+          payload.error
+            ? { error: payload.error }
+            : { text: String(payload.text || ""), authority },
+        );
       }
       return;
     }

@@ -1,0 +1,30 @@
+│         /…/scratchpad/edge-record/wide/work        │                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ Reply with exactly this markdown and no commentary. First line FIXTURE-RICHTEXT-BEGIN. Then a     
+  markdown heading: ## Deployment summary. Then a numbered list with three items: 1. preflight      
+  every manifest file before any remote copy so partial trees never activate; 2. stage into a fresh 
+  directory and smoke-test the import closure there; 3. roll back files and service health          
+  together on any failure. Then a paragraph with emphasis: The rollout order stays ph first, then   
+  both ps users, then lat, and no gate may be skipped even when every earlier stage passed cleanly. 
+  Last line FIXTURE-RICHTEXT-END.                                                                   
+
+● FIXTURE-RICHTEXT-BEGIN                                                                            
+  Deployment summary                                                                                
+
+  1. preflight every manifest file before any remote copy so partial trees never activate           
+  2. stage into a fresh directory and smoke-test the import closure there                           
+  3. roll back files and service health together on any failure                                     
+
+  The rollout order stays ph first, then both ps users, then lat, and no gate may be skipped even   
+  when every earlier stage passed cleanly.                                                          
+
+  FIXTURE-RICHTEXT-END                                                                              
+                                                                                                    
+✻ Worked for 3s                                                                                     
+                      You've used 86% of your weekly limit · resets Aug 27, 2am (America/New_York)  
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← 5 agents                                                 

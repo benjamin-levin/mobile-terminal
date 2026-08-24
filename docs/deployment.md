@@ -9,7 +9,7 @@ The enforced order is:
 3. lat: `lat-ben`, then `lat-bperritt`; verify each exact service and obtain live acceptance before progressing.
 4. `mbp-powerhouse` only when explicitly requested.
 
-Do not combine geometry rollout and provider enforcement into one acceptance gate. Deploy code first, verify tmux handoff, run provider mode in shadow, then enable enforcement separately.
+Do not combine geometry rollout and provider enforcement into one acceptance gate. Deploy code first, verify tmux handoff, run provider mode in shadow, validate prefer with its visible raw-terminal fallback warning, then enable enforcement separately only if fail-closed behavior is required.
 
 `deploy.sh` requires an explicit mode and exact per-user targets. It has no implicit fleet, `--all`, `ps`, or `lat` behavior. A dry run may preflight several exact targets, but each apply accepts exactly one target so live acceptance can occur before progression. Applying any ps or lat target requires `--confirm-ph-accepted`; applying lat additionally requires `--confirm-ps-accepted`. Dry runs require neither acceptance flag.
 
@@ -80,7 +80,7 @@ server.py
 
 Copying runtime files does not itself prove hooks are installed for every OS user. Install hooks as the target user with the repository virtualenv and the installer's explicit `--apply` flag, then verify only tagged hook counts—never hook payload credentials or provider auth files.
 
-Use `scripts/provider-mode.sh` locally for provider state changes. On fleet users, apply the same `off -> shadow -> enforce` sequence within that user's env/service boundary.
+Use `scripts/provider-mode.sh` locally for provider state changes. On fleet users, apply the same `off -> shadow -> prefer -> enforce` validation sequence within that user's env/service boundary. Direct `off -> prefer` activation is supported when shadow validation was completed separately; `enforce` is accepted only from `prefer`.
 
 ## Verification
 

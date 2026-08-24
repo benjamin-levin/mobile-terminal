@@ -144,6 +144,40 @@ assert.deepEqual(toasts, ["Pasted into this tab."]);
 '''
         )
 
+    def test_raw_terminal_to_tab_has_distinct_warning_in_both_delivery_paths(self):
+        self.run_node(
+            r'''
+let activeSessionName = "direct";
+let mobileComposerMode = false;
+let composerInput = makeComposer();
+let composerRevision = 0;
+let pendingPasteAfterSwitch = {
+  session: "direct", text: "raw direct", authority: "terminal-raw", ready: false,
+};
+let queueMessages = true;
+let sent = [];
+let toasts = [];
+let speechResets = 0;
+
+assert.equal(handlePendingPasteReady(), true);
+assert.deepEqual(toasts, [
+  "Pasted raw terminal text — line breaks and spaces may be included.",
+]);
+
+activeSessionName = "composer";
+mobileComposerMode = true;
+composerInput = makeComposer();
+pendingPasteAfterSwitch = {
+  session: "composer", text: "raw composer", authority: "terminal-raw", ready: true,
+};
+toasts = [];
+assert.equal(deliverPendingPasteToComposer(4), true);
+assert.deepEqual(toasts, [
+  "Pasted raw terminal text — line breaks and spaces may be included.",
+]);
+'''
+        )
+
     def test_mismatched_ready_preserves_pending_without_send_or_toast(self):
         self.run_node(
             r'''

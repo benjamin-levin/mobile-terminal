@@ -44,6 +44,26 @@ SCENARIOS = {
         "here., then a fenced python code block containing only print(\"東京 ✅\"), "
         "then a line containing FIXTURE-CODE-END."
     ),
+    "richtext": (
+        "Reply with exactly this markdown and no commentary. First line "
+        "FIXTURE-RICHTEXT-BEGIN. Then a markdown heading: ## Deployment summary. "
+        "Then a numbered list with three items: 1. preflight every manifest file "
+        "before any remote copy so partial trees never activate; 2. stage into a "
+        "fresh directory and smoke-test the import closure there; 3. roll back "
+        "files and service health together on any failure. Then a paragraph with "
+        "emphasis: The rollout order stays **ph first**, then *both ps users*, "
+        "then lat, and no gate may be skipped even when every earlier stage "
+        "passed cleanly. Last line FIXTURE-RICHTEXT-END."
+    ),
+    "history": (
+        "Reply with exactly this structure and no commentary. First line "
+        "FIXTURE-HISTORY-BEGIN. Then forty short lines, each of the form "
+        "item NN: retained history row followed by that number spelled in "
+        "words, for NN from 01 to 40. Then one paragraph: Selections that "
+        "start above the visible viewport must still resolve to their exact "
+        "authored source once the pane scrolls, because retained rows keep "
+        "their original width forever. Last line FIXTURE-HISTORY-END."
+    ),
 }
 
 

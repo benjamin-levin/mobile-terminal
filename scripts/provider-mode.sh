@@ -12,12 +12,12 @@ CONFIRM_ENFORCE=0
 usage() {
   printf '%s\n' \
     'Usage: scripts/provider-mode.sh status' \
-    '       scripts/provider-mode.sh off|shadow [--apply]' \
+    '       scripts/provider-mode.sh off|shadow|prefer [--apply]' \
     '       scripts/provider-mode.sh enforce [--apply --confirm-enforce]' \
     '' \
     'Mode changes are previews unless --apply is present. The script updates' \
     'only MOBILE_TERMINAL_PROVIDER_AUTHORITY and restarts only the local user' \
-    'mobile-terminal.service. Enforcement is accepted only from shadow mode' \
+    'mobile-terminal.service. Enforcement is accepted only from prefer mode' \
     'and requires both explicit flags.'
 }
 
@@ -134,7 +134,7 @@ if [[ "$MODE" == "status" ]]; then
 fi
 
 case "$MODE" in
-  off|shadow|enforce) ;;
+  off|shadow|prefer|enforce) ;;
   -h|--help) usage; exit 0 ;;
   *) echo "Invalid provider mode: $MODE" >&2; usage >&2; exit 2 ;;
 esac
@@ -151,12 +151,12 @@ if [[ "$MODE" != "enforce" && "$CONFIRM_ENFORCE" == 1 ]]; then
   exit 2
 fi
 
-if [[ "$MODE" == "enforce" && "$CURRENT" != "shadow" && "$CURRENT" != "enforce" ]]; then
-  echo "Refusing off-to-enforce transition: enable and verify shadow first" >&2
+if [[ "$MODE" == "enforce" && "$CURRENT" != "prefer" && "$CURRENT" != "enforce" ]]; then
+  echo "Refusing transition to enforce: enable and verify prefer first" >&2
   exit 1
 fi
 if [[ "$MODE" == "enforce" && "$APPLY" == 1 && "$CONFIRM_ENFORCE" != "1" ]]; then
-  echo "Refusing enforcement without --confirm-enforce after live shadow acceptance" >&2
+  echo "Refusing enforcement without --confirm-enforce after live prefer acceptance" >&2
   exit 1
 fi
 

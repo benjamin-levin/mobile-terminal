@@ -1404,12 +1404,14 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
                 "schema": 1,
                 "claudeVersion": "2.1.241",
                 "model": "claude-haiku-4-5",
-                "claudeInvocations": 3,
+                "claudeInvocations": 5,
                 "fixtures": [
                     "wide-streaming",
                     "wide-mixed-complete",
                     "wide-code-complete",
                     "narrow-prose-complete",
+                    "wide-richtext-complete",
+                    "wide-history-complete",
                 ],
             },
         )
@@ -1713,6 +1715,81 @@ class RuntimeBindingCacheTest(unittest.TestCase):
                 side_effect=error,
             ), patch.dict(os.environ, {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "shadow"}):
                 self.assertFalse(provider_selection(snapshot, 0, 0, 0, 0, home=home).owned)
+
+    def test_prefer_returns_provider_exact_or_warned_terminal_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            current = binding("claude", home / ".claude/projects/session.jsonl")
+            snapshot = SimpleNamespace(
+                pane_id="%9",
+                alternate=True,
+                cols=12,
+                seed_history=0,
+                physical_rows=["● answer    "],
+                plain_physical_rows=["● answer    "],
+            )
+            with patch.dict(
+                os.environ,
+                {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "prefer"},
+            ), patch(
+                "provider_authority.resolve_provider_binding",
+                return_value=(current, None),
+            ), patch(
+                "provider_authority.authoritative_provider_match",
+                return_value=MatchResult(True, text="exact source"),
+            ):
+                exact = provider_selection(snapshot, 2, 0, 8, 0, home=home)
+            self.assertTrue(exact.owned)
+            self.assertEqual(exact.text, "exact source")
+            self.assertEqual(exact.authority, "provider-exact")
+
+            with patch.dict(
+                os.environ,
+                {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "prefer"},
+            ), patch(
+                "provider_authority.resolve_provider_binding",
+                return_value=(current, None),
+            ), patch(
+                "provider_authority.authoritative_provider_match",
+                return_value=MatchResult.failure("no-plain-placement"),
+            ):
+                fallback = provider_selection(snapshot, 2, 0, 8, 0, home=home)
+            self.assertFalse(fallback.owned)
+            self.assertIsNone(fallback.text)
+            self.assertEqual(fallback.authority, "terminal-raw")
+
+    def test_prefer_binding_failure_falls_back_but_true_absence_is_unowned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            snapshot = SimpleNamespace(pane_id="%9", alternate=False)
+            with patch.dict(
+                os.environ,
+                {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "prefer"},
+            ), patch(
+                "provider_authority.resolve_provider_binding",
+                side_effect=ProviderAuthorityError("ambiguous-claude-binding"),
+            ):
+                fallback = provider_selection(snapshot, 0, 0, 0, 0, home=home)
+            self.assertFalse(fallback.owned)
+            self.assertEqual(fallback.authority, "terminal-raw")
+
+            with patch.dict(
+                os.environ,
+                {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "prefer"},
+            ), patch(
+                "provider_authority.resolve_provider_binding",
+                return_value=(None, None),
+            ):
+                unowned = provider_selection(snapshot, 0, 0, 0, 0, home=home)
+            self.assertFalse(unowned.owned)
+            self.assertIsNone(unowned.authority)
+
+    def test_prefer_is_a_valid_provider_mode(self):
+        with patch.dict(
+            os.environ,
+            {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "prefer"},
+        ):
+            self.assertEqual(provider_authority_module.provider_authority_mode(), "prefer")
 
     def test_provider_rejection_is_immediate_before_aggregate_threshold(self):
         with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:

@@ -1,0 +1,30 @@
+[38;5;174m│[39m         [38;5;246m/…/scratchpad/edge-record/wide/work[39m        [2m[38;5;174m│[0m                                             [38;5;174m│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+[38;5;239m[48;5;237m❯ [38;5;231mReply with exactly this markdown and no commentary. First line FIXTURE-RICHTEXT-BEGIN. Then a [39m    
+  [38;5;231mmarkdown heading: ## Deployment summary. Then a numbered list with three items: 1. preflight [39m     
+  [38;5;231mevery manifest file before any remote copy so partial trees never activate; 2. stage into a fresh[39m 
+  [38;5;231mdirectory and smoke-test the import closure there; 3. roll back files and service health [39m         
+  [38;5;231mtogether on any failure. Then a paragraph with emphasis: The rollout order stays [1mph first[0m[38;5;231m[48;5;237m, then [39m  
+  [3m[38;5;231mboth ps users[0m[38;5;231m[48;5;237m, then lat, and no gate may be skipped even when every earlier stage passed cleanly.[39m 
+  [38;5;231mLast line FIXTURE-RICHTEXT-END.[39m                                                                   
+
+[38;5;231m[49m●[39m FIXTURE-RICHTEXT-BEGIN                                                                            
+  [1mDeployment summary[0m                                                                                
+
+  1. preflight every manifest file before any remote copy so partial trees never activate           
+  2. stage into a fresh directory and smoke-test the import closure there                           
+  3. roll back files and service health together on any failure                                     
+
+  The rollout order stays [1mph first[0m, then [3mboth ps users[0m, then lat, and no gate may be skipped even   
+  when every earlier stage passed cleanly.                                                          
+
+  FIXTURE-RICHTEXT-END                                                                              
+                                                                                                    
+[38;5;246m✻[39m [38;5;246mWorked for 3s[39m                                                                                     
+                      [38;5;220mYou've used 86% of your weekly limit · resets Aug 27, 2am (America/New_York)[39m  
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯                                                 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ don't ask on[38;5;246m (shift+tab to cycle) · ← 5 agents[39m                                                 

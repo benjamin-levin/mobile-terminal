@@ -450,6 +450,27 @@ esac
             self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
             restart_count = len(log.read_text().splitlines())
 
+            refused_from_shadow = subprocess.run(
+                ["bash", script, "enforce", "--apply", "--confirm-enforce"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(refused_from_shadow.returncode, 1)
+            self.assertIn("enable and verify prefer first", refused_from_shadow.stderr)
+            self.assertEqual(len(log.read_text().splitlines()), restart_count)
+            self.assertIn("PROVIDER_AUTHORITY=shadow", env_file.read_text())
+
+            preferred = subprocess.run(
+                ["bash", script, "prefer", "--apply"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(preferred.returncode, 0, preferred.stderr)
+            self.assertIn("PROVIDER_AUTHORITY=prefer", env_file.read_text())
+            restart_count = len(log.read_text().splitlines())
+
             unconfirmed = subprocess.run(
                 ["bash", script, "enforce", "--apply"],
                 capture_output=True,
@@ -459,7 +480,7 @@ esac
             self.assertEqual(unconfirmed.returncode, 1)
             self.assertIn("--confirm-enforce", unconfirmed.stderr)
             self.assertEqual(len(log.read_text().splitlines()), restart_count)
-            self.assertIn("PROVIDER_AUTHORITY=shadow", env_file.read_text())
+            self.assertIn("PROVIDER_AUTHORITY=prefer", env_file.read_text())
 
             enforced = subprocess.run(
                 ["bash", script, "enforce", "--apply", "--confirm-enforce"],
@@ -469,6 +490,24 @@ esac
             )
             self.assertEqual(enforced.returncode, 0, enforced.stderr)
             self.assertIn("PROVIDER_AUTHORITY=enforce", env_file.read_text())
+
+            rolled_back = subprocess.run(
+                ["bash", script, "off", "--apply"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(rolled_back.returncode, 0, rolled_back.stderr)
+            self.assertIn("PROVIDER_AUTHORITY=off", env_file.read_text())
+
+            direct_prefer = subprocess.run(
+                ["bash", script, "prefer", "--apply"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(direct_prefer.returncode, 0, direct_prefer.stderr)
+            self.assertIn("PROVIDER_AUTHORITY=prefer", env_file.read_text())
 
     def test_provider_mode_rollback_repairs_owner_only_env_permissions(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -663,7 +702,7 @@ if grep -q 'PROVIDER_AUTHORITY=off' "$ROLLBACK_ENV_FILE"; then printf 200; else 
             os.symlink(ROOT / ".venv/bin/python", root / ".venv/bin/python")
             secret = "never-print-this-bootstrap-token"
             (root / "mobile-terminal.env").write_text(
-                "MOBILE_TERMINAL_PROVIDER_AUTHORITY=shadow\n"
+                "MOBILE_TERMINAL_PROVIDER_AUTHORITY=prefer\n"
                 'MOBILE_TERMINAL_PORT="8085"\n'
                 f"MOBILE_TERMINAL_TOKEN={secret}\n"
             )
@@ -862,6 +901,7 @@ printf 'INFO never-print-this-bootstrap-token\n'
         readme = self.source("README.md")
         for command in (
             "scripts/provider-mode.sh shadow --apply",
+            "scripts/provider-mode.sh prefer --apply",
             "scripts/provider-mode.sh enforce --apply --confirm-enforce",
             "scripts/provider-mode.sh off --apply",
         ):
@@ -869,6 +909,7 @@ printf 'INFO never-print-this-bootstrap-token\n'
             self.assertIn(command, provider)
         self.assertIn("scripts/test.sh --all", runbook)
         self.assertIn("each apply accepts exactly one target", deployment)
+        self.assertIn("off -> shadow -> prefer -> enforce", deployment)
         self.assertIn("`ps-powerhouse` is the only managed ps deployment target", deployment)
         for target, service in (
             ("ps-powerhouse", "mobile-terminal.service"),
