@@ -41,6 +41,7 @@ from provider_authority import (
 SESSION_ID = "12345678-1234-4123-8123-123456789abc"
 OTHER_SESSION_ID = "abcdefab-cdef-4abc-8def-abcdefabcdef"
 CODEX_V7_ID = "0198f1a2-3456-7abc-8def-0123456789ab"
+LIVE_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "provider_live"
 
 
 def write_jsonl(path, records, *, final_newline=True):
@@ -117,14 +118,16 @@ def verified_styled_rows(candidate, *, dot_fg=231, continuation_gutter_fg=None):
             for column in range(start, end):
                 styles[column] = style
         parts = []
-        for column, character in enumerate(plain):
+        column = 0
+        for grapheme in provider_authority_module.GRAPHEME_RE.findall(plain):
             style = styles.get(column)
             if continuation_gutter_fg is not None and row_index and column < 2:
-                parts.append(f"\x1b[38;5;{continuation_gutter_fg}m{character}\x1b[0m")
+                parts.append(f"\x1b[38;5;{continuation_gutter_fg}m{grapheme}\x1b[0m")
             elif style in sgr:
-                parts.append(f"\x1b[{sgr[style]}m{character}\x1b[0m")
+                parts.append(f"\x1b[{sgr[style]}m{grapheme}\x1b[0m")
             else:
-                parts.append(character)
+                parts.append(grapheme)
+            column += provider_authority_module._grapheme_width(grapheme)
         rows.append("".join(parts))
     return tuple(rows)
 
@@ -592,6 +595,38 @@ class RenderingAndMatchingTest(unittest.TestCase):
         self.assertEqual(len(candidate.plain_rows), 4)
         self.assertTrue(all(len(row) == 12 for row in candidate.plain_rows))
         self.assertTrue(all(cell.copy_start is None for cell in candidate.cells if cell.presentation))
+
+    def test_verified_wide_graphemes_preserve_display_and_source_coordinates(self):
+        candidate = self.candidate("A界 ✅ end", cols=14)
+        wide = [cell for cell in candidate.cells if cell.text in {"界", "✅"}]
+        self.assertEqual(
+            [(cell.text, cell.width, cell.copy_start, cell.copy_end) for cell in wide],
+            [("界", 2, 1, 2), ("✅", 2, 3, 4)],
+        )
+        styles = normalize_styled_rows(
+            verified_styled_rows(candidate),
+            candidate.plain_rows,
+        )
+        result = match_complete_provider_block(
+            (candidate,),
+            candidate.plain_rows,
+            candidate.selection_start,
+            candidate.selection_end,
+            style_rows=styles,
+        )
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "A界 ✅ end")
+
+        cjk = wide[0]
+        split = match_complete_provider_block(
+            (candidate,),
+            candidate.plain_rows,
+            (cjk.row, cjk.column + 1),
+            (cjk.row, cjk.column + cjk.width),
+            style_rows=styles,
+        )
+        self.assertFalse(split.matched)
+        self.assertEqual(split.internal_reason, "selection-not-complete")
 
     def test_word_wrap_moves_whole_words_and_does_not_add_copy_newlines(self):
         for width in range(8, 13):
@@ -1342,6 +1377,197 @@ class RenderingAndMatchingTest(unittest.TestCase):
             result.text = "changed"
         self.assertEqual(result.public_error, STALE_MESSAGE)
         self.assertNotIn("secret transcript", repr(result))
+
+
+class ProviderLiveFixtureReplayTest(unittest.TestCase):
+    mixed_supported = (
+        "FIXTURE-MIXED-BEGIN\n\n"
+        "Reliable terminal copying preserves authored words while removing visual "
+        "wraps, so a paragraph selected on a narrow screen still returns the "
+        "original sentence without invented newlines.\n\n"
+        "- first bullet wraps naturally across the terminal width without changing "
+        "its source\n"
+        "- second bullet remains distinct from the first item\n\n"
+        "Status ✅ 東京 漢字 complete"
+    )
+    prose = (
+        "Reliable terminal copying preserves authored words while removing visual "
+        "wraps, so a paragraph selected on a narrow screen still returns the "
+        "original sentence without invented newlines."
+    )
+
+    def fixture(self, name):
+        metadata = json.loads((LIVE_FIXTURE_ROOT / f"{name}.json").read_text())
+        plain_rows = (LIVE_FIXTURE_ROOT / metadata["files"]["plain"]).read_text().splitlines()
+        styled_rows = (LIVE_FIXTURE_ROOT / metadata["files"]["styled"]).read_text().splitlines()
+        cols = metadata["geometry"]["actual"]["cols"]
+        normalized_plain, normalized_styles = provider_authority_module._normalize_captured_rows(
+            styled_rows,
+            plain_rows,
+            cols,
+        )
+        cached = metadata["binding"]
+        binding = ProviderBinding(
+            provider=cached["provider"],
+            pane_id=cached["paneId"],
+            pid=cached["pid"],
+            proc_start=cached["procStart"],
+            session_id=cached["sessionId"],
+            transcript_id=cached["sessionId"],
+            transcript_path=LIVE_FIXTURE_ROOT / metadata["transcript"]["copy"],
+            version=cached["version"],
+            generation=cached["generation"],
+        )
+        return SimpleNamespace(
+            metadata=metadata,
+            binding=binding,
+            cols=cols,
+            plain_rows=normalized_plain,
+            style_rows=normalized_styles,
+        )
+
+    def match(self, fixture, start, end, *, plain_rows=None, style_rows=None):
+        return authoritative_provider_match(
+            fixture.binding,
+            TranscriptIndex(),
+            transcript_root=LIVE_FIXTURE_ROOT,
+            cols=fixture.cols,
+            plain_rows=fixture.plain_rows if plain_rows is None else plain_rows,
+            selection_start=start,
+            selection_end=end,
+            style_rows=fixture.style_rows if style_rows is None else style_rows,
+            proc_start_reader=lambda pid: fixture.binding.proc_start,
+            proc_environ_reader=lambda pid: {"TMUX_PANE": fixture.binding.pane_id},
+        )
+
+    def test_metadata_fences_geometry_transcript_registry_and_hook_binding(self):
+        for name in ("wide-mixed-complete", "wide-code-complete", "wide-streaming"):
+            with self.subTest(name=name):
+                fixture = self.fixture(name)
+                metadata = fixture.metadata
+                cached = metadata["binding"]
+                registry = metadata["registry"]
+                self.assertEqual(metadata["schema"], 1)
+                self.assertEqual(metadata["geometry"]["requested"], metadata["geometry"]["actual"])
+                self.assertEqual(metadata["claude"]["version"], "2.1.241")
+                self.assertEqual(cached["version"], metadata["claude"]["version"])
+                self.assertEqual(registry["version"], metadata["claude"]["version"])
+                self.assertEqual(cached["paneId"], metadata["pane"]["id"])
+                self.assertEqual(registry["tmux"], f"fixture:{metadata['pane']['id']}")
+                self.assertEqual(cached["pid"], registry["pid"])
+                self.assertEqual(cached["procStart"], registry["procStart"])
+                self.assertEqual(cached["sessionId"], registry["sessionId"])
+                self.assertEqual(cached["sessionId"], metadata["claude"]["sessionId"])
+                self.assertTrue(cached["active"])
+                self.assertTrue(fixture.binding.transcript_path.is_file())
+                self.assertEqual(
+                    fixture.binding.transcript_path.name,
+                    metadata["transcript"]["copy"],
+                )
+                self.assertTrue(Path(metadata["transcript"]["path"]).is_absolute())
+
+    def test_full_supported_island_and_sub_window_replay_exact_transcript_slices(self):
+        fixture = self.fixture("wide-mixed-complete")
+        full = self.match(fixture, (10, 2), (18, 30))
+        self.assertTrue(full.matched)
+        self.assertEqual(full.text, self.mixed_supported)
+        self.assertEqual((full.source_start, full.source_end), (0, 380))
+
+        sub_window = self.match(fixture, (12, 2), (13, 93))
+        self.assertTrue(sub_window.matched)
+        self.assertEqual(sub_window.text, self.prose)
+
+    def test_emoji_selection_uses_display_cells_and_exact_source(self):
+        fixture = self.fixture("wide-mixed-complete")
+        status = self.match(fixture, (18, 2), (18, 30))
+        self.assertTrue(status.matched)
+        self.assertEqual(status.text, "Status ✅ 東京 漢字 complete")
+
+        check = self.match(fixture, (18, 9), (18, 11))
+        self.assertTrue(check.matched)
+        self.assertEqual(check.text, "✅")
+
+    def test_narrow_geometry_prose_replay_removes_only_visual_wraps(self):
+        fixture = self.fixture("narrow-prose-complete")
+        self.assertEqual(fixture.cols, 60)
+        self.assertEqual(fixture.metadata["claude"]["version"], "2.1.241")
+
+        full = self.match(fixture, (17, 2), (22, 19))
+        self.assertTrue(full.matched)
+        self.assertEqual(
+            full.text,
+            "FIXTURE-PROSE-BEGIN\n" + self.prose + "\nFIXTURE-PROSE-END",
+        )
+
+        wrapped_prose = self.match(fixture, (18, 2), (21, 20))
+        self.assertTrue(wrapped_prose.matched)
+        self.assertEqual(wrapped_prose.text, self.prose)
+        self.assertNotIn("\n", wrapped_prose.text)
+
+    def test_real_snapshot_mutations_preserve_fail_closed_boundaries(self):
+        fixture = self.fixture("wide-mixed-complete")
+
+        repeated = self.match(
+            fixture,
+            (10, 2),
+            (18, 30),
+            plain_rows=fixture.plain_rows + fixture.plain_rows,
+            style_rows=fixture.style_rows + fixture.style_rows,
+        )
+        self.assertFalse(repeated.matched)
+        self.assertEqual(repeated.internal_reason, "placement-ambiguous")
+
+        clipped = self.match(
+            fixture,
+            (1, 2),
+            (7, 30),
+            plain_rows=fixture.plain_rows[11:19],
+            style_rows=fixture.style_rows[11:19],
+        )
+        self.assertFalse(clipped.matched)
+        self.assertEqual(clipped.internal_reason, "placement-ambiguous")
+
+        wrong_styles = list(fixture.style_rows)
+        wrong_styles[10] = tuple(
+            (start, end, "plain" if style == "plain;fg-indexed-231" else style)
+            for start, end, style in wrong_styles[10]
+        )
+        style_mismatch = self.match(
+            fixture,
+            (10, 2),
+            (18, 30),
+            style_rows=tuple(wrong_styles),
+        )
+        self.assertFalse(style_mismatch.matched)
+        self.assertEqual(style_mismatch.internal_reason, "style-mismatch")
+
+        unsafe_rows = list(fixture.plain_rows)
+        unsafe_rows[18] = "😀" + unsafe_rows[18][1:]
+        unsafe = self.match(
+            fixture,
+            (18, 0),
+            (18, 2),
+            plain_rows=tuple(unsafe_rows),
+            style_rows=None,
+        )
+        self.assertFalse(unsafe.matched)
+        self.assertEqual(unsafe.internal_reason, "unsafe-captured-wide-cell")
+
+    def test_inline_and_fenced_code_and_streaming_remain_fail_closed(self):
+        mixed = self.fixture("wide-mixed-complete")
+        crossing_inline = self.match(mixed, (18, 2), (22, 19))
+        self.assertFalse(crossing_inline.matched)
+        self.assertEqual(crossing_inline.internal_reason, "selection-not-complete")
+
+        code = self.fixture("wide-code-complete")
+        fenced = self.match(code, (19, 2), (22, 18))
+        self.assertFalse(fenced.matched)
+        self.assertEqual(fenced.internal_reason, "no-plain-placement")
+
+        streaming = self.fixture("wide-streaming")
+        pending = self.match(streaming, (24, 0), (24, 19))
+        self.assertFalse(pending.matched)
+        self.assertEqual(pending.internal_reason, "no-renderable-records")
 
 
 class RuntimeBindingCacheTest(unittest.TestCase):

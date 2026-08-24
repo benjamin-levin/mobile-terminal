@@ -1,0 +1,30 @@
+
+❯ Reply with exactly this structure and no commentary. First write FIXTURE-MIXED-BEGIN on its own   
+  line. Then write this prose paragraph: Reliable terminal copying preserves authored words while   
+  removing visual wraps, so a paragraph selected on a narrow screen still returns the original      
+  sentence without invented newlines. Then a blank line. Then two markdown bullets: - first bullet  
+  wraps naturally across the terminal width without changing its source; - second bullet remains    
+  distinct from the first item. Then a blank line and exactly: Status ✅ 東京 漢字 complete. Then a 
+  blank line and exactly: Inline code_value() remains here. End with FIXTURE-MIXED-END on its own   
+  line.                                                                                             
+
+● FIXTURE-MIXED-BEGIN                                                                               
+
+  Reliable terminal copying preserves authored words while removing visual wraps, so a paragraph    
+  selected on a narrow screen still returns the original sentence without invented newlines.        
+
+  - first bullet wraps naturally across the terminal width without changing its source              
+  - second bullet remains distinct from the first item                                              
+
+  Status ✅ 東京 漢字 complete                    
+                                                                                                    
+  Inline code_value() remains here.                                                                 
+
+  FIXTURE-MIXED-END                                                                                 
+                                                                                                    
+✻ Sautéed for 2s                                                                                    
+                      You've used 85% of your weekly limit · resets Aug 27, 2am (America/New_York)  
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← 5 agents                                                 

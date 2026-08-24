@@ -76,19 +76,28 @@ read -r CLAUDE_HOOKS CODEX_HOOKS < <("$PYTHON" - <<'PY'
 import json
 from pathlib import Path
 
-source = "mobile-terminal-provider-authority"
 def count(path):
     try:
         document = json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return 0
     hooks = document.get("hooks", {}) if isinstance(document, dict) else {}
+    if not isinstance(hooks, dict):
+        return 0
     return sum(
         1
         for entries in hooks.values()
         if isinstance(entries, list)
         for entry in entries
-        if isinstance(entry, dict) and entry.get("_mobile_terminal_source") == source
+        if isinstance(entry, dict)
+        for hook in (
+            entry.get("hooks", [])
+            if isinstance(entry.get("hooks"), list)
+            else (entry,)
+        )
+        if isinstance(hook, dict)
+        and isinstance(hook.get("command"), str)
+        and "provider_binding_hook.py" in hook["command"]
     )
 
 home = Path.home()

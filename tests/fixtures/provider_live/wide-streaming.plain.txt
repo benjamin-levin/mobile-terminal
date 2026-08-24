@@ -1,0 +1,30 @@
+
+╭─── Claude Code v2.1.241 ─────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                    │
+│                  Welcome back Ben!                 │ Ask Claude to create a new app or clone a … │
+│                                                    │ ─────────────────────────────────────────── │
+│                       ▐▛███▛█                      │ What's new                                  │
+│                      ▝▜██████▀                     │ Bug fixes and reliability improvements      │
+│                        ▝▝ ▝▝                       │ Bug fixes and reliability improvements      │
+│   Haiku 4.5 · Claude Max · benjamin@prsmai.org's   │ Cost estimates (`/cost`, status line, `--m… │
+│   Organization                                     │ /release-notes for more                     │
+│   /…/scratchpad/provider-fixtures-final/wide/work  │                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ Reply with exactly this structure and no commentary. First write FIXTURE-MIXED-BEGIN on its own   
+  line. Then write this prose paragraph: Reliable terminal copying preserves authored words while   
+  removing visual wraps, so a paragraph selected on a narrow screen still returns the original      
+  sentence without invented newlines. Then a blank line. Then two markdown bullets: - first bullet  
+  wraps naturally across the terminal width without changing its source; - second bullet remains    
+  distinct from the first item. Then a blank line and exactly: Status ✅ 東京 漢字 complete. Then a 
+  blank line and exactly: Inline code_value() remains here. End with FIXTURE-MIXED-END on its own   
+  line.                                                                                             
+                                                                                                    
+                                                                                                    
+✻ Recombobulating…                                                                                  
+                      You've used 85% of your weekly limit · resets Aug 27, 2am (America/New_York)  
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · esc to interrupt · ← 5 agents                              

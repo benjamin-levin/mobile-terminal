@@ -1,0 +1,30 @@
+
+[38;5;239m[48;5;237m❯ [38;5;231mReply with exactly this structure and no commentary. First write FIXTURE-MIXED-BEGIN on its own [39m  
+  [38;5;231mline. Then write this prose paragraph: Reliable terminal copying preserves authored words while [39m  
+  [38;5;231mremoving visual wraps, so a paragraph selected on a narrow screen still returns the original [39m     
+  [38;5;231msentence without invented newlines. Then a blank line. Then two markdown bullets: - first bullet [39m 
+  [38;5;231mwraps naturally across the terminal width without changing its source; - second bullet remains [39m   
+  [38;5;231mdistinct from the first item. Then a blank line and exactly: Status ✅ 東京 漢字 complete. Then a[39m 
+  [38;5;231mblank line and exactly: Inline [38;5;153mcode_value()[38;5;231m remains here. End with FIXTURE-MIXED-END on its own [39m  
+  [38;5;231mline.[39m                                                                                             
+
+[38;5;231m[49m●[39m FIXTURE-MIXED-BEGIN                                                                               
+
+  Reliable terminal copying preserves authored words while removing visual wraps, so a paragraph    
+  selected on a narrow screen still returns the original sentence without invented newlines.        
+
+  - first bullet wraps naturally across the terminal width without changing its source              
+  - second bullet remains distinct from the first item                                              
+
+  Status ✅ 東京 漢字 complete                    
+                                                                                                    
+  Inline [38;5;153mcode_value()[39m remains here.                                                                 
+
+  FIXTURE-MIXED-END                                                                                 
+                                                                                                    
+[38;5;246m✻[39m [38;5;246mSautéed for 2s[39m                                                                                    
+                      [38;5;220mYou've used 85% of your weekly limit · resets Aug 27, 2am (America/New_York)[39m  
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯                                                 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ don't ask on[38;5;246m (shift+tab to cycle) · ← 5 agents[39m                                                 

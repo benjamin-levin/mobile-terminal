@@ -1,0 +1,30 @@
+[38;5;174m│[39m                         [38;5;174m▝▜[48;5;16m█████[49m█▀[39m                        [38;5;174m│
+│[39m                         [38;5;174m  ▝▝ ▝▝  [39m                        [38;5;174m│
+│[39m                                                          [38;5;174m│
+│[39m                        [38;5;246mHaiku 4.5[39m                         [38;5;174m│
+│[39m                        [38;5;246mClaude Max[39m                        [38;5;174m│
+│[39m         [38;5;246m/…/scratchpad/narrow-record/narrow/work[39m          [38;5;174m│
+│[39m                                                          [38;5;174m│
+╰──────────────────────────────────────────────────────────╯
+
+
+[38;5;239m[48;5;237m❯ [38;5;231mReply with exactly three lines and no commentary. Line [39m   
+  [38;5;231mone is FIXTURE-PROSE-BEGIN. Line two is: Reliable [39m        
+  [38;5;231mterminal copying preserves authored words while removing [39m 
+  [38;5;231mvisual wraps, so a paragraph selected on a narrow screen [39m 
+  [38;5;231mstill returns the original sentence without invented [39m     
+  [38;5;231mnewlines. Line three is FIXTURE-PROSE-END.[39m                
+
+[38;5;231m[49m●[39m FIXTURE-PROSE-BEGIN                                       
+  Reliable terminal copying preserves authored words while  
+  removing visual wraps, so a paragraph selected on a narrow
+  screen still returns the original sentence without        
+  invented newlines.                                        
+  FIXTURE-PROSE-END           
+
+[38;5;246m✻[39m [38;5;246mBaked for 1s[39m                                              
+  [38;5;220mYou've used 86% of your weekly limit · resets Aug 27, 2…[39m  
+[38;5;244m────────────────────────────────────────────────────────────
+[39m❯                                                           
+[38;5;244m────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ don't ask on[38;5;246m (shift+tab to cycle) · ← 5 agents[39m         

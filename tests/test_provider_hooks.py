@@ -259,6 +259,25 @@ class ProviderBindingHookTest(unittest.TestCase):
             )
             self.assertEqual(json.loads(path.read_text()), ended)
 
+    def test_state_root_isolates_fixture_binding_cache(self):
+        state_root = self.home / "fixture-state"
+        with patch.dict(os.environ, {"TMUX_PANE": "%7"}, clear=False), patch(
+            "provider_binding_hook._claude_registry",
+            return_value=(321, 444, "2.1.241"),
+        ):
+            update_binding(
+                "claude",
+                self.event,
+                "ignored",
+                self.home,
+                state_root=state_root,
+            )
+        path = state_root / ".mobile-terminal" / "provider-bindings" / "7.json"
+        self.assertTrue(path.is_file())
+        self.assertFalse(
+            (self.home / ".mobile-terminal" / "provider-bindings" / "7.json").exists()
+        )
+
     def test_codex_records_normal_buffer_boundaries_and_saturation(self):
         transcript = self.home / ".codex" / "sessions" / "2026" / f"{SESSION_ID}.jsonl"
         transcript.parent.mkdir(parents=True)

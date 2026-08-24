@@ -168,6 +168,8 @@ def update_binding(
     home: Path,
     *,
     pane_coordinates: Any = _pane_coordinates,
+    state_root: Path | None = None,
+    claude_registry: Any = None,
 ) -> None:
     pane_id = os.environ.get("TMUX_PANE", "")
     if not PANE_RE.fullmatch(pane_id):
@@ -189,7 +191,8 @@ def update_binding(
         raise ValueError
     transcript = _safe_transcript(provider, Path(transcript_value), home)
     if provider == "claude":
-        pid, proc_start, registry_version = _claude_registry(home, pane_id, session_id)
+        registry_reader = claude_registry or _claude_registry
+        pid, proc_start, registry_version = registry_reader(home, pane_id, session_id)
         if registry_version:
             version = registry_version
         coordinates = None
@@ -201,7 +204,7 @@ def update_binding(
             coordinates = None
     event_name = str(event.get("hook_event_name") or event.get("event") or event.get("type") or "")
     active = event_name not in END_EVENTS
-    state_dir = home / ".mobile-terminal" / "provider-bindings"
+    state_dir = (state_root or home) / ".mobile-terminal" / "provider-bindings"
     path = state_dir / f"{pane_id[1:]}.json"
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock_path = state_dir / ".lock"
@@ -299,6 +302,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--provider", choices=("claude", "codex"), required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--state-root")
     arguments = parser.parse_args()
     try:
         raw = os.read(0, MAX_INPUT_BYTES + 1)
@@ -306,7 +310,17 @@ def main() -> int:
             return 0
         event = json.loads(raw)
         if isinstance(event, dict):
-            update_binding(arguments.provider, event, arguments.version, Path.home().resolve())
+            state_value = arguments.state_root or os.environ.get(
+                "MOBILE_TERMINAL_PROVIDER_BINDING_STATE_ROOT"
+            )
+            state_root = Path(state_value).resolve() if state_value else None
+            update_binding(
+                arguments.provider,
+                event,
+                arguments.version,
+                Path.home().resolve(),
+                state_root=state_root,
+            )
     except Exception:
         pass
     return 0

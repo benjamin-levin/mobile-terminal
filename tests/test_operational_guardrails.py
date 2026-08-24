@@ -690,7 +690,53 @@ printf 'INFO never-print-this-bootstrap-token\n'
                 path.write_text(source)
                 path.chmod(0o755)
             env = os.environ.copy()
-            env["HOME"] = str(root / "home")
+            home = root / "home"
+            (home / ".claude").mkdir(parents=True)
+            (home / ".codex/hooks").mkdir(parents=True)
+            (home / ".claude/settings.json").write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "SessionStart": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "/repo/provider_binding_hook.py --provider claude",
+                                        }
+                                    ]
+                                }
+                            ],
+                            "SessionEnd": [
+                                {
+                                    "_mobile_terminal_source": "moved-tag",
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "/repo/provider_binding_hook.py --provider claude",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    }
+                )
+            )
+            (home / ".codex/hooks/hooks.json").write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "SessionStart": [
+                                {
+                                    "type": "command",
+                                    "command": "/repo/provider_binding_hook.py --provider codex",
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+            env["HOME"] = str(home)
             env["PATH"] = f"{fake_bin}:{env['PATH']}"
             env["JOURNAL_ARGS"] = str(journal_args)
 
@@ -702,6 +748,8 @@ printf 'INFO never-print-this-bootstrap-token\n'
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("manual_windows=1", result.stdout)
+            self.assertIn("claude_hook_events=2", result.stdout)
+            self.assertIn("codex_hook_events=1", result.stdout)
             self.assertIn("recent_error_count=0", result.stdout)
             self.assertNotIn(secret, result.stdout + result.stderr)
             self.assertIn("--lines=200", journal_args.read_text())
@@ -755,6 +803,31 @@ printf 'INFO never-print-this-bootstrap-token\n'
         self.assertIn("self.test_case.addAsyncCleanup(self._stop_process, process)", harness)
         self.assertIn("def tmux_client_options()", server)
         self.assertIn('["tmux", *tmux_client_options(), *args]', server)
+
+    def test_provider_fixture_recorder_uses_private_visible_control_probes(self):
+        recorder = self.source("tests/tools/record_provider_fixtures.py")
+        visible_start = recorder.index("    def capture_visible(")
+        saved_start = recorder.index("    def capture(", visible_start)
+        geometry_start = recorder.index("def record_geometry(", saved_start)
+        visible = recorder[visible_start:saved_start]
+        saved = recorder[saved_start:geometry_start]
+        ready_start = recorder.index("        def ready()", geometry_start)
+        ready_end = recorder.index("        wait_for(", ready_start)
+        ready = recorder[ready_start:ready_end]
+
+        self.assertIn('self.env = dict(env, TMUX_TMPDIR=str(root / "tmux-tmp"))', recorder)
+        self.assertIn('["tmux", "-S", self.socket, *arguments]', recorder)
+        self.assertNotIn("resize-window", recorder)
+        self.assertNotIn('"-N"', visible)
+        self.assertIn('arguments = ["capture-pane", "-p"]', saved)
+        self.assertIn('arguments.append("-e")', saved)
+        self.assertIn('arguments.append("-N")', saved)
+        self.assertIn("value = tmux.capture_visible()", ready)
+        self.assertIn('return True if "❯" in value else None', ready)
+        self.assertNotIn("Claude Code v", ready)
+        self.assertIn("save_failure_snapshot(root, failure_phase, tmux)", recorder)
+        self.assertNotIn('"bullets":', recorder)
+        self.assertNotIn('"unicode":', recorder)
 
     def test_test_state_and_provider_subprocesses_are_sanitized(self):
         proxy_tests = self.source("tests/test_proxy_integration.py")

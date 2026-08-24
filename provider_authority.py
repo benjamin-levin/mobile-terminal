@@ -129,6 +129,7 @@ GRAPHEME_RE = regex.compile(r"\X")
 REGIONAL_INDICATOR_RE = regex.compile(r"\A\p{Regional_Indicator}\Z")
 EXTENDED_PICTOGRAPHIC_RE = regex.compile(r"\p{Extended_Pictographic}")
 EMOJI_MODIFIER_RE = regex.compile(r"\p{Emoji_Modifier}")
+VERIFIED_CAPTURED_WIDE_PICTOGRAPHS = frozenset({"✅"})
 HTML_ENTITY_RE = re.compile(
     r"&(?:#[xX][0-9A-Fa-f]+|#[0-9]+|[A-Za-z][A-Za-z0-9]+);"
 )
@@ -316,6 +317,7 @@ CLAUDE_PROFILES = {
         "  ",
         "- ",
         "{number}. ",
+        marker_style="assistant",
         first_gutter_styles=("assistant-dot", "assistant"),
     ),
 }
@@ -1052,6 +1054,8 @@ def _is_verified_cjk_base(character: str) -> bool:
 def _captured_grapheme_width(grapheme: str) -> int:
     if grapheme == "♥︎":
         return 1
+    if grapheme in VERIFIED_CAPTURED_WIDE_PICTOGRAPHS and wcwidth(grapheme) == 2:
+        return 2
     if all(REGIONAL_INDICATOR_RE.fullmatch(character) for character in grapheme):
         if len(grapheme) == 2:
             return 2
@@ -1184,10 +1188,7 @@ def _compile_render_lines(
 def _unit_width(grapheme: str) -> int:
     if grapheme == "\t":
         raise ProviderAuthorityError("unsupported-wrap-tab")
-    width = _grapheme_width(grapheme)
-    if width != 1:
-        raise ProviderAuthorityError("unsupported-wrap-width")
-    return width
+    return _grapheme_width(grapheme)
 
 
 def render_semantic_candidate(
@@ -2066,6 +2067,10 @@ def _candidate_selection_index(candidate: RenderCandidate) -> _CandidateSelectio
     )
 
 
+def _candidate_row_width(row: str) -> int:
+    return sum(_grapheme_width(grapheme) for grapheme in GRAPHEME_RE.findall(row))
+
+
 def _candidate_selection_text(
     candidate: RenderCandidate,
     placement: int,
@@ -2076,12 +2081,13 @@ def _candidate_selection_text(
 ) -> _CandidateSelection:
     first_row = placement
     last_row = placement + len(candidate.plain_rows) - 1
+    row_widths = tuple(_candidate_row_width(row) for row in candidate.plain_rows)
     if (
         selection_start >= selection_end
         or selection_start[0] < first_row
         or selection_end[0] > last_row
-        or not 0 <= selection_start[1] <= len(candidate.plain_rows[0])
-        or not 0 <= selection_end[1] <= len(candidate.plain_rows[0])
+        or not 0 <= selection_start[1] <= row_widths[selection_start[0] - placement]
+        or not 0 <= selection_end[1] <= row_widths[selection_end[0] - placement]
     ):
         raise ProviderAuthorityError("selection-outside-provider-block")
     if index is None:
@@ -2102,7 +2108,7 @@ def _candidate_selection_text(
             row_end = (
                 selection_end[1]
                 if absolute_row == selection_end[0]
-                else len(candidate.plain_rows[cell.row])
+                else row_widths[cell.row]
             )
             overlap_start = max(row_start, cell.column)
             overlap_end = min(row_end, cell.column + cell.width)

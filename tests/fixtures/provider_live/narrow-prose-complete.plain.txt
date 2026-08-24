@@ -1,0 +1,30 @@
+│                         ▝▜██████▀                        │
+│                           ▝▝ ▝▝                          │
+│                                                          │
+│                        Haiku 4.5                         │
+│                        Claude Max                        │
+│         /…/scratchpad/narrow-record/narrow/work          │
+│                                                          │
+╰──────────────────────────────────────────────────────────╯
+
+
+❯ Reply with exactly three lines and no commentary. Line    
+  one is FIXTURE-PROSE-BEGIN. Line two is: Reliable         
+  terminal copying preserves authored words while removing  
+  visual wraps, so a paragraph selected on a narrow screen  
+  still returns the original sentence without invented      
+  newlines. Line three is FIXTURE-PROSE-END.                
+
+● FIXTURE-PROSE-BEGIN                                       
+  Reliable terminal copying preserves authored words while  
+  removing visual wraps, so a paragraph selected on a narrow
+  screen still returns the original sentence without        
+  invented newlines.                                        
+  FIXTURE-PROSE-END           
+
+✻ Baked for 1s                                              
+  You've used 86% of your weekly limit · resets Aug 27, 2…  
+────────────────────────────────────────────────────────────
+❯                                                           
+────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← 5 agents         

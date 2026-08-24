@@ -1,0 +1,30 @@
+                                                                                                    
+  Reliable terminal copying preserves authored words while removing visual wraps, so a paragraph    
+  selected on a narrow screen still returns the original sentence without invented newlines.        
+                                                                                                    
+  - first bullet wraps naturally across the terminal width without changing its source              
+  - second bullet remains distinct from the first item                                              
+                                                                                                    
+  Status ✅ 東京 漢字 complete                                                                      
+                                                                                                    
+  Inline code_value() remains here.                                                                 
+                                                                                                    
+  FIXTURE-MIXED-END                                                                                 
+
+✻ Sautéed for 2s                                                                                    
+
+❯ Reply with exactly this markdown and no commentary: a line containing FIXTURE-CODE-BEGIN, then a  
+  line containing Inline code_value() remains here., then a fenced python code block containing     
+  only print("東京 ✅"), then a line containing FIXTURE-CODE-END.                                   
+
+● FIXTURE-CODE-BEGIN                                                                                
+  Inline code_value() remains here.               
+  print("東京 ✅")                                                                                  
+  FIXTURE-CODE-END       
+
+✻ Worked for 1s                                                                                     
+                      You've used 85% of your weekly limit · resets Aug 27, 2am (America/New_York)  
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                                                                   
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← 5 agents                                                 
