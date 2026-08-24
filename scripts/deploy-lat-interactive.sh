@@ -52,6 +52,8 @@ WORK=$(mktemp -d "/tmp/mt-lat-deploy.XXXXXX")
 trap 'rm -rf -- "$WORK" "$PAYLOAD_DIR/.mt-lat-closure.tar.gz" "$PAYLOAD_DIR/.mt-lat-remote-deploy.sh"' EXIT
 mkdir -p "$WORK/closure"
 tar -xzf "$PAYLOAD_DIR/.mt-lat-closure.tar.gz" -C "$WORK/closure"
+# The payload is code only (no secrets); per-user pip/smoke must read it.
+chmod -R a+rX "$WORK"
 
 ensure_unit_dropin() {
   local dropin_dir=/etc/systemd/system/mobile-terminal@.service.d
