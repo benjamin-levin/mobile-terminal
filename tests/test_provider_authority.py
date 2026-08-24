@@ -1,6 +1,8 @@
 import json
 import os
+import random
 import tempfile
+import time
 import unittest
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -699,6 +701,310 @@ class RenderingAndMatchingTest(unittest.TestCase):
         )
         self.assertFalse(style_result.matched)
 
+    def test_selected_window_mapping_is_globally_unambiguous(self):
+        quarantined = provider_authority_module._QuarantinedCapturedRow(
+            "unsafe-captured-wide-cell"
+        )
+        repeated = self.candidate(
+            "left\nsame\nright\nsame\nend",
+            record_id="repeated",
+            cols=12,
+        )
+        rows = [quarantined] * (len(repeated.plain_rows) + 2)
+        selected_row = 3
+        rows[selected_row] = repeated.plain_rows[1]
+        start = (selected_row, 2)
+        end = (selected_row, 6)
+        result = match_complete_provider_block(
+            (repeated,),
+            rows,
+            start,
+            end,
+        )
+        self.assertFalse(result.matched)
+        self.assertEqual(result.internal_reason, "placement-ambiguous")
+
+        first = self.candidate("left\nsame\nright", record_id="first", cols=12)
+        second = self.candidate("other\nsame\nelse", record_id="second", cols=12)
+        rows = (quarantined, first.plain_rows[1], quarantined)
+        different_records = match_complete_provider_block(
+            (first, second),
+            rows,
+            (1, 2),
+            (1, 6),
+        )
+        self.assertFalse(different_records.matched)
+        self.assertEqual(
+            different_records.internal_reason,
+            "placement-ambiguous",
+        )
+
+        different_island = replace(
+            second,
+            source_id=first.source_id,
+            source_start=100,
+            source_end=100 + len(second.source_text.encode("utf-8")),
+        )
+        islands = match_complete_provider_block(
+            (first, different_island),
+            rows,
+            (1, 2),
+            (1, 6),
+        )
+        self.assertFalse(islands.matched)
+        self.assertEqual(islands.internal_reason, "placement-ambiguous")
+
+    def test_selected_window_unsupported_alias_poisons_supported_mapping(self):
+        quarantined = provider_authority_module._QuarantinedCapturedRow(
+            "unsafe-captured-wide-cell"
+        )
+        supported = self.candidate("left\nsame\nright", record_id="supported", cols=12)
+        unsupported = replace(
+            self.candidate("other\nsame\nelse", record_id="unsupported", cols=12),
+            unsupported=True,
+        )
+        result = match_complete_provider_block(
+            (supported, unsupported),
+            (quarantined, supported.plain_rows[1], quarantined),
+            (1, 2),
+            (1, 6),
+        )
+        self.assertFalse(result.matched)
+        self.assertEqual(result.internal_reason, "no-canonical-candidate")
+
+    def test_clipped_edge_aliases_poison_different_copy_offsets(self):
+        quarantined = provider_authority_module._QuarantinedCapturedRow(
+            "unsafe-captured-wide-cell"
+        )
+        candidate = render_semantic_candidate(
+            AssistantTextRecord("claude", "edge", "edge", "same\nsame  ", 1),
+            version="test",
+            cols=12,
+            profile=self.profile,
+            first_record_island=False,
+        )
+        self.assertEqual(candidate.plain_rows[0], candidate.plain_rows[1])
+        styles = normalize_styled_rows(
+            verified_styled_rows(candidate),
+            candidate.plain_rows,
+        )
+        for name, rows, actual_styles, terminal_row in (
+            (
+                "top",
+                (candidate.plain_rows[1], quarantined),
+                (styles[1], quarantined),
+                0,
+            ),
+            (
+                "bottom",
+                (quarantined, candidate.plain_rows[0]),
+                (quarantined, styles[0]),
+                1,
+            ),
+        ):
+            for selection_name, start_column, end_column in (
+                ("full", 2, 6),
+                ("prefix", 2, 5),
+                ("suffix", 3, 6),
+            ):
+                with self.subTest(edge=name, selection=selection_name):
+                    result = match_complete_provider_block(
+                        (candidate,),
+                        rows,
+                        (terminal_row, start_column),
+                        (terminal_row, end_column),
+                        style_rows=actual_styles,
+                    )
+                    self.assertFalse(result.matched)
+                    self.assertEqual(
+                        result.internal_reason,
+                        "placement-ambiguous",
+                    )
+                    if selection_name == "full":
+                        self.assertNotIn(result.text, {"same", "same  "})
+
+    def test_clipped_prefix_and_suffix_fail_but_full_surroundings_match(self):
+        cases = (
+            ("top", self.candidate("prefix\nsame", cols=12), 1),
+            ("bottom", self.candidate("same\nsuffix", cols=12), 0),
+        )
+        for name, candidate, visible_row in cases:
+            with self.subTest(edge=name):
+                result = match_complete_provider_block(
+                    (candidate,),
+                    (candidate.plain_rows[visible_row],),
+                    (0, 2),
+                    (0, 6),
+                )
+                self.assertFalse(result.matched)
+                self.assertEqual(result.internal_reason, "placement-ambiguous")
+
+        candidate = self.candidate("prefix\nsame\nsuffix", cols=12)
+        result = match_complete_provider_block(
+            (candidate,),
+            candidate.plain_rows,
+            (1, 2),
+            (1, 6),
+        )
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "same")
+
+    def test_colliding_claimed_identity_keeps_conflicts_and_dedupes_exact_records(self):
+        quarantined = provider_authority_module._QuarantinedCapturedRow(
+            "unsafe-captured-wide-cell"
+        )
+        first = self.candidate(
+            "left\nsame\nright",
+            record_id="claimed",
+            source_id="claimed",
+            cols=12,
+        )
+        conflicting = self.candidate(
+            "xxxx\nsame\nyyyyy",
+            record_id="claimed",
+            source_id="claimed",
+            cols=12,
+        )
+        self.assertEqual(first.source_start, conflicting.source_start)
+        self.assertEqual(first.source_end, conflicting.source_end)
+        rows = (quarantined, first.plain_rows[1], quarantined)
+        conflict = match_complete_provider_block(
+            (first, conflicting),
+            rows,
+            (1, 2),
+            (1, 6),
+        )
+        self.assertFalse(conflict.matched)
+        self.assertEqual(conflict.internal_reason, "placement-ambiguous")
+
+        duplicate = match_complete_provider_block(
+            (first, replace(first)),
+            rows,
+            (1, 2),
+            (1, 6),
+        )
+        self.assertTrue(duplicate.matched)
+        self.assertEqual(duplicate.text, "same")
+
+    def test_anchored_placement_discovery_matches_small_exhaustive_reference(self):
+        random_source = random.Random(731)
+        quarantined = provider_authority_module._QuarantinedCapturedRow(
+            "unsafe-captured-wide-cell"
+        )
+        base = self.candidate("seed", cols=8)
+        for probe in range(500):
+            snapshot_height = random_source.randint(1, 7)
+            candidate_height = random_source.randint(1, 5)
+            selection_first = random_source.randrange(snapshot_height)
+            selection_last = random_source.randrange(
+                selection_first,
+                snapshot_height,
+            )
+            rows = [random_source.choice(("a", "b", "c")) for _ in range(snapshot_height)]
+            for row_index in range(snapshot_height):
+                if (
+                    not selection_first <= row_index <= selection_last
+                    and random_source.randrange(5) == 0
+                ):
+                    rows[row_index] = quarantined
+            candidate_rows = tuple(
+                random_source.choice(("a", "b", "c"))
+                for _ in range(candidate_height)
+            )
+            candidate = replace(
+                base,
+                plain_rows=candidate_rows,
+                style_rows=((),) * candidate_height,
+            )
+            selection_start = (selection_first, 0)
+            selection_end = (selection_last, 1)
+            context_start, context_end = provider_authority_module._selection_safe_context(
+                rows,
+                selection_start,
+                selection_end,
+            )
+            actual, _ = provider_authority_module._candidate_window_placements(
+                candidate,
+                rows,
+                selection_start,
+                selection_end,
+                context_start,
+                context_end,
+            )
+            actual = tuple(
+                placement
+                for placement in actual
+                if placement <= selection_first
+                and placement + candidate_height - 1 >= selection_last
+            )
+            expected = []
+            for placement in range(1 - candidate_height, snapshot_height):
+                if (
+                    placement > selection_first
+                    or placement + candidate_height - 1 < selection_last
+                ):
+                    continue
+                overlap_start = max(placement, context_start)
+                overlap_end = min(
+                    placement + candidate_height,
+                    context_end,
+                )
+                if overlap_start >= overlap_end:
+                    continue
+                if all(
+                    rows[absolute_row]
+                    == candidate_rows[absolute_row - placement]
+                    for absolute_row in range(overlap_start, overlap_end)
+                ):
+                    expected.append(placement)
+            self.assertEqual(actual, tuple(expected), f"probe {probe}")
+
+    def test_anchored_matcher_bounds_adversarial_record_window(self):
+        row = "same".ljust(12)
+        candidate = provider_authority_module.RenderCandidate(
+            provider="claude",
+            version="test",
+            record_id="record-0",
+            source_id="record-0",
+            source_text="same",
+            copy_text="same",
+            plain_rows=(row,) * 1000,
+            style_rows=((),) * 1000,
+            cells=(
+                provider_authority_module.RenderedCell(
+                    500,
+                    0,
+                    "same",
+                    4,
+                    0,
+                    4,
+                ),
+            ),
+            boundaries=(),
+            selection_start=(500, 0),
+            selection_end=(500, 4),
+            source_end=4,
+        )
+        candidates = tuple(
+            replace(
+                candidate,
+                record_id=f"record-{record_index}",
+                source_id=f"record-{record_index}",
+            )
+            for record_index in range(128)
+        )
+        started = time.perf_counter()
+        result = match_complete_provider_block(
+            candidates,
+            (row,) * 2000,
+            (1000, 0),
+            (1000, 4),
+        )
+        elapsed = time.perf_counter() - started
+        self.assertFalse(result.matched)
+        self.assertEqual(result.internal_reason, "placement-ambiguous")
+        self.assertLess(elapsed, 5.0)
+
     def test_runtime_style_normalization_verifies_required_spans(self):
         candidate = self.candidate("**same**", cols=12)
         plain = candidate.plain_rows[0]
@@ -1363,7 +1669,7 @@ class ProviderSelectionQuarantineTest(unittest.TestCase):
             version="2.1.241",
             cols=self.cols,
         )
-        self.assertGreater(len(self.candidate.plain_rows), 1)
+        self.assertGreaterEqual(len(self.candidate.plain_rows), 3)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -1413,6 +1719,21 @@ class ProviderSelectionQuarantineTest(unittest.TestCase):
                 self.candidate.selection_end[1],
             ),
         )
+
+    def candidate_row_selection(self, candidate_row, terminal_row):
+        cells = [
+            cell
+            for cell in self.candidate.cells
+            if cell.row == candidate_row and cell.copy_start is not None
+        ]
+        start = (terminal_row, min(cell.column for cell in cells))
+        end = (
+            terminal_row,
+            max(cell.column + cell.width for cell in cells),
+        )
+        copy_start = min(cell.copy_start for cell in cells)
+        copy_end = max(cell.copy_end for cell in cells)
+        return start, end, self.candidate.copy_text[copy_start:copy_end]
 
     def assert_rejected(self, plain, styled, reason):
         rows = (plain, *self.candidate.plain_rows)
@@ -1469,22 +1790,152 @@ class ProviderSelectionQuarantineTest(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assert_rejected(plain, styled, reason)
 
-    def test_quarantine_inside_candidate_blocks_spanning_placement(self):
-        plain_rows = list(self.candidate.plain_rows)
-        styled_rows = list(verified_styled_rows(self.candidate))
-        plain_rows[1] = "✳"
-        styled_rows[1] = "✳"
-        with self.assertRaises(ProviderAuthorityError) as raised:
-            self.select(
-                plain_rows,
-                styled_rows,
-                (self.candidate.selection_start[0], self.candidate.selection_start[1]),
-                (0, self.cols),
-            )
-        self.assertEqual(
-            raised.exception.reason,
-            "candidate-spans-quarantine",
+    def test_inserted_and_replaced_spinner_allow_exact_selected_windows(self):
+        split = 1
+        styled_candidate = verified_styled_rows(self.candidate)
+        for inserted in (True, False):
+            with self.subTest(inserted=inserted):
+                if inserted:
+                    plain_rows = (
+                        *self.candidate.plain_rows[:split],
+                        "✳",
+                        *self.candidate.plain_rows[split:],
+                    )
+                    styled_rows = (
+                        *styled_candidate[:split],
+                        "✳",
+                        *styled_candidate[split:],
+                    )
+                    after_shift = 1
+                else:
+                    plain_rows = list(self.candidate.plain_rows)
+                    styled_rows = list(styled_candidate)
+                    plain_rows[split] = "✳"
+                    styled_rows[split] = "✳"
+                    after_shift = 0
+
+                before_start, before_end, before_text = self.candidate_row_selection(0, 0)
+                before = self.select(
+                    plain_rows,
+                    styled_rows,
+                    before_start,
+                    before_end,
+                )
+                self.assertTrue(before.owned)
+                self.assertEqual(before.text, before_text)
+
+                first_after_row = split if inserted else split + 1
+                candidate_row = len(self.candidate.plain_rows) - 1
+                after_start, _, _ = self.candidate_row_selection(
+                    first_after_row,
+                    first_after_row + after_shift,
+                )
+                _, after_end, _ = self.candidate_row_selection(
+                    candidate_row,
+                    candidate_row + after_shift,
+                )
+                after_cells = [
+                    cell
+                    for cell in self.candidate.cells
+                    if first_after_row <= cell.row <= candidate_row
+                    and cell.copy_start is not None
+                ]
+                after_copy_start = min(cell.copy_start for cell in after_cells)
+                after_copy_end = max(cell.copy_end for cell in after_cells)
+                after_text = self.candidate.copy_text[
+                    after_copy_start:after_copy_end
+                ]
+                self.assertEqual(
+                    after_text,
+                    "response exactly" if inserted else "exactly",
+                )
+                after = self.select(
+                    plain_rows,
+                    styled_rows,
+                    after_start,
+                    after_end,
+                )
+                self.assertTrue(after.owned)
+                self.assertEqual(after.text, after_text)
+
+    def test_required_style_mismatch_inside_safe_window_rejects(self):
+        split = 1
+        plain_rows = (
+            *self.candidate.plain_rows[:split],
+            "✳",
+            *self.candidate.plain_rows[split:],
         )
+        styled_candidate = verified_styled_rows(self.candidate, dot_fg=114)
+        styled_rows = (
+            *styled_candidate[:split],
+            "✳",
+            *styled_candidate[split:],
+        )
+        start, end, _ = self.candidate_row_selection(0, 0)
+        with self.assertRaises(ProviderAuthorityError) as raised:
+            self.select(plain_rows, styled_rows, start, end)
+        self.assertEqual(raised.exception.reason, "style-mismatch")
+
+    def test_non_quarantine_mismatch_inside_safe_window_rejects(self):
+        candidate_row = len(self.candidate.plain_rows) - 1
+        start, end, _ = self.candidate_row_selection(
+            candidate_row,
+            candidate_row + 1,
+        )
+        original = self.candidate.plain_rows[1]
+        for changed in (
+            "changed".ljust(self.cols),
+            "." + original[1:],
+            original[:-1] + "x",
+        ):
+            with self.subTest(changed=changed):
+                plain_rows = (
+                    self.candidate.plain_rows[0],
+                    "✳",
+                    changed,
+                    *self.candidate.plain_rows[2:],
+                )
+                styled_rows = (
+                    verified_styled_rows(self.candidate)[0],
+                    "✳",
+                    changed,
+                    *verified_styled_rows(self.candidate)[2:],
+                )
+                with self.assertRaises(ProviderAuthorityError) as raised:
+                    self.select(plain_rows, styled_rows, start, end)
+                self.assertEqual(raised.exception.reason, "no-plain-placement")
+
+    def test_selection_touching_or_crossing_spinner_uses_original_reason(self):
+        split = 1
+        plain_rows = (
+            *self.candidate.plain_rows[:split],
+            "✳",
+            *self.candidate.plain_rows[split:],
+        )
+        styled_candidate = verified_styled_rows(self.candidate)
+        styled_rows = (
+            *styled_candidate[:split],
+            "✳",
+            *styled_candidate[split:],
+        )
+        before_start, _, _ = self.candidate_row_selection(0, 0)
+        candidate_row = len(self.candidate.plain_rows) - 1
+        _, after_end, _ = self.candidate_row_selection(
+            candidate_row,
+            candidate_row + 1,
+        )
+        for start, end in (
+            (before_start, (split, 0)),
+            ((split, self.cols), after_end),
+            (before_start, after_end),
+        ):
+            with self.subTest(start=start, end=end):
+                with self.assertRaises(ProviderAuthorityError) as raised:
+                    self.select(plain_rows, styled_rows, start, end)
+                self.assertEqual(
+                    raised.exception.reason,
+                    "unsafe-captured-wide-cell",
+                )
 
     def test_duplicate_candidate_remains_ambiguous_with_quarantine(self):
         plain_rows = (
@@ -1802,6 +2253,32 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         self.assertEqual(result.text, "final answer")
         self.assertEqual([len(row) for row in rows], [90, 45])
 
+    def test_historical_width_window_remains_exact_at_quarantine_boundary(self):
+        candidate = render_semantic_candidate(self.record, version="2.1.241", cols=180)
+        quarantined = provider_authority_module._QuarantinedCapturedRow(
+            "unsafe-captured-wide-cell"
+        )
+        ordinary = "unrelated".ljust(90)
+        selected = candidate.plain_rows[0][:45]
+        selected_styled = f"\x1b[38;5;231m{selected[0]}\x1b[0m{selected[1:]}"
+        ordinary_styles = normalize_styled_rows((ordinary,), (ordinary,))[0]
+        selected_styles = normalize_styled_rows((selected_styled,), (selected,))[0]
+        result = authoritative_provider_match(
+            self.binding,
+            TranscriptIndex(),
+            transcript_root=self.root,
+            cols=180,
+            plain_rows=(ordinary, quarantined, selected),
+            selection_start=(2, candidate.selection_start[1]),
+            selection_end=(2, candidate.selection_end[1]),
+            style_rows=(ordinary_styles, quarantined, selected_styles),
+            proc_start_reader=lambda pid: "77",
+            proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+        )
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "final answer")
+        self.assertEqual((len(ordinary), len(selected)), (90, 45))
+
     def test_inline_code_island_matches_historical_width_with_exact_copy(self):
         source = "before `code`\nselected  fragment  \nafter `code`"
         write_jsonl(self.path, [claude_text(source)])
@@ -2024,6 +2501,45 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         result = self.match()
         self.assertFalse(result.matched)
         self.assertEqual(result.internal_reason, "placement-ambiguous")
+
+    def test_duplicate_claimed_transcript_identity_fails_only_on_conflict(self):
+        claimed = dict(message_id="same", record_uuid="same-record")
+        quarantined = provider_authority_module._QuarantinedCapturedRow(
+            "unsafe-captured-wide-cell"
+        )
+        first = render_semantic_candidate(
+            replace(self.record, text="left\nsame\nright"),
+            version="2.1.241",
+            cols=24,
+        )
+
+        def match_claimed(records):
+            write_jsonl(self.path, records)
+            return authoritative_provider_match(
+                self.binding,
+                TranscriptIndex(),
+                transcript_root=self.root,
+                cols=24,
+                plain_rows=(quarantined, first.plain_rows[1], quarantined),
+                selection_start=(1, 2),
+                selection_end=(1, 6),
+                proc_start_reader=lambda pid: "77",
+                proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+            )
+
+        conflicting = match_claimed(
+            (
+                claude_text("left\nsame\nright", **claimed),
+                claude_text("xxxx\nsame\nyyyyy", **claimed),
+            )
+        )
+        self.assertFalse(conflicting.matched)
+        self.assertEqual(conflicting.internal_reason, "placement-ambiguous")
+
+        exact = claude_text("left\nsame\nright", **claimed)
+        duplicate = match_claimed((exact, exact))
+        self.assertTrue(duplicate.matched)
+        self.assertEqual(duplicate.text, "same")
 
     def test_append_during_matching_fails_closed(self):
         def append():

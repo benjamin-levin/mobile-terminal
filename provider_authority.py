@@ -6,6 +6,7 @@ import re
 import stat
 import threading
 import unicodedata
+from bisect import bisect_left
 from collections import OrderedDict, deque
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -238,6 +239,21 @@ class OwnershipRange:
 @dataclass(frozen=True)
 class _QuarantinedCapturedRow:
     reason: str
+
+
+@dataclass(frozen=True)
+class _CandidateSelection:
+    text: str
+    copy_start: int
+    copy_end: int
+
+
+@dataclass(frozen=True)
+class _CandidateSelectionIndex:
+    cells_by_row: tuple[tuple[tuple[int, RenderedCell], ...], ...]
+    boundaries_by_row: tuple[tuple[BoundaryProvenance, ...], ...]
+    copy_ranges: tuple[tuple[int, int, int], ...]
+    copy_starts: tuple[int, ...]
 
 
 _CAPTURED_ROW_QUARANTINE_REASONS = frozenset(
@@ -1801,44 +1817,252 @@ def _style_satisfies(expected: str, actual: str) -> bool:
     }
 
 
+def _captured_style_cells(
+    row: Sequence[tuple[int, int, str]] | _QuarantinedCapturedRow,
+) -> dict[int, str] | None:
+    if isinstance(row, _QuarantinedCapturedRow):
+        return None
+    cells: dict[int, str] = {}
+    for start, end, style in row:
+        if start < 0 or end <= start:
+            return None
+        for column in range(start, end):
+            if column in cells:
+                return None
+            cells[column] = style
+    return cells
+
+
+def _candidate_style_row_matches(
+    expected_spans: Sequence[tuple[int, int, str]],
+    actual_cells: Mapping[int, str] | None,
+) -> bool:
+    return actual_cells is not None and all(
+        _style_satisfies(expected, actual_cells.get(column, "unsupported"))
+        for start, end, expected in expected_spans
+        for column in range(start, end)
+    )
+
+
 def _candidate_styles_match(
     candidate: RenderCandidate,
     actual_rows: Sequence[
         Sequence[tuple[int, int, str]] | _QuarantinedCapturedRow
     ],
     placement: int,
+    *,
+    verify_start: int | None = None,
+    verify_end: int | None = None,
+    indexed_rows: Sequence[Mapping[int, str] | None] | None = None,
+    allow_clipped: bool = False,
 ) -> bool:
-    if placement + len(candidate.style_rows) > len(actual_rows):
+    candidate_end = placement + len(candidate.style_rows)
+    if not allow_clipped and (placement < 0 or candidate_end > len(actual_rows)):
         return False
-    for row_index, expected_spans in enumerate(candidate.style_rows):
-        actual_row = actual_rows[placement + row_index]
-        if isinstance(actual_row, _QuarantinedCapturedRow):
+    overlap_start = max(
+        0,
+        placement,
+        placement if verify_start is None else verify_start,
+    )
+    overlap_end = min(
+        len(actual_rows),
+        candidate_end,
+        candidate_end if verify_end is None else verify_end,
+    )
+    if overlap_start >= overlap_end:
+        return False
+    for absolute_row in range(overlap_start, overlap_end):
+        expected_spans = candidate.style_rows[absolute_row - placement]
+        actual_cells = (
+            indexed_rows[absolute_row]
+            if indexed_rows is not None
+            else _captured_style_cells(actual_rows[absolute_row])
+        )
+        if not _candidate_style_row_matches(expected_spans, actual_cells):
             return False
-        actual_cells: dict[int, str] = {}
-        for start, end, style in actual_row:
-            if start < 0 or end <= start:
-                return False
-            for column in range(start, end):
-                if column in actual_cells:
-                    return False
-                actual_cells[column] = style
-        for start, end, expected in expected_spans:
-            if any(not _style_satisfies(expected, actual_cells.get(column, "unsupported")) for column in range(start, end)):
-                return False
     return True
+
+
+def _sequence_prefix_table(values: Sequence[Any]) -> tuple[int, ...]:
+    table = [0] * len(values)
+    matched = 0
+    for index in range(1, len(values)):
+        while matched and values[index] != values[matched]:
+            matched = table[matched - 1]
+        if values[index] == values[matched]:
+            matched += 1
+            table[index] = matched
+    return tuple(table)
 
 
 def exact_plain_row_placements(
     candidate: RenderCandidate,
     plain_rows: Sequence[str | _QuarantinedCapturedRow],
 ) -> tuple[int, ...]:
-    height = len(candidate.plain_rows)
-    if not height or height > len(plain_rows):
+    pattern = candidate.plain_rows
+    if not pattern or len(pattern) > len(plain_rows):
         return ()
-    return tuple(
-        start
-        for start in range(len(plain_rows) - height + 1)
-        if tuple(plain_rows[start : start + height]) == candidate.plain_rows
+    table = _sequence_prefix_table(pattern)
+    placements = []
+    matched = 0
+    for row_index, row in enumerate(plain_rows):
+        while matched and row != pattern[matched]:
+            matched = table[matched - 1]
+        if row == pattern[matched]:
+            matched += 1
+            if matched == len(pattern):
+                placements.append(row_index - len(pattern) + 1)
+                matched = table[matched - 1]
+    return tuple(placements)
+
+
+def _selected_quarantine_reason(
+    plain_rows: Sequence[str | _QuarantinedCapturedRow],
+    selection_start: tuple[int, int],
+    selection_end: tuple[int, int],
+) -> str | None:
+    if selection_start >= selection_end:
+        return None
+    first = max(0, selection_start[0])
+    last = min(len(plain_rows) - 1, selection_end[0])
+    for row in plain_rows[first : last + 1]:
+        if isinstance(row, _QuarantinedCapturedRow):
+            if row.reason in _CAPTURED_ROW_QUARANTINE_REASONS:
+                return row.reason
+            return "candidate-spans-quarantine"
+    return None
+
+
+def _selection_safe_context(
+    plain_rows: Sequence[str | _QuarantinedCapturedRow],
+    selection_start: tuple[int, int],
+    selection_end: tuple[int, int],
+) -> tuple[int, int]:
+    if (
+        selection_start >= selection_end
+        or selection_start[0] < 0
+        or selection_end[0] >= len(plain_rows)
+    ):
+        raise ProviderAuthorityError("selection-not-complete")
+    quarantine_reason = _selected_quarantine_reason(
+        plain_rows,
+        selection_start,
+        selection_end,
+    )
+    if quarantine_reason is not None:
+        raise ProviderAuthorityError(quarantine_reason)
+    context_start = selection_start[0]
+    while (
+        context_start > 0
+        and not isinstance(
+            plain_rows[context_start - 1],
+            _QuarantinedCapturedRow,
+        )
+    ):
+        context_start -= 1
+    context_end = selection_end[0] + 1
+    while (
+        context_end < len(plain_rows)
+        and not isinstance(plain_rows[context_end], _QuarantinedCapturedRow)
+    ):
+        context_end += 1
+    return context_start, context_end
+
+
+def _z_match_lengths(pattern: Sequence[Any], values: Sequence[Any]) -> tuple[int, ...]:
+    separator = object()
+    combined = (*pattern, separator, *values)
+    lengths = [0] * len(combined)
+    left = right = 0
+    for index in range(1, len(combined)):
+        if index <= right:
+            lengths[index] = min(right - index + 1, lengths[index - left])
+        while (
+            index + lengths[index] < len(combined)
+            and combined[lengths[index]] == combined[index + lengths[index]]
+        ):
+            lengths[index] += 1
+        if index + lengths[index] - 1 > right:
+            left = index
+            right = index + lengths[index] - 1
+    offset = len(pattern) + 1
+    return tuple(lengths[offset:])
+
+
+def _candidate_window_placements(
+    candidate: RenderCandidate,
+    plain_rows: Sequence[str | _QuarantinedCapturedRow],
+    selection_start: tuple[int, int],
+    selection_end: tuple[int, int],
+    context_start: int,
+    context_end: int,
+) -> tuple[tuple[int, ...], int | None]:
+    height = len(candidate.plain_rows)
+    if not height:
+        return (), None
+
+    row_offsets: dict[str, list[int]] = {}
+    for row_offset, row in enumerate(candidate.plain_rows):
+        row_offsets.setdefault(row, []).append(row_offset)
+
+    anchors = []
+    for terminal_row in range(selection_start[0], selection_end[0] + 1):
+        actual = plain_rows[terminal_row]
+        if isinstance(actual, _QuarantinedCapturedRow):
+            continue
+        offsets = tuple(row_offsets.get(actual, ()))
+        if offsets:
+            anchors.append((len(offsets), terminal_row, offsets))
+    if not anchors:
+        return (), None
+    _, anchor_row, anchor_offsets = min(anchors, key=lambda value: value[:2])
+
+    right_pattern = plain_rows[anchor_row:context_end]
+    right_matches = _z_match_lengths(right_pattern, candidate.plain_rows)
+    left_pattern = tuple(reversed(plain_rows[context_start : anchor_row + 1]))
+    reversed_candidate = tuple(reversed(candidate.plain_rows))
+    left_matches = _z_match_lengths(left_pattern, reversed_candidate)
+
+    placements = []
+    for row_offset in anchor_offsets:
+        right_required = min(context_end - anchor_row, height - row_offset)
+        left_required = min(anchor_row - context_start + 1, row_offset + 1)
+        if (
+            right_matches[row_offset] >= right_required
+            and left_matches[height - row_offset - 1] >= left_required
+        ):
+            placements.append(anchor_row - row_offset)
+    return tuple(sorted(placements)), anchor_row
+
+
+def _candidate_selection_index(candidate: RenderCandidate) -> _CandidateSelectionIndex:
+    cells_by_row: list[list[tuple[int, RenderedCell]]] = [
+        [] for _ in candidate.plain_rows
+    ]
+    copy_ranges = []
+    for cell_index, cell in enumerate(candidate.cells):
+        if not 0 <= cell.row < len(cells_by_row):
+            raise ProviderAuthorityError("selection-not-complete")
+        cells_by_row[cell.row].append((cell_index, cell))
+        if cell.copy_start is not None and cell.copy_end is not None:
+            copy_ranges.append((cell.copy_start, cell.copy_end, cell_index))
+
+    boundaries_by_row: list[list[BoundaryProvenance]] = [
+        [] for _ in candidate.plain_rows
+    ]
+    for boundary in candidate.boundaries:
+        if boundary.anchor_row is None or boundary.anchor_column is None:
+            raise ProviderAuthorityError("unanchored-provider-boundary")
+        if not 0 <= boundary.anchor_row < len(boundaries_by_row):
+            raise ProviderAuthorityError("selection-not-complete")
+        boundaries_by_row[boundary.anchor_row].append(boundary)
+
+    copy_ranges.sort()
+    return _CandidateSelectionIndex(
+        tuple(tuple(row) for row in cells_by_row),
+        tuple(tuple(row) for row in boundaries_by_row),
+        tuple(copy_ranges),
+        tuple(start for start, _, _ in copy_ranges),
     )
 
 
@@ -1847,7 +2071,9 @@ def _candidate_selection_text(
     placement: int,
     selection_start: tuple[int, int],
     selection_end: tuple[int, int],
-) -> str:
+    *,
+    index: _CandidateSelectionIndex | None = None,
+) -> _CandidateSelection:
     first_row = placement
     last_row = placement + len(candidate.plain_rows) - 1
     if (
@@ -1858,40 +2084,42 @@ def _candidate_selection_text(
         or not 0 <= selection_end[1] <= len(candidate.plain_rows[0])
     ):
         raise ProviderAuthorityError("selection-outside-provider-block")
+    if index is None:
+        index = _candidate_selection_index(candidate)
 
     selected: list[RenderedCell] = []
     selected_ids: set[int] = set()
-    for cell_index, cell in enumerate(candidate.cells):
-        if cell.copy_start is None or cell.copy_end is None:
-            continue
-        absolute_row = placement + cell.row
-        row_start = selection_start[1] if absolute_row == selection_start[0] else 0
-        row_end = (
-            selection_end[1]
-            if absolute_row == selection_end[0]
-            else len(candidate.plain_rows[cell.row])
-        )
-        if absolute_row < selection_start[0] or absolute_row > selection_end[0]:
-            continue
-        overlap_start = max(row_start, cell.column)
-        overlap_end = min(row_end, cell.column + cell.width)
-        if overlap_end <= overlap_start:
-            continue
-        if overlap_start != cell.column or overlap_end != cell.column + cell.width:
-            raise ProviderAuthorityError("partial-provider-cell")
-        selected.append(cell)
-        selected_ids.add(cell_index)
+    for absolute_row in range(selection_start[0], selection_end[0] + 1):
+        candidate_row = absolute_row - placement
+        for cell_index, cell in index.cells_by_row[candidate_row]:
+            if cell.copy_start is None or cell.copy_end is None:
+                continue
+            row_start = (
+                selection_start[1]
+                if absolute_row == selection_start[0]
+                else 0
+            )
+            row_end = (
+                selection_end[1]
+                if absolute_row == selection_end[0]
+                else len(candidate.plain_rows[cell.row])
+            )
+            overlap_start = max(row_start, cell.column)
+            overlap_end = min(row_end, cell.column + cell.width)
+            if overlap_end <= overlap_start:
+                continue
+            if overlap_start != cell.column or overlap_end != cell.column + cell.width:
+                raise ProviderAuthorityError("partial-provider-cell")
+            selected.append(cell)
+            selected_ids.add(cell_index)
 
     selected_boundaries = []
-    for boundary in candidate.boundaries:
-        if boundary.anchor_row is None or boundary.anchor_column is None:
-            raise ProviderAuthorityError("unanchored-provider-boundary")
-        absolute_anchor = (
-            placement + boundary.anchor_row,
-            boundary.anchor_column,
-        )
-        if selection_start < absolute_anchor <= selection_end:
-            selected_boundaries.append(boundary)
+    for absolute_row in range(selection_start[0], selection_end[0] + 1):
+        candidate_row = absolute_row - placement
+        for boundary in index.boundaries_by_row[candidate_row]:
+            absolute_anchor = (absolute_row, boundary.anchor_column)
+            if selection_start < absolute_anchor <= selection_end:
+                selected_boundaries.append(boundary)
 
     if not selected and not selected_boundaries:
         raise ProviderAuthorityError("provider-presentation-only-selection")
@@ -1930,33 +2158,26 @@ def _candidate_selection_text(
 
     output_start = 0 if reaches_leading_edge else selected_start
     output_end = len(candidate.copy_text) if reaches_trailing_edge else selected_end
-    for cell_index, cell in enumerate(candidate.cells):
-        if cell.copy_start is None or cell.copy_end is None:
-            continue
-        if (
-            cell.copy_start < output_end
-            and cell.copy_end > output_start
-            and cell_index not in selected_ids
-        ):
+    for copy_start, copy_end, cell_index in index.copy_ranges[
+        : bisect_left(index.copy_starts, output_end)
+    ]:
+        if copy_end > output_start and cell_index not in selected_ids:
             raise ProviderAuthorityError("discontinuous-provider-selection")
 
     coverage = list(selected_ranges)
-    copy_cells = [
-        cell
-        for cell in candidate.cells
-        if cell.copy_start is not None and cell.copy_end is not None
-    ]
+    if not index.copy_ranges:
+        raise ProviderAuthorityError("provider-presentation-only-selection")
     if reaches_leading_edge:
         coverage.extend(
             (boundary.copy_start, boundary.copy_end)
             for boundary in candidate.boundaries
-            if boundary.copy_end <= copy_cells[0].copy_start
+            if boundary.copy_end <= index.copy_ranges[0][0]
         )
     if reaches_trailing_edge:
         coverage.extend(
             (boundary.copy_start, boundary.copy_end)
             for boundary in candidate.boundaries
-            if boundary.copy_start >= copy_cells[-1].copy_end
+            if boundary.copy_start >= index.copy_ranges[-1][1]
         )
     coverage.sort()
     covered = output_start
@@ -1968,31 +2189,11 @@ def _candidate_selection_text(
         covered = end
     if covered < output_end:
         raise ProviderAuthorityError("unexplained-provider-gap")
-    return candidate.copy_text[output_start:output_end]
-
-
-def _quarantine_compatible_plain_row_placements(
-    candidate: RenderCandidate,
-    plain_rows: Sequence[str | _QuarantinedCapturedRow],
-) -> tuple[int, ...]:
-    height = len(candidate.plain_rows)
-    if not height or height > len(plain_rows):
-        return ()
-    placements = []
-    for start in range(len(plain_rows) - height + 1):
-        spans_quarantine = False
-        for expected, actual in zip(
-            candidate.plain_rows,
-            plain_rows[start : start + height],
-        ):
-            if isinstance(actual, _QuarantinedCapturedRow):
-                spans_quarantine = True
-            elif actual != expected:
-                break
-        else:
-            if spans_quarantine:
-                placements.append(start)
-    return tuple(placements)
+    return _CandidateSelection(
+        candidate.copy_text[output_start:output_end],
+        output_start,
+        output_end,
+    )
 
 
 def match_complete_provider_block(
@@ -2007,52 +2208,102 @@ def match_complete_provider_block(
     | None = None,
 ) -> MatchResult:
     try:
-        matches: list[tuple[RenderCandidate, int, str]] = []
-        shadows: list[tuple[RenderCandidate, int]] = []
-        spans_quarantine = False
+        context_start, context_end = _selection_safe_context(
+            plain_rows,
+            selection_start,
+            selection_end,
+        )
+        indexed_styles = (
+            tuple(_captured_style_cells(row) for row in style_rows)
+            if style_rows is not None
+            else None
+        )
+        matches: dict[
+            tuple[int, int, _CandidateSelection],
+            tuple[RenderCandidate, int, _CandidateSelection],
+        ] = {}
+        shadows: dict[
+            tuple[int, int, _CandidateSelection],
+            tuple[RenderCandidate, int, _CandidateSelection],
+        ] = {}
+        candidate_instances: dict[RenderCandidate, int] = {}
+        exact_placement_counts: dict[int, int] = {}
         has_plain_placement = False
         has_complete_selection = False
         has_matching_style = False
-        repeated_selection = False
         for candidate in candidates:
-            placements = exact_plain_row_placements(candidate, plain_rows)
-            if not placements and _quarantine_compatible_plain_row_placements(
-                candidate, plain_rows
-            ):
-                spans_quarantine = True
-            if placements:
-                has_plain_placement = True
+            if candidate in candidate_instances:
+                candidate_instance = candidate_instances[candidate]
+            else:
+                candidate_instance = len(candidate_instances)
+                candidate_instances[candidate] = candidate_instance
+            selection_index = _candidate_selection_index(candidate)
+            placements, anchor_row = _candidate_window_placements(
+                candidate,
+                plain_rows,
+                selection_start,
+                selection_end,
+                context_start,
+                context_end,
+            )
+            if indexed_styles is not None and anchor_row is not None:
+                placements = tuple(
+                    sorted(
+                        placements,
+                        key=lambda placement: not _candidate_style_row_matches(
+                            candidate.style_rows[anchor_row - placement],
+                            indexed_styles[anchor_row],
+                        ),
+                    )
+                )
+            candidate_has_selection = False
             for placement in placements:
+                complete = (
+                    placement >= 0
+                    and placement + len(candidate.plain_rows) <= len(plain_rows)
+                )
+                if complete:
+                    has_plain_placement = True
                 try:
-                    text = _candidate_selection_text(
+                    selected = _candidate_selection_text(
                         candidate,
                         placement,
                         selection_start,
                         selection_end,
+                        index=selection_index,
                     )
                 except ProviderAuthorityError:
                     continue
-                has_complete_selection = True
-                if len(placements) != 1:
-                    if not candidate.unsupported:
-                        repeated_selection = True
+                if complete:
+                    candidate_has_selection = True
+                    has_complete_selection = True
+                if style_rows is not None and not _candidate_styles_match(
+                    candidate,
+                    style_rows,
+                    placement,
+                    verify_start=context_start,
+                    verify_end=context_end,
+                    indexed_rows=indexed_styles,
+                    allow_clipped=True,
+                ):
                     continue
-                if style_rows is not None and not _candidate_styles_match(candidate, style_rows, placement):
-                    continue
+                if not complete:
+                    return MatchResult.failure("placement-ambiguous")
                 has_matching_style = True
-                if candidate.unsupported:
-                    shadows.append((candidate, placement))
-                else:
-                    matches.append((candidate, placement, text))
-        if repeated_selection:
-            return MatchResult.failure("placement-ambiguous")
-        identities = {(candidate.source_id, placement) for candidate, placement, _ in matches}
-        if len(matches) > 1 or len(identities) > 1:
-            return MatchResult.failure("placement-ambiguous")
+                identity = (candidate_instance, placement, selected)
+                target = shadows if candidate.unsupported else matches
+                target.setdefault(identity, (candidate, placement, selected))
+                if len(matches) > 1:
+                    return MatchResult.failure("placement-ambiguous")
+            if candidate_has_selection and not candidate.unsupported:
+                exact_count = exact_placement_counts.get(candidate_instance)
+                if exact_count is None:
+                    exact_count = len(exact_plain_row_placements(candidate, plain_rows))
+                    exact_placement_counts[candidate_instance] = exact_count
+                if exact_count > 1:
+                    return MatchResult.failure("placement-ambiguous")
         if not matches:
-            if spans_quarantine:
-                reason = "candidate-spans-quarantine"
-            elif not has_plain_placement:
+            if not has_plain_placement:
                 reason = "no-plain-placement"
             elif not has_complete_selection:
                 reason = "selection-not-complete"
@@ -2063,23 +2314,20 @@ def match_complete_provider_block(
             else:
                 reason = "no-canonical-candidate"
             return MatchResult.failure(reason)
-        candidate, placement, text = matches[0]
-        if any(
-            shadow_placement == placement
-            and shadow.plain_rows == candidate.plain_rows
-            and shadow.style_rows == candidate.style_rows
-            for shadow, shadow_placement in shadows
-        ):
+        if shadows:
             return MatchResult.failure("no-canonical-candidate")
+        candidate, placement, selected = next(iter(matches.values()))
         return MatchResult(
             True,
-            text=text,
+            text=selected.text,
             provider=candidate.provider,
             record_id=candidate.record_id,
             placement_row=placement,
             source_start=candidate.source_start,
             source_end=candidate.source_end,
         )
+    except ProviderAuthorityError as exc:
+        return MatchResult.failure(exc.reason)
     except Exception:
         return MatchResult.failure("no-canonical-candidate")
 
@@ -2133,18 +2381,13 @@ def authoritative_provider_match(
         records = index.update(fence, binding)
         profile = renderer_profile(binding.provider, binding.version)
         normalized_plain_rows = normalize_plain_rows(plain_rows, cols)
-        selected_quarantine = next(
-            (
-                row.reason
-                for row in normalized_plain_rows[
-                    max(0, selection_start[0]) : min(
-                        len(normalized_plain_rows), selection_end[0] + 1
-                    )
-                ]
-                if isinstance(row, _QuarantinedCapturedRow)
-            ),
-            None,
+        selected_quarantine = _selected_quarantine_reason(
+            normalized_plain_rows,
+            selection_start,
+            selection_end,
         )
+        if selected_quarantine is not None:
+            return MatchResult.failure(selected_quarantine)
         if style_rows is not None:
             if len(style_rows) != len(normalized_plain_rows):
                 raise ProviderAuthorityError("styled-row-geometry")
@@ -2183,11 +2426,6 @@ def authoritative_provider_match(
             style_rows=style_rows,
         )
         if not result.matched:
-            if (
-                selected_quarantine is not None
-                and result.internal_reason != "candidate-spans-quarantine"
-            ):
-                return MatchResult.failure(selected_quarantine)
             return result
         matched_candidate = next(
             (
