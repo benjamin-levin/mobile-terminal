@@ -293,6 +293,7 @@ class AssistantTextRecord:
     text: str
     ordinal: int
     unsupported: bool = False
+    role: str = "assistant"
 
 
 @dataclass(frozen=True)
@@ -307,6 +308,9 @@ class RendererProfile:
     marker_style: str = "list-marker"
     first_gutter_styles: tuple[str | None, ...] = ()
     source_newlines_are_hard: bool = True
+    role: str = "assistant"
+    first_text_style: str | None = None
+    wrap_margin: int = 0
 
 
 CLAUDE_PROFILES = {
@@ -321,13 +325,33 @@ CLAUDE_PROFILES = {
         first_gutter_styles=("assistant-dot", "assistant"),
     ),
 }
+CLAUDE_USER_ECHO_PROFILES = {
+    "2.1.241": RendererProfile(
+        "claude",
+        "2.1.241",
+        "❯ ",
+        "  ",
+        "- ",
+        "{number}. ",
+        text_style="user-echo",
+        first_gutter_styles=("user-echo-gutter", "user-echo-gutter"),
+        role="user",
+        first_text_style="user-echo-first",
+        wrap_margin=1,
+    ),
+}
 CODEX_PROFILES = {
     "0.147.0": RendererProfile("codex", "0.147.0", "• ", "  ", "• ", "{number}. "),
 }
 
 
-def renderer_profile(provider: str, version: str) -> RendererProfile:
-    profiles = CLAUDE_PROFILES if provider == "claude" else CODEX_PROFILES if provider == "codex" else {}
+def renderer_profile(provider: str, version: str, *, role: str = "assistant") -> RendererProfile:
+    if provider == "claude" and role == "user":
+        profiles = CLAUDE_USER_ECHO_PROFILES
+    elif role == "assistant":
+        profiles = CLAUDE_PROFILES if provider == "claude" else CODEX_PROFILES if provider == "codex" else {}
+    else:
+        profiles = {}
     try:
         return profiles[version]
     except KeyError as exc:
@@ -649,9 +673,17 @@ class TranscriptIndex:
         return raw
 
     @staticmethod
-    def _is_assistant_record(data: Mapping[str, Any], provider: str) -> bool:
+    def _is_candidate_record(data: Mapping[str, Any], provider: str) -> bool:
         if provider == "claude":
-            return data.get("type") == "assistant"
+            if data.get("type") == "assistant":
+                return True
+            origin = data.get("origin")
+            return (
+                data.get("type") == "user"
+                and data.get("promptSource") == "typed"
+                and isinstance(origin, dict)
+                and origin.get("kind") == "human"
+            )
         if provider != "codex" or data.get("type") != "response_item":
             return False
         payload = data.get("payload")
@@ -717,8 +749,8 @@ class TranscriptIndex:
                     raise ProviderAuthorityError("invalid-jsonl-record") from exc
                 if not isinstance(data, dict):
                     raise ProviderAuthorityError("schema-drift")
-                assistant = self._is_assistant_record(data, binding.provider)
-                if assistant and len(line) > self.max_record_bytes:
+                candidate_record = self._is_candidate_record(data, binding.provider)
+                if candidate_record and len(line) > self.max_record_bytes:
                     raise ProviderAuthorityError("oversized-assistant-record")
                 if binding.provider == "claude" and data.get("type") == "user":
                     bootstrap_boundary_seen = True
@@ -773,6 +805,33 @@ class TranscriptIndex:
         ordinal: int,
     ) -> tuple[AssistantTextRecord, ...]:
         record_type = data.get("type")
+        if record_type == "user":
+            origin = data.get("origin")
+            if (
+                data.get("promptSource") != "typed"
+                or not isinstance(origin, dict)
+                or origin.get("kind") != "human"
+            ):
+                return ()
+            if data.get("sessionId") != binding.session_id or not isinstance(data.get("uuid"), str):
+                raise ProviderAuthorityError("schema-drift")
+            message = data.get("message")
+            if not isinstance(message, dict) or message.get("role") != "user":
+                raise ProviderAuthorityError("schema-drift")
+            content = message.get("content")
+            if not isinstance(content, str):
+                raise ProviderAuthorityError("schema-drift")
+            record_id = f"claude:{binding.session_id}:{data['uuid']}:user"
+            return (
+                AssistantTextRecord(
+                    "claude",
+                    record_id,
+                    record_id,
+                    content,
+                    ordinal,
+                    role="user",
+                ),
+            )
         if record_type != "assistant":
             return ()
         if data.get("sessionId") != binding.session_id or not isinstance(data.get("uuid"), str):
@@ -1028,6 +1087,112 @@ def lex_semantic_source(source: str, *, source_byte_offset: int = 0) -> tuple[Se
     return _SemanticLexer(source, source_byte_offset=source_byte_offset).lex()
 
 
+def lex_user_echo_source(source: str, *, source_byte_offset: int = 0) -> tuple[SemanticToken, ...]:
+    if not isinstance(source, str):
+        raise TypeError("source must be text")
+    if source_byte_offset < 0:
+        raise ValueError("source byte offset must be non-negative")
+    # TODO: Enable authored hard breaks after a recorded multiline composer fixture verifies their layout.
+    if "\n" in source:
+        raise ProviderAuthorityError("unsupported-user-echo-hard-break")
+    if "\r" in source or "\x00" in source:
+        raise ProviderAuthorityError("unsupported-source-control")
+    if "*" in source:
+        raise ProviderAuthorityError("unsupported-user-echo-markdown")
+
+    byte_offsets = [source_byte_offset]
+    for character in source:
+        byte_offsets.append(byte_offsets[-1] + len(character.encode("utf-8")))
+    tokens: list[SemanticToken] = []
+
+    def emit(kind: str, start: int, end: int, *, style: str, semantic: str = "") -> None:
+        value = source[start:end]
+        tokens.append(
+            SemanticToken(
+                kind,
+                byte_offsets[start],
+                byte_offsets[end],
+                value,
+                "" if kind == "hidden_source" else value,
+                value,
+                semantic,
+                style,
+            )
+        )
+
+    cursor = 0
+    visible_start = 0
+    plain_style = "plain"
+    active: tuple[str, str] | None = None
+
+    def flush(position: int) -> None:
+        nonlocal visible_start
+        if position > visible_start:
+            emit(
+                "authored_visible",
+                visible_start,
+                position,
+                style=active[1] if active is not None else plain_style,
+            )
+        visible_start = position
+
+    while cursor < len(source):
+        if source[cursor] == "`" and active is None:
+            run_end = cursor + 1
+            while run_end < len(source) and source[run_end] == "`":
+                run_end += 1
+            if run_end - cursor != 1:
+                raise ProviderAuthorityError("unsupported-inline-code")
+            closing = source.find("`", run_end)
+            if closing < 0 or closing == run_end:
+                raise ProviderAuthorityError("unsupported-inline-code")
+            flush(cursor)
+            emit("hidden_source", cursor, run_end, style="user-echo-code", semantic="leading")
+            emit("authored_visible", run_end, closing, style="user-echo-code")
+            emit("hidden_source", closing, closing + 1, style="user-echo-code", semantic="trailing")
+            cursor = closing + 1
+            visible_start = cursor
+            continue
+
+        marker = None
+        marker_style = None
+        for candidate, style in (("**", "user-echo-strong"), ("*", "user-echo-emphasis")):
+            if source.startswith(candidate, cursor):
+                marker, marker_style = candidate, style
+                break
+        if marker is None:
+            cursor += 1
+            continue
+        flush(cursor)
+        if active is None:
+            closing = source.find(marker, cursor + len(marker))
+            if closing <= cursor + len(marker):
+                raise ProviderAuthorityError("unsupported-markdown")
+            emit("hidden_source", cursor, cursor + len(marker), style=marker_style, semantic="leading")
+            active = (marker, marker_style)
+            plain_style = "plain"
+        elif active[0] == marker:
+            emit("hidden_source", cursor, cursor + len(marker), style=active[1], semantic="trailing")
+            active = None
+            plain_style = "user-echo-after-format"
+        else:
+            raise ProviderAuthorityError("unsupported-nested-markdown")
+        cursor += len(marker)
+        visible_start = cursor
+
+    flush(len(source))
+    if active is not None:
+        raise ProviderAuthorityError("unsupported-markdown")
+    expected = source_byte_offset
+    for token in tokens:
+        if token.source_start != expected or token.source_end <= token.source_start:
+            raise ProviderAuthorityError("source-byte-coverage")
+        expected = token.source_end
+    if expected != source_byte_offset + len(source.encode("utf-8")):
+        raise ProviderAuthorityError("source-byte-coverage")
+    return tuple(tokens)
+
+
 def _grapheme_width(value: str) -> int:
     widths = [wcwidth(character) for character in value]
     if not widths or widths[0] <= 0 or any(width < 0 for width in widths):
@@ -1128,6 +1293,20 @@ def _compile_render_lines(
                 lines[-1].heading_level = int(token.semantic.split(":", 1)[1])
             except ValueError as exc:
                 raise ProviderAuthorityError("unsupported-heading") from exc
+        if token.kind == "hidden_source":
+            start = copy_offset
+            copy_parts.append(token.copy_text)
+            copy_offset += len(token.copy_text)
+            boundaries.append(
+                BoundaryProvenance(
+                    f"hidden-source-{token.semantic}",
+                    start,
+                    copy_offset,
+                    token.source_start,
+                    token.source_end,
+                )
+            )
+            continue
         if token.kind == "source_hard_break":
             start = copy_offset
             copy_parts.append(token.copy_text)
@@ -1203,19 +1382,28 @@ def render_semantic_candidate(
 ) -> RenderCandidate:
     if record.unsupported and not allow_unsupported:
         raise ProviderAuthorityError("unsupported-assistant-record")
-    selected_profile = profile or renderer_profile(record.provider, version)
-    if selected_profile.provider != record.provider or selected_profile.version != version or cols <= 0:
+    selected_profile = profile or renderer_profile(record.provider, version, role=record.role)
+    if (
+        selected_profile.provider != record.provider
+        or selected_profile.version != version
+        or selected_profile.role != record.role
+        or cols <= 0
+        or not 0 <= selected_profile.wrap_margin < cols
+    ):
         raise ProviderAuthorityError("renderer-profile-mismatch")
+    wrap_cols = cols - selected_profile.wrap_margin
     if not first_record_island:
         selected_profile = replace(
             selected_profile,
             first_gutter=selected_profile.continuation_gutter,
             first_gutter_styles=(),
         )
-    copy_text, lines, boundaries = _compile_render_lines(
-        lex_semantic_source(record.text, source_byte_offset=source_byte_offset),
-        selected_profile,
+    tokens = (
+        lex_user_echo_source(record.text, source_byte_offset=source_byte_offset)
+        if record.role == "user"
+        else lex_semantic_source(record.text, source_byte_offset=source_byte_offset)
     )
+    copy_text, lines, boundaries = _compile_render_lines(tokens, selected_profile)
     if any(line.heading_level == 1 for line in lines):
         raise ProviderAuthorityError("unsupported-heading-style")
 
@@ -1322,6 +1510,30 @@ def render_semantic_candidate(
                 groups[-1][1].append(unit)
             else:
                 groups.append((whitespace, [unit]))
+        previous_unit_style: str | None = None
+        post_format_row: int | None = None
+
+        def resolved_style(unit_style: str) -> str:
+            nonlocal previous_unit_style, post_format_row
+            if unit_style == "user-echo-after-format":
+                if previous_unit_style != unit_style:
+                    post_format_row = row
+                style = (
+                    unit_style
+                    if row == post_format_row
+                    else selected_profile.text_style
+                )
+            elif (
+                row == 0
+                and selected_profile.first_text_style is not None
+                and unit_style == selected_profile.text_style
+            ):
+                style = selected_profile.first_text_style
+            else:
+                style = unit_style
+            previous_unit_style = unit_style
+            return style
+
         index = 0
         while index < len(groups):
             whitespace, group = groups[index]
@@ -1329,10 +1541,11 @@ def render_semantic_candidate(
             if whitespace and index + 1 < len(groups):
                 next_group = groups[index + 1][1]
                 next_width = sum(_unit_width(unit.grapheme) for unit in next_group)
-                if len(group) == 1 and column + width + next_width > cols:
-                    if next_width > cols - len(selected_profile.continuation_gutter) - continuation_padding:
+                if len(group) == 1 and column + width + next_width > wrap_cols:
+                    if next_width > wrap_cols - len(selected_profile.continuation_gutter) - continuation_padding:
                         raise ProviderAuthorityError("unsupported-unbreakable-token")
                     unit = group[0]
+                    resolved_style(unit.style)
                     begin_row(continuation_padding)
                     boundary = BoundaryProvenance(
                         "soft-wrap-separator",
@@ -1347,18 +1560,18 @@ def render_semantic_candidate(
                     boundary_anchors[id(boundary)] = (row, 0)
                     index += 1
                     continue
-                if column + width + next_width > cols:
+                if column + width + next_width > wrap_cols:
                     raise ProviderAuthorityError("unsupported-wrap-whitespace")
-            elif not whitespace and width > cols - len(selected_profile.continuation_gutter) - continuation_padding:
+            elif not whitespace and width > wrap_cols - len(selected_profile.continuation_gutter) - continuation_padding:
                 raise ProviderAuthorityError("unsupported-unbreakable-token")
-            if column + width > cols:
+            if column + width > wrap_cols:
                 raise ProviderAuthorityError("unsupported-wrap-whitespace")
             for unit in group:
                 put(
                     unit.grapheme,
                     unit.copy_start,
                     unit.copy_end,
-                    unit.style,
+                    resolved_style(unit.style),
                 )
             index += 1
 
@@ -1420,6 +1633,35 @@ def render_semantic_candidate(
         raise ProviderAuthorityError("empty-render-candidate")
     first = copy_cells[0]
     last_cell = copy_cells[-1]
+    for boundary in (
+        value for value in boundaries if value.kind.startswith("hidden-source-")
+    ):
+        if boundary.kind == "hidden-source-leading":
+            adjacent = next(
+                (
+                    cell
+                    for cell in copy_cells
+                    if cell.copy_start == boundary.copy_end
+                ),
+                None,
+            )
+        elif boundary.kind == "hidden-source-trailing":
+            adjacent = next(
+                (
+                    cell
+                    for cell in reversed(copy_cells)
+                    if cell.copy_end == boundary.copy_start
+                ),
+                None,
+            )
+        else:
+            adjacent = None
+        if adjacent is None:
+            raise ProviderAuthorityError("unsupported-boundary-layout")
+        boundary_anchors[id(boundary)] = (
+            adjacent.row,
+            adjacent.column + adjacent.width,
+        )
     for hard_break in (value for value in boundaries if value.kind == "hard-break"):
         anchor = boundary_anchors.get(id(hard_break))
         if anchor is None:
@@ -1529,17 +1771,35 @@ def _inline_code_islands(source: str) -> tuple[tuple[int, int], ...]:
         return ()
 
     unsupported: set[int] = set()
+    fence_width: int | None = None
     for line_index, (_, _, _, body) in enumerate(lines):
+        stripped = body.lstrip(" \t")
+        marker_width = len(stripped) - len(stripped.lstrip("`"))
+        if fence_width is not None:
+            unsupported.add(line_index)
+            if marker_width >= fence_width and not stripped[marker_width:].strip(" \t"):
+                fence_width = None
+            continue
+        if marker_width >= 3:
+            unsupported.add(line_index)
+            fence_width = marker_width
+            continue
+
         spans = _inline_code_spans(body)
         if spans is None:
-            raise ProviderAuthorityError("unsupported-inline-code")
-        if not spans:
-            lex_semantic_source(body)
+            unsupported.add(line_index)
             continue
-        masked = list(body)
-        for start, end in spans:
-            masked[start:end] = "x" * (end - start)
-        lex_semantic_source("".join(masked))
+        try:
+            if not spans:
+                lex_semantic_source(body)
+                continue
+            masked = list(body)
+            for start, end in spans:
+                masked[start:end] = "x" * (end - start)
+            lex_semantic_source("".join(masked))
+        except ProviderAuthorityError:
+            unsupported.add(line_index)
+            continue
         unsupported.add(line_index)
     if not unsupported:
         raise ProviderAuthorityError("unsupported-inline-code")
@@ -1595,7 +1855,7 @@ def _render_record_candidates(
             (),
         )
     except ProviderAuthorityError as exc:
-        if exc.reason != "unsupported-inline-code":
+        if exc.reason not in {"unsupported-code-fence", "unsupported-inline-code"}:
             raise
 
     islands = _inline_code_islands(record.text)
@@ -1640,7 +1900,7 @@ def normalize_styled_rows(
         visible: list[str] = []
         column = 0
         bold = dim = italic = underline = reverse = strike = False
-        background = False
+        background: str | None = None
         foreground: str | None = None
         cursor = 0
         while cursor < len(styled):
@@ -1659,8 +1919,8 @@ def normalize_styled_rows(
                 while index < len(parameters):
                     parameter = parameters[index]
                     if parameter == 0:
-                        bold = dim = italic = underline = reverse = strike = background = False
-                        foreground = None
+                        bold = dim = italic = underline = reverse = strike = False
+                        background = foreground = None
                     elif parameter == 1:
                         bold = True
                     elif parameter == 2:
@@ -1684,16 +1944,28 @@ def normalize_styled_rows(
                     elif parameter == 29:
                         strike = False
                     elif 40 <= parameter <= 48 or 100 <= parameter <= 107:
-                        background = parameter != 49
                         if parameter == 48:
                             if index + 1 >= len(parameters) or parameters[index + 1] not in (2, 5):
                                 raise ProviderAuthorityError("unsupported-styled-row")
-                            count = 2 if parameters[index + 1] == 5 else 4
+                            mode = parameters[index + 1]
+                            count = 2 if mode == 5 else 4
                             if index + count >= len(parameters):
                                 raise ProviderAuthorityError("unsupported-styled-row")
+                            if mode == 5:
+                                value = parameters[index + 2]
+                                if not 0 <= value <= 255:
+                                    raise ProviderAuthorityError("unsupported-styled-row")
+                                background = f"indexed-{value}"
+                            else:
+                                red, green, blue = parameters[index + 2 : index + 5]
+                                if any(not 0 <= value <= 255 for value in (red, green, blue)):
+                                    raise ProviderAuthorityError("unsupported-styled-row")
+                                background = f"rgb-{red}-{green}-{blue}"
                             index += count
+                        else:
+                            background = f"sgr-{parameter}"
                     elif parameter == 49:
-                        background = False
+                        background = None
                     elif parameter == 38:
                         if index + 1 >= len(parameters) or parameters[index + 1] not in (2, 5):
                             raise ProviderAuthorityError("unsupported-styled-row")
@@ -1742,6 +2014,10 @@ def normalize_styled_rows(
                 style = "plain"
             if foreground is not None:
                 style = f"{style};fg-{foreground}"
+            if background is not None:
+                style = f"{style};bg-{background}"
+            if reverse:
+                style = f"{style};inverse"
             spans.append((column, column + width, style))
             visible.append(grapheme)
             column += width
@@ -1807,9 +2083,21 @@ def _normalize_captured_rows(
 
 
 def _style_satisfies(expected: str, actual: str) -> bool:
-    if expected == "assistant-dot":
-        return actual == "plain;fg-indexed-231"
+    exact_styles = {
+        "assistant-dot": "plain;fg-indexed-231",
+        "user-echo-gutter": "code-inline;fg-indexed-239;bg-indexed-237",
+        "user-echo-first": "code-inline;fg-indexed-231;bg-indexed-237",
+        "user-echo": "plain;fg-indexed-231",
+        "user-echo-code": "plain;fg-indexed-153",
+        "user-echo-strong": "strong;fg-indexed-231",
+        "user-echo-emphasis": "emphasis;fg-indexed-231",
+        "user-echo-after-format": "code-inline;fg-indexed-231;bg-indexed-237",
+    }
+    if expected in exact_styles:
+        return actual == exact_styles[expected]
     if expected == actual:
+        return True
+    if expected == "code" and actual.startswith("code-inline;"):
         return True
     return (expected, actual) in {
         ("assistant", "plain"),
@@ -2212,6 +2500,7 @@ def match_complete_provider_block(
         Sequence[tuple[int, int, str]] | _QuarantinedCapturedRow
     ]
     | None = None,
+    allow_partial_context: bool = False,
 ) -> MatchResult:
     try:
         context_start, context_end = _selection_safe_context(
@@ -2267,7 +2556,12 @@ def match_complete_provider_block(
                 candidate_end = placement + len(candidate.plain_rows)
                 complete = placement >= 0 and candidate_end <= len(plain_rows)
                 top_clipped = placement < 0 and candidate_end <= len(plain_rows)
-                selectable = complete or top_clipped
+                context_clipped = (
+                    allow_partial_context
+                    and placement <= context_start
+                    and candidate_end >= context_end
+                )
+                selectable = complete or top_clipped or context_clipped
                 if selectable:
                     has_plain_placement = True
                 try:
@@ -2371,6 +2665,7 @@ def authoritative_provider_match(
         Sequence[tuple[int, int, str]] | _QuarantinedCapturedRow
     ]
     | None = None,
+    allow_partial_context: bool = False,
     owner_uid: int | None = None,
     proc_start_reader: Callable[[int], str] = _read_proc_start,
     proc_environ_reader: Callable[[int], Mapping[str, str]] = _read_proc_environ,
@@ -2385,7 +2680,7 @@ def authoritative_provider_match(
         )
         fence = open_transcript_fence(binding, root=transcript_root, owner_uid=owner_uid)
         records = index.update(fence, binding)
-        profile = renderer_profile(binding.provider, binding.version)
+        renderer_profile(binding.provider, binding.version)
         normalized_plain_rows = normalize_plain_rows(plain_rows, cols)
         selected_quarantine = _selected_quarantine_reason(
             normalized_plain_rows,
@@ -2416,7 +2711,11 @@ def authoritative_provider_match(
                     record,
                     version=binding.version,
                     cols=cols,
-                    profile=profile,
+                    profile=renderer_profile(
+                        binding.provider,
+                        binding.version,
+                        role=record.role,
+                    ),
                 )
                 candidates.extend(rendered)
                 unsupported_collision_texts.extend(unsupported_texts)
@@ -2430,6 +2729,7 @@ def authoritative_provider_match(
             selection_start,
             selection_end,
             style_rows=style_rows,
+            allow_partial_context=allow_partial_context,
         )
         if not result.matched:
             return result
@@ -2845,6 +3145,7 @@ def _provider_selection_locked(
             selection_start=match_start,
             selection_end=match_end,
             style_rows=style_rows,
+            allow_partial_context=client_rows is not None,
             before_final_revalidation=lambda: _revalidate_runtime_binding(
                 binding, cache, provider_home
             ),

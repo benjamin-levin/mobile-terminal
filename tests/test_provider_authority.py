@@ -69,6 +69,17 @@ def claude_text(text, *, message_id="msg_1", record_uuid="record-1", content=Non
     }
 
 
+def claude_user(text, *, record_uuid="user-record-1"):
+    return {
+        "type": "user",
+        "uuid": record_uuid,
+        "sessionId": SESSION_ID,
+        "message": {"role": "user", "content": text},
+        "origin": {"kind": "human"},
+        "promptSource": "typed",
+    }
+
+
 def codex_meta(*, thread_id=SESSION_ID, session_id=OTHER_SESSION_ID, parent_thread_id=None):
     payload = {"id": thread_id, "session_id": session_id}
     if parent_thread_id is not None:
@@ -110,6 +121,13 @@ def verified_styled_rows(candidate, *, dot_fg=231, continuation_gutter_fg=None):
         "strong": "1",
         "emphasis": "3",
         "list-marker": "2",
+        "user-echo-gutter": "38;5;239;48;5;237",
+        "user-echo-first": "38;5;231;48;5;237",
+        "user-echo": "38;5;231",
+        "user-echo-code": "38;5;153",
+        "user-echo-strong": "1;38;5;231",
+        "user-echo-emphasis": "3;38;5;231",
+        "user-echo-after-format": "38;5;231;48;5;237",
     }
     rows = []
     for row_index, plain in enumerate(candidate.plain_rows):
@@ -355,6 +373,27 @@ class TranscriptIndexTest(unittest.TestCase):
             return index.update(fence, current)
         finally:
             close_transcript_fence(fence)
+
+    def test_claude_indexes_typed_user_text_as_user_echo(self):
+        write_jsonl(self.path, [claude_user("typed prompt"), claude_text("answer")])
+        records = self.update(TranscriptIndex())
+        self.assertEqual(
+            [(record.role, record.text) for record in records],
+            [("user", "typed prompt"), ("assistant", "answer")],
+        )
+        self.assertTrue(records[0].record_id.endswith(":user"))
+
+    def test_claude_user_echo_multiline_is_fail_closed_without_fixture_evidence(self):
+        write_jsonl(self.path, [claude_user("first\nsecond")])
+        record = self.update(TranscriptIndex())[0]
+        with self.assertRaisesRegex(ProviderAuthorityError, "user-echo-hard-break"):
+            render_semantic_candidate(record, version="2.1.241", cols=20)
+
+    def test_claude_rich_user_echo_is_fail_closed_without_verified_wrapping(self):
+        write_jsonl(self.path, [claude_user("plain **strong words** plain")])
+        record = self.update(TranscriptIndex())[0]
+        with self.assertRaisesRegex(ProviderAuthorityError, "user-echo-markdown"):
+            render_semantic_candidate(record, version="2.1.241", cols=20)
 
     def test_claude_keeps_same_message_chunks_distinct(self):
         write_jsonl(self.path, [claude_text("one", record_uuid="u1")])
@@ -736,6 +775,71 @@ class RenderingAndMatchingTest(unittest.TestCase):
         )
         self.assertFalse(style_result.matched)
 
+    def test_assistant_and_user_echo_aliases_remain_ambiguous(self):
+        source = "left same right"
+        assistant = render_semantic_candidate(
+            AssistantTextRecord("claude", "assistant", "assistant", source, 1),
+            version="2.1.241",
+            cols=10,
+        )
+        user = render_semantic_candidate(
+            AssistantTextRecord(
+                "claude",
+                "user",
+                "user",
+                source,
+                2,
+                role="user",
+            ),
+            version="2.1.241",
+            cols=10,
+        )
+        self.assertEqual(assistant.plain_rows[1], user.plain_rows[1])
+        quarantined = provider_authority_module._QuarantinedCapturedRow(
+            "unsafe-captured-wide-cell"
+        )
+        rows = (quarantined, user.plain_rows[1], quarantined)
+        ambiguous = match_complete_provider_block(
+            (assistant, user),
+            rows,
+            (1, 2),
+            (1, 6),
+        )
+        self.assertFalse(ambiguous.matched)
+        self.assertEqual(ambiguous.internal_reason, "placement-ambiguous")
+
+        poisoned = match_complete_provider_block(
+            (assistant, replace(user, unsupported=True)),
+            rows,
+            (1, 2),
+            (1, 6),
+        )
+        self.assertFalse(poisoned.matched)
+        self.assertEqual(poisoned.internal_reason, "no-canonical-candidate")
+
+    def test_user_echo_style_mismatch_fails_closed(self):
+        candidate = render_semantic_candidate(
+            AssistantTextRecord(
+                "claude",
+                "user",
+                "user",
+                "alpha beta gamma",
+                1,
+                role="user",
+            ),
+            version="2.1.241",
+            cols=10,
+        )
+        result = match_complete_provider_block(
+            (candidate,),
+            candidate.plain_rows,
+            candidate.selection_start,
+            candidate.selection_end,
+            style_rows=tuple(() for _ in candidate.style_rows),
+        )
+        self.assertFalse(result.matched)
+        self.assertEqual(result.internal_reason, "style-mismatch")
+
     def test_selected_window_mapping_is_globally_unambiguous(self):
         quarantined = provider_authority_module._QuarantinedCapturedRow(
             "unsafe-captured-wide-cell"
@@ -880,6 +984,17 @@ class RenderingAndMatchingTest(unittest.TestCase):
         self.assertFalse(result.matched)
         self.assertEqual(result.internal_reason, "placement-ambiguous")
 
+        result = match_complete_provider_block(
+            (bottom_clipped,),
+            (bottom_clipped.plain_rows[0],),
+            (0, 2),
+            (0, 6),
+            allow_partial_context=True,
+        )
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "same")
+        self.assertEqual(result.placement_row, 0)
+
         candidate = self.candidate("prefix\nsame\nsuffix", cols=12)
         result = match_complete_provider_block(
             (candidate,),
@@ -889,6 +1004,28 @@ class RenderingAndMatchingTest(unittest.TestCase):
         )
         self.assertTrue(result.matched)
         self.assertEqual(result.text, "same")
+
+        result = match_complete_provider_block(
+            (candidate,),
+            (candidate.plain_rows[1],),
+            (0, 2),
+            (0, 6),
+            allow_partial_context=True,
+        )
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "same")
+        self.assertEqual(result.placement_row, -1)
+
+        ambiguous = self.candidate("prefix\nsame\nsame\nsuffix", cols=12)
+        result = match_complete_provider_block(
+            (ambiguous,),
+            (ambiguous.plain_rows[1],),
+            (0, 2),
+            (0, 6),
+            allow_partial_context=True,
+        )
+        self.assertFalse(result.matched)
+        self.assertEqual(result.internal_reason, "placement-ambiguous")
 
     def test_colliding_claimed_identity_keeps_conflicts_and_dedupes_exact_records(self):
         quarantined = provider_authority_module._QuarantinedCapturedRow(
@@ -1439,8 +1576,14 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
         )
         transcript_path = LIVE_FIXTURE_ROOT / metadata["transcript"]["copy"]
         transcript_texts = []
+        transcript_user_texts = []
         for line in transcript_path.read_text().splitlines():
             record = json.loads(line)
+            if record.get("type") == "user":
+                message = record.get("message")
+                if isinstance(message, dict) and isinstance(message.get("content"), str):
+                    transcript_user_texts.append(message["content"])
+                continue
             if record.get("type") != "assistant":
                 continue
             message = record.get("message")
@@ -1468,6 +1611,7 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
             plain_rows=normalized_plain,
             style_rows=normalized_styles,
             transcript_texts=tuple(transcript_texts),
+            transcript_user_texts=tuple(transcript_user_texts),
         )
 
     def match(self, fixture, start, end, *, plain_rows=None, style_rows=None):
@@ -1547,6 +1691,96 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
         self.assertTrue(wrapped_prose.matched)
         self.assertEqual(wrapped_prose.text, self.prose)
         self.assertNotIn("\n", wrapped_prose.text)
+
+    def test_narrow_user_echo_replay_removes_soft_wraps_and_preserves_typed_bytes(self):
+        fixture = self.fixture("narrow-prose-complete")
+        prompt = fixture.transcript_user_texts[-1]
+
+        full = self.match(fixture, (10, 0), (15, 60))
+        self.assertTrue(full.matched)
+        self.assertEqual(full.text, prompt)
+        self.assertNotIn("\n", full.text)
+
+        partial = self.match(fixture, (11, 2), (13, 59))
+        self.assertTrue(partial.matched)
+        self.assertEqual(
+            partial.text,
+            prompt[prompt.index("one is") : prompt.index(" still returns")],
+        )
+
+    def test_wide_user_echo_replay_preserves_inline_source_markers(self):
+        fixture = self.fixture("wide-mixed-complete")
+        prompt = fixture.transcript_user_texts[-1]
+
+        full = self.match(fixture, (1, 0), (8, 100))
+        self.assertTrue(full.matched)
+        self.assertEqual(full.text, prompt)
+        self.assertIn("`code_value()`", full.text)
+        self.assertNotIn("\n", full.text)
+
+    def test_rich_user_echo_replay_fails_closed_without_verified_wrapping(self):
+        fixture = self.fixture("wide-richtext-complete")
+        result = self.match(fixture, (4, 0), (10, 100))
+        self.assertFalse(result.matched)
+        self.assertEqual(result.internal_reason, "no-plain-placement")
+
+    def test_user_echo_requires_fixture_styles_and_exact_full_rows(self):
+        fixture = self.fixture("narrow-prose-complete")
+        wrong_styles = list(fixture.style_rows)
+        wrong_styles[10] = tuple(
+            (start, end, "plain")
+            for start, end, _ in wrong_styles[10]
+        )
+        mismatch = self.match(
+            fixture,
+            (10, 0),
+            (15, 60),
+            style_rows=tuple(wrong_styles),
+        )
+        self.assertFalse(mismatch.matched)
+        self.assertEqual(mismatch.internal_reason, "style-mismatch")
+
+        for name, rewrite in (
+            (
+                "wrong-background",
+                lambda style: style.replace(";bg-indexed-237", ";bg-indexed-1"),
+            ),
+            (
+                "inverse",
+                lambda style: f"{style};inverse"
+                if ";bg-indexed-237" in style
+                else style,
+            ),
+        ):
+            with self.subTest(name=name):
+                wrong_styles = list(fixture.style_rows)
+                wrong_styles[10] = tuple(
+                    (start, end, rewrite(style))
+                    for start, end, style in wrong_styles[10]
+                )
+                mismatch = self.match(
+                    fixture,
+                    (10, 0),
+                    (15, 60),
+                    style_rows=tuple(wrong_styles),
+                )
+                self.assertFalse(mismatch.matched)
+                self.assertEqual(mismatch.internal_reason, "style-mismatch")
+
+        changed_rows = list(fixture.plain_rows)
+        changed_rows[15] = (
+            changed_rows[15][:45]
+            + "status"
+            + changed_rows[15][51:]
+        )
+        trailing_ui = self.match(
+            fixture,
+            (10, 0),
+            (15, 44),
+            plain_rows=tuple(changed_rows),
+        )
+        self.assertFalse(trailing_ui.matched)
+        self.assertEqual(trailing_ui.internal_reason, "no-plain-placement")
 
     def test_richtext_heading_replay_consumes_marker_and_requires_real_style(self):
         fixture = self.fixture("wide-richtext-complete")
@@ -1768,7 +2002,7 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
         code = self.fixture("wide-code-complete")
         fenced = self.match(code, (19, 2), (22, 18))
         self.assertFalse(fenced.matched)
-        self.assertEqual(fenced.internal_reason, "no-plain-placement")
+        self.assertEqual(fenced.internal_reason, "selection-not-complete")
 
         streaming = self.fixture("wide-streaming")
         pending = self.match(streaming, (24, 0), (24, 19))
@@ -1987,6 +2221,89 @@ class RuntimeBindingCacheTest(unittest.TestCase):
             self.assertEqual(match.call_args.kwargs["selection_start"], (0, 2))
             self.assertEqual(match.call_args.kwargs["selection_end"], (0, 8))
             self.assertEqual(match.call_args.kwargs["style_rows"], (client_rows[0][2],))
+
+    def test_alternate_client_rows_match_user_echo_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            transcript = home / ".claude" / "projects" / f"{SESSION_ID}.jsonl"
+            source = "copy this wrapped prompt exactly"
+            write_jsonl(transcript, [claude_user(source)])
+            current = binding("claude", transcript)
+            candidate = render_semantic_candidate(
+                AssistantTextRecord(
+                    "claude",
+                    "user",
+                    "user",
+                    source,
+                    1,
+                    role="user",
+                ),
+                version="2.1.241",
+                cols=16,
+            )
+            styles = normalize_styled_rows(
+                verified_styled_rows(candidate),
+                candidate.plain_rows,
+            )
+            first_y = 4
+            client_rows = tuple(
+                (first_y + row, text, styles[row])
+                for row, text in enumerate(candidate.plain_rows)
+            )
+            snapshot = SimpleNamespace(
+                pane_id="%9",
+                alternate=True,
+                cols=16,
+                seed_history=0,
+                physical_rows=["changed"],
+                plain_physical_rows=["changed"],
+            )
+
+            def match(*args, **kwargs):
+                kwargs["proc_start_reader"] = lambda pid: "77"
+                kwargs["proc_environ_reader"] = lambda pid: {"TMUX_PANE": "%9"}
+                return authoritative_provider_match(*args, **kwargs)
+
+            with patch.dict(
+                os.environ,
+                {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "enforce"},
+            ), patch(
+                "provider_authority.resolve_provider_binding",
+                return_value=(current, None),
+            ), patch(
+                "provider_authority.authoritative_provider_match",
+                side_effect=match,
+            ):
+                full_result = provider_selection(
+                    snapshot,
+                    candidate.selection_start[1],
+                    first_y + candidate.selection_start[0],
+                    candidate.selection_end[1],
+                    first_y + candidate.selection_end[0],
+                    home=home,
+                    client_rows=client_rows,
+                )
+                partial_results = []
+                for row in (0, 1):
+                    partial_results.append(
+                        provider_selection(
+                            snapshot,
+                            2,
+                            first_y + row,
+                            16,
+                            first_y + row,
+                            home=home,
+                            client_rows=(client_rows[row],),
+                        )
+                    )
+
+            self.assertTrue(full_result.owned)
+            self.assertEqual(full_result.text, source)
+            self.assertEqual(full_result.authority, "provider-exact")
+            self.assertEqual(
+                [(result.text, result.authority) for result in partial_results],
+                [("copy this", "provider-exact"), ("wrapped", "provider-exact")],
+            )
 
     def test_client_anchor_preserves_shadow_prefer_and_enforce_modes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2792,6 +3109,105 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
             result.source_end,
             len((prefix + "selected  fragment  ").encode("utf-8")),
         )
+
+    def test_fenced_code_quarantines_lines_and_preserves_surrounding_prose(self):
+        source = (
+            "Opening prose remains exact.\n\n"
+            "```bash\n"
+            "printf '%s\\n' value\n"
+            "```\n\n"
+            "Closing prose remains exact."
+        )
+        write_jsonl(self.path, [claude_text(source)])
+        expected_islands = (
+            ("Opening prose remains exact.", True),
+            ("Closing prose remains exact.", False),
+        )
+        for text, first_record_island in expected_islands:
+            with self.subTest(text=text):
+                offset = len(source[: source.index(text)].encode("utf-8"))
+                island = render_semantic_candidate(
+                    replace(self.record, text=text),
+                    version="2.1.241",
+                    cols=24,
+                    source_byte_offset=offset,
+                    first_record_island=first_record_island,
+                )
+                result = authoritative_provider_match(
+                    self.binding,
+                    TranscriptIndex(),
+                    transcript_root=self.root,
+                    cols=24,
+                    plain_rows=island.plain_rows,
+                    selection_start=island.selection_start,
+                    selection_end=island.selection_end,
+                    proc_start_reader=lambda pid: "77",
+                    proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+                )
+                self.assertTrue(result.matched)
+                self.assertEqual(result.text, text)
+                self.assertEqual(result.source_start, offset)
+                self.assertEqual(result.source_end, offset + len(text.encode("utf-8")))
+
+        for row, end_column in (("  ```bash".ljust(24), 9), ("  printf '%s\\n' value".ljust(24), 22)):
+            with self.subTest(row=row.rstrip()):
+                result = authoritative_provider_match(
+                    self.binding,
+                    TranscriptIndex(),
+                    transcript_root=self.root,
+                    cols=24,
+                    plain_rows=(row,),
+                    selection_start=(0, 2),
+                    selection_end=(0, end_column),
+                    proc_start_reader=lambda pid: "77",
+                    proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+                )
+                self.assertFalse(result.matched)
+                self.assertIsNone(result.text)
+
+    def test_inline_code_fence_and_line_lex_failures_recover_prose_islands(self):
+        source = (
+            "First prose island.\n"
+            "inline `code` and **broken\n"
+            "**also broken\n"
+            "```bash\n"
+            "printf value\n"
+            "```\n"
+            "Last prose island."
+        )
+        write_jsonl(self.path, [claude_text(source)])
+        record = replace(self.record, text=source)
+        candidates, unsupported_texts = provider_authority_module._render_record_candidates(
+            record,
+            version="2.1.241",
+            cols=24,
+            profile=provider_authority_module.renderer_profile("claude", "2.1.241"),
+        )
+        self.assertEqual(
+            [candidate.copy_text for candidate in candidates],
+            ["First prose island.", "Last prose island."],
+        )
+        self.assertEqual(
+            unsupported_texts,
+            (
+                "\ninline `code` and **broken\n**also broken\n```bash\nprintf value\n```\n",
+            ),
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate.copy_text):
+                result = authoritative_provider_match(
+                    self.binding,
+                    TranscriptIndex(),
+                    transcript_root=self.root,
+                    cols=24,
+                    plain_rows=candidate.plain_rows,
+                    selection_start=candidate.selection_start,
+                    selection_end=candidate.selection_end,
+                    proc_start_reader=lambda pid: "77",
+                    proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+                )
+                self.assertTrue(result.matched)
+                self.assertEqual(result.text, candidate.copy_text)
 
     def test_inline_code_island_touching_and_crossing_fail_closed(self):
         source = "before `code`\nselected fragment\nafter `code`"

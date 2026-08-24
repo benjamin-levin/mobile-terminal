@@ -3410,7 +3410,13 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
                     {
                         "y": 0,
                         "text": "✅ KEEP",
-                        "styles": [[0, 8, "plain"]],
+                        "styles": [
+                            [
+                                0,
+                                8,
+                                "code-inline;fg-indexed-231;bg-indexed-237;inverse",
+                            ]
+                        ],
                     }
                 ],
             }
@@ -4083,6 +4089,8 @@ class ClientProtocolSourceTest(unittest.TestCase):
         self.assertIn("line.translateToString(false, 0, term.cols)", client_rows)
         self.assertIn("styles.push([runStart, column, runToken])", client_rows)
         self.assertIn("fg-indexed-", client_rows)
+        self.assertIn("bg-indexed-", client_rows)
+        self.assertIn('token += ";inverse"', client_rows)
 
     def test_empty_authoritative_text_is_a_successful_copy_result(self):
         copy_start = self.source.index("  async function copyTerminalSelection()")

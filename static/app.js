@@ -1465,13 +1465,13 @@
       cell?.isInvisible?.() === true ||
       cell?.isOverline?.() === true ||
       (bold && italic);
+    const inverse = cell?.isInverse?.() === true;
+    const hasBackground =
+      typeof cell?.isBgDefault === "function" && !cell.isBgDefault();
     let token;
     if (unsupported) {
       token = "unsupported";
-    } else if (
-      cell?.isInverse?.() === true ||
-      (typeof cell?.isBgDefault === "function" && !cell.isBgDefault())
-    ) {
+    } else if (inverse || hasBackground) {
       token = "code-inline";
     } else if (bold) {
       token = "strong";
@@ -1493,6 +1493,21 @@
       } else {
         token = "unsupported";
       }
+    }
+    if (token !== "unsupported" && hasBackground) {
+      if (cell?.isBgPalette?.() === true) {
+        const color = Number(cell.getBgColor?.());
+        if (Number.isInteger(color) && color >= 0 && color <= 255) {
+          token += `;bg-indexed-${color}`;
+        } else {
+          token = "unsupported";
+        }
+      } else {
+        token = "unsupported";
+      }
+    }
+    if (token !== "unsupported" && inverse) {
+      token += ";inverse";
     }
     return token;
   }

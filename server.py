@@ -454,6 +454,8 @@ MAX_CLIENT_SELECTION_ROWS_BYTES = 64 * 1024
 CLIENT_SELECTION_STYLE_RE = re.compile(
     r"(?:plain|strong|emphasis|list-marker|code-inline|unsupported)"
     r"(?:;fg-indexed-(?:[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))?"
+    r"(?:;bg-indexed-(?:[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))?"
+    r"(?:;inverse)?"
 )
 TMUX_INPUT_CHUNK_BYTES = 1024
 AUTHORITATIVE_SELECTION_DIAGNOSTIC_FLUSH_EVERY = 128
