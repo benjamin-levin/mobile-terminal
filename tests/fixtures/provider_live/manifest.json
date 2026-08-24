@@ -1,0 +1,12 @@
+{
+  "claudeInvocations": 3,
+  "claudeVersion": "2.1.241",
+  "fixtures": [
+    "wide-streaming",
+    "wide-mixed-complete",
+    "wide-code-complete",
+    "narrow-prose-complete"
+  ],
+  "model": "claude-haiku-4-5",
+  "schema": 1
+}

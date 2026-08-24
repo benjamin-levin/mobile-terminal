@@ -1396,6 +1396,29 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
         "original sentence without invented newlines."
     )
 
+    def test_manifest_describes_complete_corpus_and_exact_request_count(self):
+        manifest = json.loads((LIVE_FIXTURE_ROOT / "manifest.json").read_text())
+        self.assertEqual(
+            manifest,
+            {
+                "schema": 1,
+                "claudeVersion": "2.1.241",
+                "model": "claude-haiku-4-5",
+                "claudeInvocations": 3,
+                "fixtures": [
+                    "wide-streaming",
+                    "wide-mixed-complete",
+                    "wide-code-complete",
+                    "narrow-prose-complete",
+                ],
+            },
+        )
+        self.assertEqual(
+            {path.stem for path in LIVE_FIXTURE_ROOT.glob("*.json")}
+            - {"manifest"},
+            set(manifest["fixtures"]),
+        )
+
     def fixture(self, name):
         metadata = json.loads((LIVE_FIXTURE_ROOT / f"{name}.json").read_text())
         plain_rows = (LIVE_FIXTURE_ROOT / metadata["files"]["plain"]).read_text().splitlines()
