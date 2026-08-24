@@ -685,8 +685,12 @@ if grep -q 'PROVIDER_AUTHORITY=off' "$ROLLBACK_ENV_FILE"; then printf 200; else 
         self.assertIn("startup never prints generated secrets", server)
         self.assertIn("secrets.token_urlsafe(32)", installer)
         self.assertIn('chmod 600 "$ENV_FILE"', installer)
-        self.assertNotIn("MOBILE_TERMINAL_TOKEN", collector)
-        self.assertNotIn("mobile-terminal.env", collector)
+        # The collector reads tokens only behind an explicit operator flag,
+        # with the private-terminal warning; the default mode stays redacted.
+        self.assertIn('--with-secrets', collector)
+        self.assertIn("Never run it through an AI session's `!` prompt", collector)
+        self.assertIn('"$with_secrets" == 1 && "$token_state" == configured', collector)
+        self.assertIn("Token values were not read", collector)
         self.assertNotIn('cat "$f"', collector)
         self.assertIn("StrictHostKeyChecking=yes", collector)
         self.assertNotIn("StrictHostKeyChecking=accept-new", collector)
