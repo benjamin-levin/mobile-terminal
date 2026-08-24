@@ -2309,6 +2309,109 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(text)
         self.assertEqual(error, "Terminal changed; select again.")
 
+    async def test_client_selection_check_false_has_distinct_sanitized_reason(self):
+        connection = QueuedConnection()
+        bridge = TmuxBridge(connection, "session", "/bin/sh", "/")
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        payload = {
+            "requestId": "false-sentinel-request",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 80,
+            "rows": 24,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {
+                "start": {"x": 3, "y": 4},
+                "end": {"x": 9, "y": 4},
+            },
+        }
+
+        with (
+            mock.patch("server._record_authoritative_selection_rejection") as rejected,
+            mock.patch("server.capture_pane_snapshot") as capture,
+            mock.patch("server.provider_selection") as provider,
+            mock.patch("server.extract_authoritative_selection") as extract,
+        ):
+            selecting = asyncio.create_task(bridge.authoritative_selection(payload))
+            check = await connection.payloads.get()
+            self.assertEqual(
+                check,
+                {"type": "selection-check", "requestId": "false-sentinel-request"},
+            )
+            bridge.acknowledge(
+                {
+                    "type": "selection-check-ack",
+                    "requestId": "false-sentinel-request",
+                    "unchanged": False,
+                }
+            )
+            text, error = await selecting
+
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+        rejected.assert_called_once_with("client-selection-check-false")
+        capture.assert_not_called()
+        provider.assert_not_called()
+        extract.assert_not_called()
+        self.assertEqual(bridge.phase, "forward")
+
+    async def test_client_selection_check_timeout_has_distinct_sanitized_reason(self):
+        connection = QueuedConnection()
+        bridge = TmuxBridge(connection, "session", "/bin/sh", "/")
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        payload = {
+            "requestId": "timeout-sentinel-request",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 80,
+            "rows": 24,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {
+                "start": {"x": 3, "y": 4},
+                "end": {"x": 9, "y": 4},
+            },
+        }
+
+        async def timeout_wait_for(awaitable, *, timeout):
+            self.assertEqual(timeout, 5)
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        with (
+            mock.patch("server.asyncio.wait_for", new=timeout_wait_for),
+            mock.patch("server._record_authoritative_selection_rejection") as rejected,
+            mock.patch("server.capture_pane_snapshot") as capture,
+            mock.patch("server.provider_selection") as provider,
+            mock.patch("server.extract_authoritative_selection") as extract,
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+
+        self.assertEqual(
+            await connection.payloads.get(),
+            {"type": "selection-check", "requestId": "timeout-sentinel-request"},
+        )
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+        rejected.assert_called_once_with("client-selection-check-timeout")
+        capture.assert_not_called()
+        provider.assert_not_called()
+        extract.assert_not_called()
+        self.assertEqual(bridge.phase, "forward")
+
     async def test_authoritative_selection_blocks_owned_writer_until_exact_copy_finishes(self):
         connection = RecordingConnection()
         provenance = CommandProvenanceState(layout_generation=3)

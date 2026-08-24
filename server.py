@@ -457,7 +457,8 @@ AUTHORITATIVE_SELECTION_REJECTION_REASONS = frozenset(
         "payload-identity",
         "revision-phase",
         "provenance-unavailable",
-        "client-selection-check",
+        "client-selection-check-false",
+        "client-selection-check-timeout",
         "output-changed",
         "snapshot-capture",
         "geometry-buffer-base-mismatch",
@@ -3425,11 +3426,14 @@ class TmuxBridge:
                     ack_payload: dict[str, Any] = {}
                     self.selection_acks[request_id] = (event, ack_payload)
                     await self._send_json({"type": "selection-check", "requestId": request_id})
-                exception_reason = "client-selection-check"
+                exception_reason = "client-selection-check-timeout"
                 try:
-                    await asyncio.wait_for(event.wait(), timeout=5)
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        return reject("client-selection-check-timeout")
                     if ack_payload.get("unchanged") is not True:
-                        return reject("client-selection-check")
+                        return reject("client-selection-check-false")
                     exception_reason = "provider-tmux-exception"
                     self.last_output_at = time.monotonic()
                     await self.quiet(0.1)
