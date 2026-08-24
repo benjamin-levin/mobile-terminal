@@ -587,10 +587,13 @@ class SemanticLexerTest(unittest.TestCase):
         rendered, copied, _ = self.rendered_and_copied("paragraph with `inline` code")
         self.assertEqual(rendered, "paragraph with inline code")
         self.assertEqual(copied, rendered)
-        for source in ("```python\n  x\n```\n", "paragraph ``double`` ticks"):
-            with self.subTest(source=source):
-                with self.assertRaises(ProviderAuthorityError):
-                    lex_semantic_source(source)
+        fenced_tokens = lex_semantic_source("a\n```sh\nx  y\n```\nb")
+        self.assertEqual(
+            "".join(token.copy_text for token in fenced_tokens),
+            "a\nx  y\nb",
+        )
+        with self.assertRaises(ProviderAuthorityError):
+            lex_semantic_source("paragraph ``double`` ticks")
 
     def test_rejects_unsupported_and_ambiguous_markdown_without_whitespace_cleanup(self):
         unsupported = (
@@ -2009,8 +2012,14 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
 
         code = self.fixture("wide-code-complete")
         fenced = self.match(code, (19, 2), (22, 18))
-        self.assertFalse(fenced.matched)
-        self.assertEqual(fenced.internal_reason, "selection-not-complete")
+        self.assertTrue(fenced.matched)
+        self.assertEqual(
+            fenced.text,
+            "FIXTURE-CODE-BEGIN\n"
+            "Inline code_value() remains here.\n"
+            'print("東京 ✅")\n'
+            "FIXTURE-CODE-END",
+        )
 
         streaming = self.fixture("wide-streaming")
         pending = self.match(streaming, (24, 0), (24, 19))
@@ -3127,35 +3136,48 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
             "Closing prose remains exact."
         )
         write_jsonl(self.path, [claude_text(source)])
-        expected_islands = (
-            ("Opening prose remains exact.", True),
-            ("Closing prose remains exact.", False),
+        candidate = render_semantic_candidate(
+            replace(self.record, text=source),
+            version="2.1.241",
+            cols=24,
         )
-        for text, first_record_island in expected_islands:
-            with self.subTest(text=text):
-                offset = len(source[: source.index(text)].encode("utf-8"))
-                island = render_semantic_candidate(
-                    replace(self.record, text=text),
-                    version="2.1.241",
-                    cols=24,
-                    source_byte_offset=offset,
-                    first_record_island=first_record_island,
-                )
-                result = authoritative_provider_match(
-                    self.binding,
-                    TranscriptIndex(),
-                    transcript_root=self.root,
-                    cols=24,
-                    plain_rows=island.plain_rows,
-                    selection_start=island.selection_start,
-                    selection_end=island.selection_end,
-                    proc_start_reader=lambda pid: "77",
-                    proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
-                )
-                self.assertTrue(result.matched)
-                self.assertEqual(result.text, text)
-                self.assertEqual(result.source_start, offset)
-                self.assertEqual(result.source_end, offset + len(text.encode("utf-8")))
+        full = authoritative_provider_match(
+            self.binding,
+            TranscriptIndex(),
+            transcript_root=self.root,
+            cols=24,
+            plain_rows=candidate.plain_rows,
+            selection_start=candidate.selection_start,
+            selection_end=candidate.selection_end,
+            proc_start_reader=lambda pid: "77",
+            proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+        )
+        self.assertTrue(full.matched)
+        self.assertEqual(
+            full.text,
+            "Opening prose remains exact.\n\n"
+            "printf '%s\\n' value\n\n"
+            "Closing prose remains exact.",
+        )
+        code_row = next(
+            index
+            for index, row in enumerate(candidate.plain_rows)
+            if "printf" in row
+        )
+        code_width = len(candidate.plain_rows[code_row].rstrip())
+        code = authoritative_provider_match(
+            self.binding,
+            TranscriptIndex(),
+            transcript_root=self.root,
+            cols=24,
+            plain_rows=candidate.plain_rows,
+            selection_start=(code_row, 2),
+            selection_end=(code_row, code_width),
+            proc_start_reader=lambda pid: "77",
+            proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+        )
+        self.assertTrue(code.matched)
+        self.assertEqual(code.text, "printf '%s\\n' value")
 
         for row, end_column in (("  ```bash".ljust(24), 9), ("  printf '%s\\n' value".ljust(24), 22)):
             with self.subTest(row=row.rstrip()):
@@ -3193,13 +3215,11 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         )
         self.assertEqual(
             [candidate.copy_text for candidate in candidates],
-            ["First prose island.", "Last prose island."],
+            ["First prose island.", "printf value\nLast prose island."],
         )
         self.assertEqual(
             unsupported_texts,
-            (
-                "\ninline `code` and **broken\n**also broken\n```bash\nprintf value\n```\n",
-            ),
+            ("\ninline `code` and **broken\n**also broken\n",),
         )
         for candidate in candidates:
             with self.subTest(candidate=candidate.copy_text):
@@ -3452,7 +3472,7 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         )
         result = self.match()
         self.assertFalse(result.matched)
-        self.assertEqual(result.internal_reason, "no-canonical-candidate")
+        self.assertEqual(result.internal_reason, "placement-ambiguous")
 
     def test_html_entity_aliases_poison_but_unrelated_entities_do_not(self):
         source = "left > right"
@@ -3496,14 +3516,6 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
                     record_uuid="record-0",
                 ),
             ),
-            (
-                "hex-inside-markdown",
-                claude_text(
-                    "```\nleft &#x3e; right\n```",
-                    message_id="msg_0",
-                    record_uuid="record-0",
-                ),
-            ),
         )
         for name, alias in aliases:
             with self.subTest(alias=name):
@@ -3514,6 +3526,23 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
                     result.internal_reason,
                     "no-canonical-candidate",
                 )
+
+        # Entities inside fenced code render literally, so they can no longer
+        # alias decoded prose; the plain candidate must match uniquely.
+        write_jsonl(
+            self.path,
+            [
+                claude_text(
+                    "```\nleft &#x3e; right\n```",
+                    message_id="msg_0",
+                    record_uuid="record-0",
+                ),
+                claude_text(source),
+            ],
+        )
+        literal_fence = match_candidate()
+        self.assertTrue(literal_fence.matched)
+        self.assertEqual(literal_fence.text, source)
 
         write_jsonl(
             self.path,

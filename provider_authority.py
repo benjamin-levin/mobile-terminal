@@ -962,16 +962,63 @@ class _SemanticLexer:
         if not lines and self.source == "":
             return ()
         offset = 0
+        fence: str | None = None
         for line in lines:
             body = line[:-1] if line.endswith("\n") else line
             newline = line.endswith("\n")
             if "\r" in line or "\x00" in line:
                 raise ProviderAuthorityError("unsupported-source-control")
+            if fence is not None:
+                closing = re.fullmatch(r"(`{3,}|~{3,})[ \t]*", body)
+                if (
+                    closing
+                    and closing.group(1)[0] == fence[0]
+                    and len(closing.group(1)) >= len(fence)
+                ):
+                    self.emit(
+                        "consumed_marker",
+                        offset,
+                        offset + len(line),
+                        render_text="",
+                        copy_text="",
+                        semantic="code-fence",
+                        style="code-block",
+                    )
+                    fence = None
+                else:
+                    if body:
+                        self.emit(
+                            "authored_visible",
+                            offset,
+                            offset + len(body),
+                            style="code-block",
+                        )
+                    if newline:
+                        self.emit(
+                            "source_hard_break",
+                            offset + len(body),
+                            offset + len(line),
+                            render_text="\n",
+                            copy_text="\n",
+                        )
+                offset += len(line)
+                continue
+            opening = re.fullmatch(r"(`{3,}|~{3,})([A-Za-z0-9_+.-]*)[ \t]*", body)
+            if opening:
+                self.emit(
+                    "consumed_marker",
+                    offset,
+                    offset + len(line),
+                    render_text="",
+                    copy_text="",
+                    semantic="code-fence",
+                    style="code-block",
+                )
+                fence = opening.group(1)
+                offset += len(line)
+                continue
             if _contains_html_entity_syntax(body):
                 raise ProviderAuthorityError("unsupported-html-entity")
-            fence_match = re.fullmatch(r"(```|~~~)([A-Za-z0-9_+.-]*)", body)
-            if fence_match:
-                raise ProviderAuthorityError("unsupported-code-fence")
             if re.match(r"^\s*(?:>|[-*_]{3,}|\[[ xX]\]|\|)", body):
                 raise ProviderAuthorityError("unsupported-markdown")
             if body.startswith("#") and not re.match(r"^#{1,6} ", body):
@@ -1017,6 +1064,8 @@ class _SemanticLexer:
             if newline:
                 self.emit("source_hard_break", offset + len(body), offset + len(line), render_text="\n", copy_text="\n")
             offset += len(line)
+        if fence is not None:
+            raise ProviderAuthorityError("unsupported-code-fence")
         self._validate_coverage()
         return tuple(self.tokens)
 
@@ -1803,26 +1852,38 @@ def _inline_code_islands(source: str) -> tuple[tuple[int, int], ...]:
         return ()
 
     unsupported: set[int] = set()
-    fence_width: int | None = None
+    fence_marker: str | None = None
+    fence_start = 0
     for line_index, (_, _, _, body) in enumerate(lines):
-        stripped = body.lstrip(" \t")
-        marker_width = len(stripped) - len(stripped.lstrip("`"))
-        if fence_width is not None:
-            unsupported.add(line_index)
-            if marker_width >= fence_width and not stripped[marker_width:].strip(" \t"):
-                fence_width = None
+        if fence_marker is not None:
+            closing = re.fullmatch(r"(`{3,}|~{3,})[ \t]*", body)
+            if (
+                closing
+                and closing.group(1)[0] == fence_marker[0]
+                and len(closing.group(1)) >= len(fence_marker)
+            ):
+                fence_marker = None
             continue
-        if marker_width >= 3:
-            unsupported.add(line_index)
-            fence_width = marker_width
+        opening = re.fullmatch(r"(`{3,}|~{3,})([A-Za-z0-9_+.-]*)[ \t]*", body)
+        if opening:
+            fence_marker = opening.group(1)
+            fence_start = line_index
             continue
-
+        if re.match(r"^# ", body):
+            unsupported.add(line_index)
+            continue
         try:
             lex_semantic_source(body)
         except ProviderAuthorityError:
             unsupported.add(line_index)
+    if fence_marker is not None:
+        for line_index in range(fence_start, len(lines)):
+            unsupported.add(line_index)
     if not unsupported:
-        raise ProviderAuthorityError("unsupported-inline-code")
+        # Every line is individually supported; the record-level failure is a
+        # rendering condition. Hand back one whole-record island so the caller
+        # can degrade it (e.g. split at fence groups) instead of aborting.
+        return ((0, len(source)),)
 
     for line_index in tuple(unsupported):
         before = line_index - 1
@@ -1854,16 +1915,55 @@ def _inline_code_islands(source: str) -> tuple[tuple[int, int], ...]:
     return tuple(islands)
 
 
-_LINE_RECOVERABLE_LEX_REASONS = frozenset(
+_RENDER_RECOVERABLE_REASONS = frozenset(
     {
-        "unsupported-code-fence",
-        "unsupported-inline-code",
-        "unsupported-markdown",
-        "unsupported-nested-markdown",
-        "unsupported-markdown-escape",
-        "unsupported-nested-list",
+        "unsupported-wrap-whitespace",
+        "unsupported-unbreakable-token",
+        "renderer-width-too-small",
+        "unsupported-wrap-tab",
     }
 )
+
+_LINE_RECOVERABLE_LEX_REASONS = (
+    frozenset(
+        {
+            "unsupported-code-fence",
+            "unsupported-inline-code",
+            "unsupported-markdown",
+            "unsupported-nested-markdown",
+            "unsupported-markdown-escape",
+            "unsupported-nested-list",
+        }
+    )
+    | _RENDER_RECOVERABLE_REASONS
+)
+
+
+def _fence_group_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    """Character ranges of complete fenced code groups (opening line through
+    closing line, including the closing line's newline when present)."""
+    ranges = []
+    cursor = 0
+    fence_marker: str | None = None
+    fence_start = 0
+    for line in text.splitlines(keepends=True):
+        body = line[:-1] if line.endswith("\n") else line
+        if fence_marker is not None:
+            closing = re.fullmatch(r"(`{3,}|~{3,})[ \t]*", body)
+            if (
+                closing
+                and closing.group(1)[0] == fence_marker[0]
+                and len(closing.group(1)) >= len(fence_marker)
+            ):
+                ranges.append((fence_start, cursor + len(line)))
+                fence_marker = None
+        else:
+            opening = re.fullmatch(r"(`{3,}|~{3,})([A-Za-z0-9_+.-]*)[ \t]*", body)
+            if opening:
+                fence_marker = opening.group(1)
+                fence_start = cursor
+        cursor += len(line)
+    return tuple(ranges)
 
 
 def _render_record_candidates(
@@ -1887,7 +1987,10 @@ def _render_record_candidates(
             (),
         )
     except ProviderAuthorityError as exc:
-        if exc.reason not in _LINE_RECOVERABLE_LEX_REASONS:
+        if (
+            exc.reason not in _LINE_RECOVERABLE_LEX_REASONS
+            and exc.reason != "unsupported-heading-style"
+        ):
             raise
         record_failure = exc
 
@@ -1900,24 +2003,66 @@ def _render_record_candidates(
     byte_offsets = [0]
     for character in record.text:
         byte_offsets.append(byte_offsets[-1] + len(character.encode("utf-8")))
+    def render_island(start: int, end: int) -> None:
+        text = record.text[start:end]
+        if not text.strip(" \t\n"):
+            if text:
+                unsupported_texts.append(text)
+            return
+        try:
+            candidates.append(
+                render_semantic_candidate(
+                    replace(record, text=text),
+                    version=version,
+                    cols=cols,
+                    profile=profile,
+                    allow_unsupported=record.unsupported,
+                    source_byte_offset=byte_offsets[start],
+                    first_record_island=start == 0,
+                )
+            )
+            return
+        except ProviderAuthorityError:
+            pass
+        # The island cannot render as-is. Split it at complete fenced groups
+        # so surrounding prose stays exact; a group (or fenceless island)
+        # that still cannot render degrades to unsupported text, which keeps
+        # matching fail-closed (raw fallback) rather than wrong.
+        fences = _fence_group_ranges(text)
+        if not fences:
+            unsupported_texts.append(text)
+            return
+        position = start
+        for fence_start, fence_end in fences:
+            if position < start + fence_start:
+                render_island(position, start + fence_start)
+            try:
+                candidates.append(
+                    render_semantic_candidate(
+                        replace(record, text=text[fence_start:fence_end]),
+                        version=version,
+                        cols=cols,
+                        profile=profile,
+                        allow_unsupported=record.unsupported,
+                        source_byte_offset=byte_offsets[start + fence_start],
+                        first_record_island=start + fence_start == 0,
+                    )
+                )
+            except ProviderAuthorityError:
+                unsupported_texts.append(text[fence_start:fence_end])
+            position = start + fence_end
+        if position < end:
+            render_island(position, end)
+
     for start, end in islands:
         if cursor < start:
             unsupported_texts.append(record.text[cursor:start])
-        island_record = replace(record, text=record.text[start:end])
-        candidates.append(
-            render_semantic_candidate(
-                island_record,
-                version=version,
-                cols=cols,
-                profile=profile,
-                allow_unsupported=record.unsupported,
-                source_byte_offset=byte_offsets[start],
-                first_record_island=start == 0,
-            )
-        )
+        render_island(start, end)
         cursor = end
     if cursor < len(record.text):
         unsupported_texts.append(record.text[cursor:])
+    if not candidates:
+        raise ProviderAuthorityError("unsupported-code-fence")
     return tuple(candidates), tuple(unsupported_texts)
 
 
@@ -2131,6 +2276,10 @@ def _style_satisfies(expected: str, actual: str) -> bool:
     if expected == actual:
         return True
     if expected == "code" and actual.startswith("code-inline;"):
+        return True
+    if expected == "code-block":
+        # Fenced-code interiors are syntax-highlighted with theme-dependent
+        # colors; text equality and unique placement remain the authority.
         return True
     return (expected, actual) in {
         ("assistant", "plain"),
