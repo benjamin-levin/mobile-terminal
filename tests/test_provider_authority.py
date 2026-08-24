@@ -583,8 +583,11 @@ class SemanticLexerTest(unittest.TestCase):
         self.assertEqual(rendered, "*literal* and # heading")
         self.assertEqual(copied, rendered)
 
-    def test_rejects_theme_dependent_code_rendering(self):
-        for source in ("paragraph with `inline` code", "```python\n  x\n```\n"):
+    def test_inline_code_lexes_and_fenced_code_rejects(self):
+        rendered, copied, _ = self.rendered_and_copied("paragraph with `inline` code")
+        self.assertEqual(rendered, "paragraph with inline code")
+        self.assertEqual(copied, rendered)
+        for source in ("```python\n  x\n```\n", "paragraph ``double`` ticks"):
             with self.subTest(source=source):
                 with self.assertRaises(ProviderAuthorityError):
                     lex_semantic_source(source)
@@ -1659,7 +1662,7 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
         full = self.match(fixture, (10, 2), (18, 30))
         self.assertTrue(full.matched)
         self.assertEqual(full.text, self.mixed_supported)
-        self.assertEqual((full.source_start, full.source_end), (0, 380))
+        self.assertEqual((full.source_start, full.source_end), (0, 436))
 
         sub_window = self.match(fixture, (12, 2), (13, 93))
         self.assertTrue(sub_window.matched)
@@ -1957,8 +1960,8 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
             fixture,
             (1, 2),
             (7, 30),
-            plain_rows=fixture.plain_rows[11:19],
-            style_rows=fixture.style_rows[11:19],
+            plain_rows=fixture.plain_rows[11:23],
+            style_rows=fixture.style_rows[11:23],
         )
         transcript = fixture.transcript_texts[-1]
         clipped_start = transcript.index("Reliable terminal copying")
@@ -1996,8 +1999,13 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
     def test_inline_and_fenced_code_and_streaming_remain_fail_closed(self):
         mixed = self.fixture("wide-mixed-complete")
         crossing_inline = self.match(mixed, (18, 2), (22, 19))
-        self.assertFalse(crossing_inline.matched)
-        self.assertEqual(crossing_inline.internal_reason, "selection-not-complete")
+        self.assertTrue(crossing_inline.matched)
+        self.assertEqual(
+            crossing_inline.text,
+            "Status ✅ 東京 漢字 complete\n\n"
+            "Inline code_value() remains here.\n\n"
+            "FIXTURE-MIXED-END",
+        )
 
         code = self.fixture("wide-code-complete")
         fenced = self.match(code, (19, 2), (22, 18))
@@ -3081,9 +3089,9 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         self.assertEqual(result.text, "final answer")
 
     def test_inline_code_before_and_after_supported_island_matches_exact_source(self):
-        source = "before `code`\nselected  fragment  \nafter `code`"
+        source = "> before quote\nselected  fragment  \n> after quote"
         write_jsonl(self.path, [claude_text(source)])
-        prefix = "before `code`\n"
+        prefix = "> before quote\n"
         island = render_semantic_candidate(
             replace(self.record, text="selected  fragment  "),
             version="2.1.241",
@@ -3210,13 +3218,13 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
                 self.assertEqual(result.text, candidate.copy_text)
 
     def test_inline_code_island_touching_and_crossing_fail_closed(self):
-        source = "before `code`\nselected fragment\nafter `code`"
+        source = "> before quote\nselected fragment\n> after quote"
         write_jsonl(self.path, [claude_text(source)])
         island = render_semantic_candidate(
             replace(self.record, text="selected fragment"),
             version="2.1.241",
             cols=24,
-            source_byte_offset=len("before `code`\n".encode("utf-8")),
+            source_byte_offset=len("> before quote\n".encode("utf-8")),
             first_record_island=False,
         )
         rows = ("before".ljust(24), *island.plain_rows, "after".ljust(24))
@@ -3248,7 +3256,7 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         )
 
     def test_duplicate_supported_inline_code_islands_are_ambiguous(self):
-        source = "`before`\nsame\n`middle`\nsame\n`after`"
+        source = "> b\nsame\n> m\nsame\n> a"
         write_jsonl(self.path, [claude_text(source)])
         island = render_semantic_candidate(
             replace(self.record, text="same"),
@@ -3328,13 +3336,13 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         self.assertEqual((len(ordinary), len(selected)), (90, 45))
 
     def test_inline_code_island_matches_historical_width_with_exact_copy(self):
-        source = "before `code`\nselected  fragment  \nafter `code`"
+        source = "> before quote\nselected  fragment  \n> after quote"
         write_jsonl(self.path, [claude_text(source)])
         island = render_semantic_candidate(
             replace(self.record, text="selected  fragment  "),
             version="2.1.241",
             cols=180,
-            source_byte_offset=len("before `code`\n".encode("utf-8")),
+            source_byte_offset=len("> before quote\n".encode("utf-8")),
             first_record_island=False,
         )
         rows = ("unrelated".ljust(90), island.plain_rows[0][:45])

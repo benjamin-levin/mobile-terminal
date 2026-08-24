@@ -1043,7 +1043,39 @@ class _SemanticLexer:
                 visible_start = cursor
                 continue
             if character == "`":
-                raise ProviderAuthorityError("unsupported-inline-code")
+                if active is not None:
+                    raise ProviderAuthorityError("unsupported-nested-markdown")
+                run_end = cursor + 1
+                while run_end < end and self.source[run_end] == "`":
+                    run_end += 1
+                if run_end - cursor != 1:
+                    raise ProviderAuthorityError("unsupported-inline-code")
+                closing = self.source.find("`", run_end, end)
+                if closing < 0 or closing == run_end:
+                    raise ProviderAuthorityError("unsupported-inline-code")
+                flush(cursor)
+                self.emit(
+                    "consumed_marker",
+                    cursor,
+                    run_end,
+                    render_text="",
+                    copy_text="",
+                    semantic="code",
+                    style="code",
+                )
+                self.emit("authored_visible", run_end, closing, style="code")
+                self.emit(
+                    "consumed_marker",
+                    closing,
+                    closing + 1,
+                    render_text="",
+                    copy_text="",
+                    semantic="code",
+                    style="code",
+                )
+                cursor = closing + 1
+                visible_start = cursor
+                continue
             marker = None
             for candidate, candidate_style in (("**", "strong"), ("__", "strong"), ("*", "emphasis"), ("_", "emphasis")):
                 if self.source.startswith(candidate, cursor):
@@ -1785,22 +1817,10 @@ def _inline_code_islands(source: str) -> tuple[tuple[int, int], ...]:
             fence_width = marker_width
             continue
 
-        spans = _inline_code_spans(body)
-        if spans is None:
-            unsupported.add(line_index)
-            continue
         try:
-            if not spans:
-                lex_semantic_source(body)
-                continue
-            masked = list(body)
-            for start, end in spans:
-                masked[start:end] = "x" * (end - start)
-            lex_semantic_source("".join(masked))
+            lex_semantic_source(body)
         except ProviderAuthorityError:
             unsupported.add(line_index)
-            continue
-        unsupported.add(line_index)
     if not unsupported:
         raise ProviderAuthorityError("unsupported-inline-code")
 
@@ -1834,6 +1854,18 @@ def _inline_code_islands(source: str) -> tuple[tuple[int, int], ...]:
     return tuple(islands)
 
 
+_LINE_RECOVERABLE_LEX_REASONS = frozenset(
+    {
+        "unsupported-code-fence",
+        "unsupported-inline-code",
+        "unsupported-markdown",
+        "unsupported-nested-markdown",
+        "unsupported-markdown-escape",
+        "unsupported-nested-list",
+    }
+)
+
+
 def _render_record_candidates(
     record: AssistantTextRecord,
     *,
@@ -1855,12 +1887,13 @@ def _render_record_candidates(
             (),
         )
     except ProviderAuthorityError as exc:
-        if exc.reason not in {"unsupported-code-fence", "unsupported-inline-code"}:
+        if exc.reason not in _LINE_RECOVERABLE_LEX_REASONS:
             raise
+        record_failure = exc
 
     islands = _inline_code_islands(record.text)
     if not islands:
-        raise ProviderAuthorityError("unsupported-inline-code")
+        raise record_failure
     candidates = []
     unsupported_texts = []
     cursor = 0
@@ -2103,6 +2136,7 @@ def _style_satisfies(expected: str, actual: str) -> bool:
         ("assistant", "plain"),
         ("heading", "strong"),
         ("code", "code-inline"),
+        ("code", "plain;fg-indexed-153"),
     }
 
 
