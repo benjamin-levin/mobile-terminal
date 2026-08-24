@@ -1,0 +1,54 @@
+{
+  "binding": {
+    "active": true,
+    "eventTimeNs": 1787584890602597437,
+    "generation": 1,
+    "paneId": "%0",
+    "pid": 3771712,
+    "procStart": "49135118",
+    "provider": "claude",
+    "schema": 1,
+    "sessionId": "6cd6f92f-987b-4690-a7ac-dbba8be3ce08",
+    "terminalEvent": "",
+    "transcriptPath": "/home/powerhouse/.claude/projects/-var-tmp-powerhouse-claude-1000--home-powerhouse-mobile-terminal-e7beb469-c5d1-4420-ac29-96109f659f4c-scratchpad-longcode-record-narrow-work/6cd6f92f-987b-4690-a7ac-dbba8be3ce08.jsonl",
+    "version": "2.1.241"
+  },
+  "claude": {
+    "invocation": 6,
+    "model": "claude-haiku-4-5",
+    "sessionId": "6cd6f92f-987b-4690-a7ac-dbba8be3ce08",
+    "version": "2.1.241"
+  },
+  "files": {
+    "plain": "narrow-longcode-complete.plain.txt",
+    "styled": "narrow-longcode-complete.styled.txt"
+  },
+  "geometry": {
+    "actual": {
+      "cols": 60,
+      "rows": 30
+    },
+    "requested": {
+      "cols": 60,
+      "rows": 30
+    }
+  },
+  "pane": {
+    "id": "%0",
+    "shellPid": 3771681
+  },
+  "registry": {
+    "pid": 3771712,
+    "procStart": "49135118",
+    "sessionId": "6cd6f92f-987b-4690-a7ac-dbba8be3ce08",
+    "tmux": "fixture:%0",
+    "version": "2.1.241"
+  },
+  "scenario": "narrow-longcode-complete",
+  "schema": 1,
+  "state": "complete",
+  "transcript": {
+    "copy": "narrow-longcode-complete.transcript.jsonl",
+    "path": "/home/powerhouse/.claude/projects/-var-tmp-powerhouse-claude-1000--home-powerhouse-mobile-terminal-e7beb469-c5d1-4420-ac29-96109f659f4c-scratchpad-longcode-record-narrow-work/6cd6f92f-987b-4690-a7ac-dbba8be3ce08.jsonl"
+  }
+}

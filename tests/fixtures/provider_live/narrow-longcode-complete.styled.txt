@@ -1,0 +1,30 @@
+[38;5;174m│[39m                        [38;5;246mClaude Max[39m                        [38;5;174m│
+│[39m        [38;5;246m/…/scratchpad/longcode-record/narrow/work[39m         [38;5;174m│
+│[39m                                                          [38;5;174m│
+╰──────────────────────────────────────────────────────────╯
+
+
+[38;5;239m[48;5;237m❯ [38;5;231mReply with exactly this markdown and no commentary. First[39m 
+  [38;5;231mline FIXTURE-LONGCODE-BEGIN. Then a fenced bash code [39m     
+  [38;5;231mblock containing exactly one line: [39m                       
+  [38;5;231mMOBILE_TERMINAL_STATE=/var/tmp/mobile-terminal-state [39m     
+  [38;5;231mscripts/deploy-remote.sh --target powerhouse --service [39m   
+  [38;5;231mmobile-terminal --confirm-deploy-after-preflight [39m         
+  [38;5;231m--health-timeout 45 --rollback-on-failure. Last line [39m     
+  [38;5;231mFIXTURE-LONGCODE-END.[39m                                     
+
+[38;5;231m[49m●[39m FIXTURE-LONGCODE-BEGIN      
+                                                            
+  MOBILE_TERMINAL_STATE=/var/tmp/mobile-terminal-state      
+  scripts/deploy-remote.sh --target powerhouse --service    
+  mobile-terminal --confirm-deploy-after-preflight          
+  --health-timeout 45 --rollback-on-failure                 
+                              
+  FIXTURE-LONGCODE-END        
+
+[38;5;246m✻[39m [38;5;246mCogitated for 3s[39m                                          
+  [38;5;220mYou've used 95% of your weekly limit · resets Aug 27, 2…[39m  
+[38;5;37m────────────────────────[38;5;16m[48;5;37m add-provider-transcript-authority [38;5;37m[49m─
+[39m❯                             
+[38;5;37m────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ don't ask on[38;5;246m (shift+tab to cycle) · ← 5 agents[39m         

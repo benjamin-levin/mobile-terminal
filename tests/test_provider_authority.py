@@ -681,9 +681,23 @@ class RenderingAndMatchingTest(unittest.TestCase):
                 self.assertGreater(len(candidate.plain_rows), 1)
                 self.assertTrue(all("alph" not in row or "alpha" in row for row in candidate.plain_rows))
 
-    def test_long_unbreakable_tokens_fail_closed(self):
-        with self.assertRaisesRegex(ProviderAuthorityError, "unbreakable"):
-            self.candidate("abcdefghijk", cols=8)
+    def test_long_unbreakable_tokens_char_break_at_width(self):
+        # Verified live: Claude 2.1.241 fills the row and continues the token
+        # on the next row with no hyphen or marker.
+        candidate = self.candidate("abcdefghijk", cols=8)
+        self.assertEqual(
+            candidate.plain_rows,
+            ("G abcdef", "  ghijk "),
+        )
+        self.assertEqual(candidate.copy_text, "abcdefghijk")
+
+    def test_token_following_text_fills_row_before_char_breaking(self):
+        candidate = self.candidate("hi abcdefghijk", cols=8)
+        self.assertEqual(
+            candidate.plain_rows,
+            ("G hi abc", "  defghi", "  jk    "),
+        )
+        self.assertEqual(candidate.copy_text, "hi abcdefghijk")
 
     def test_source_hard_breaks_are_preserved(self):
         candidate = self.candidate("abc\ndef", cols=20)
@@ -1553,7 +1567,7 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
                 "schema": 1,
                 "claudeVersion": "2.1.241",
                 "model": "claude-haiku-4-5",
-                "claudeInvocations": 5,
+                "claudeInvocations": 6,
                 "fixtures": [
                     "wide-streaming",
                     "wide-mixed-complete",
@@ -1561,6 +1575,7 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
                     "narrow-prose-complete",
                     "wide-richtext-complete",
                     "wide-history-complete",
+                    "narrow-longcode-complete",
                 ],
             },
         )
@@ -1697,6 +1712,27 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
         self.assertTrue(wrapped_prose.matched)
         self.assertEqual(wrapped_prose.text, self.prose)
         self.assertNotIn("\n", wrapped_prose.text)
+
+    def test_narrow_longcode_replay_unwraps_char_broken_command(self):
+        fixture = self.fixture("narrow-longcode-complete")
+        command = (
+            "MOBILE_TERMINAL_STATE=/var/tmp/mobile-terminal-state "
+            "scripts/deploy-remote.sh --target powerhouse --service "
+            "mobile-terminal --confirm-deploy-after-preflight "
+            "--health-timeout 45 --rollback-on-failure"
+        )
+
+        code_only = self.match(fixture, (17, 2), (20, 43))
+        self.assertTrue(code_only.matched)
+        self.assertEqual(code_only.text, command)
+        self.assertNotIn("\n", code_only.text)
+
+        full = self.match(fixture, (15, 2), (22, 22))
+        self.assertTrue(full.matched)
+        self.assertEqual(
+            full.text,
+            "FIXTURE-LONGCODE-BEGIN\n\n" + command + "\n\nFIXTURE-LONGCODE-END",
+        )
 
     def test_narrow_user_echo_replay_removes_soft_wraps_and_preserves_typed_bytes(self):
         fixture = self.fixture("narrow-prose-complete")

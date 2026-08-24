@@ -1622,9 +1622,16 @@ def render_semantic_candidate(
             if whitespace and index + 1 < len(groups):
                 next_group = groups[index + 1][1]
                 next_width = sum(_unit_width(unit.grapheme) for unit in next_group)
-                if len(group) == 1 and column + width + next_width > wrap_cols:
-                    if next_width > wrap_cols - len(selected_profile.continuation_gutter) - continuation_padding:
-                        raise ProviderAuthorityError("unsupported-unbreakable-token")
+                token_fits_fresh_row = next_width <= (
+                    wrap_cols
+                    - len(selected_profile.continuation_gutter)
+                    - continuation_padding
+                )
+                if (
+                    len(group) == 1
+                    and column + width + next_width > wrap_cols
+                    and token_fits_fresh_row
+                ):
                     unit = group[0]
                     resolved_style(unit.style)
                     begin_row(continuation_padding)
@@ -1641,13 +1648,34 @@ def render_semantic_candidate(
                     boundary_anchors[id(boundary)] = (row, 0)
                     index += 1
                     continue
-                if column + width + next_width > wrap_cols:
+                if column + width + next_width > wrap_cols and token_fits_fresh_row:
                     raise ProviderAuthorityError("unsupported-wrap-whitespace")
-            elif not whitespace and width > wrap_cols - len(selected_profile.continuation_gutter) - continuation_padding:
-                raise ProviderAuthorityError("unsupported-unbreakable-token")
-            if column + width > wrap_cols:
+            char_break = not whitespace and width > (
+                wrap_cols
+                - len(selected_profile.continuation_gutter)
+                - continuation_padding
+            )
+            if not char_break and column + width > wrap_cols:
                 raise ProviderAuthorityError("unsupported-wrap-whitespace")
             for unit in group:
+                if column + _unit_width(unit.grapheme) > wrap_cols:
+                    if not char_break:
+                        raise ProviderAuthorityError("unsupported-wrap-whitespace")
+                    # A token wider than any row fills the current row and
+                    # continues on the next (verified live: Claude 2.1.241
+                    # breaks long tokens at the width boundary, no hyphen).
+                    begin_row(continuation_padding)
+                    boundary = BoundaryProvenance(
+                        "soft-wrap-separator",
+                        unit.copy_start,
+                        unit.copy_start,
+                        unit.source_start,
+                        unit.source_start,
+                        row,
+                        0,
+                    )
+                    boundaries.append(boundary)
+                    boundary_anchors[id(boundary)] = (row, 0)
                 put(
                     unit.grapheme,
                     unit.copy_start,

@@ -1,0 +1,30 @@
+│                        Claude Max                        │
+│        /…/scratchpad/longcode-record/narrow/work         │
+│                                                          │
+╰──────────────────────────────────────────────────────────╯
+
+
+❯ Reply with exactly this markdown and no commentary. First 
+  line FIXTURE-LONGCODE-BEGIN. Then a fenced bash code      
+  block containing exactly one line:                        
+  MOBILE_TERMINAL_STATE=/var/tmp/mobile-terminal-state      
+  scripts/deploy-remote.sh --target powerhouse --service    
+  mobile-terminal --confirm-deploy-after-preflight          
+  --health-timeout 45 --rollback-on-failure. Last line      
+  FIXTURE-LONGCODE-END.                                     
+
+● FIXTURE-LONGCODE-BEGIN      
+                                                            
+  MOBILE_TERMINAL_STATE=/var/tmp/mobile-terminal-state      
+  scripts/deploy-remote.sh --target powerhouse --service    
+  mobile-terminal --confirm-deploy-after-preflight          
+  --health-timeout 45 --rollback-on-failure                 
+                              
+  FIXTURE-LONGCODE-END        
+
+✻ Cogitated for 3s                                          
+  You've used 95% of your weekly limit · resets Aug 27, 2…  
+──────────────────────── add-provider-transcript-authority ─
+❯                             
+────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← 5 agents         
