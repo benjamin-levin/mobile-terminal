@@ -1,6 +1,6 @@
 # Passkey integration
 
-`webauthn_auth.py` and `static/passkey.js` are integration-ready seams for the proxy auth work in `docs/unified-config-design.md` §5. They do not change the current standalone server: the constrained implementation intentionally does not modify `server.py`, `static/app.js`, `static/sw.js`, or the running service.
+`webauthn_auth.py` and `static/passkey.js` are the shared passkey implementation used by the standalone server and the profile proxy described in `docs/unified-config-design.md` §5. The integration is active in `server.py`, `static/app.js`, `static/index.html`, and the service-worker cache; this document describes the contract that both paths must preserve.
 
 ## What is implemented
 
@@ -12,7 +12,7 @@
 - Browser conversion between py_webauthn's base64url JSON and WebAuthn `ArrayBuffer` values.
 - Existing registration message names are preserved: `webauthn-register-options` and `webauthn-register`.
 
-The dependency is `webauthn>=3.0`. It is already present in the working-tree `requirements.txt`; this change does not overwrite that parallel edit.
+The dependency is `webauthn>=3.0` and is pinned through the repository `requirements.txt`.
 
 ## Proxy setup
 
@@ -97,11 +97,11 @@ The proxy should resolve a connection in this order, matching the existing auth 
 
 For a realm with credentials, send `webauthn-auth-options` first. If the realm has no credential usable by this browser, show the token bootstrap UI. Once the token is valid, hold terminal authorization until `finish_registration()` succeeds; then continue the current connection and use passkeys on later connections. This is what makes the shared token bootstrap-only rather than a durable terminal credential.
 
-Do not auto-register the legacy WebCrypto ECDSA key after token auth in proxy mode. The current `enroll-key` / `register-key` exchange remains available only for unchanged standalone deployments.
+Do not auto-register the legacy WebCrypto ECDSA key after token auth in proxy mode. The standalone device-key exchange remains a separate fallback path; proxy authorization must complete the configured passkey flow rather than treating a legacy key as cross-realm authorization.
 
 ## Browser wiring
 
-Load `static/passkey.js` before `static/app.js` in the proxy-served app shell. Route WebAuthn messages before the normal message dispatch:
+The standalone app shell already loads `static/passkey.js` before `static/app.js`. Any proxy-served shell must preserve that order and route WebAuthn messages before normal terminal-message dispatch:
 
 ```javascript
 if (await window.MobileTerminalPasskeys.handleMessage(payload, sendMessage)) {
@@ -111,7 +111,7 @@ if (await window.MobileTerminalPasskeys.handleMessage(payload, sendMessage)) {
 
 `sendMessage` must accept the plain object produced by the helper. Handle a rejected promise by returning to the bootstrap/sign-in UI; do not silently fall through to token terminal auth. The helper deliberately does not read or persist the shared token.
 
-The proxy app shell must include `passkey.js` in its cache version when service-worker precaching is added. No change is needed to the current standalone service worker until the proxy begins serving this script.
+`static/passkey.js` is part of the standalone service-worker precache. Keep its cache namespace/version synchronized when the helper or app-shell wiring changes, and apply the same rule to a proxy-owned service worker.
 
 ## Revocation and rotation
 

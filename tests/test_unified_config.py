@@ -8,12 +8,19 @@ from unittest import mock
 
 from mobile_terminal_config import ConfigError, load_runtime_config
 from proxy_auth import AuthenticationRequest, TokenAuthenticator
-from server import AppServer, terminal_child_environment, terminal_command
+from server import (
+    AppServer,
+    ssh_file_payload,
+    tailscale_capture,
+    terminal_child_environment,
+    terminal_command,
+)
 
 
 ROOT = Path(__file__).parents[1]
 BACKEND_SERVICE = (ROOT / "systemd" / "mobile-terminal@.service").read_text()
 DEPLOY_SH = (ROOT / "deploy.sh").read_text()
+DEPLOY_MANIFEST = (ROOT / "deployment-manifest.sh").read_text()
 INSTALL_SH = (ROOT / "install.sh").read_text()
 SERVER_PY = (ROOT / "server.py").read_text()
 
@@ -200,11 +207,13 @@ class RuntimeConfigTest(unittest.TestCase):
 
 class DeploymentRuntimeTest(unittest.TestCase):
     def test_deploy_copies_and_import_checks_runtime_modules(self):
-        for module in ("mobile_terminal_config.py", "proxy.py", "proxy_auth.py"):
-            self.assertIn(module, DEPLOY_SH.split("FILES=(", 1)[1].split(")", 1)[0])
+        for module in ("requirements.txt", "mobile_terminal_config.py", "proxy.py", "proxy_auth.py"):
+            self.assertIn(module, DEPLOY_MANIFEST)
         self.assertIn("from mobile_terminal_config import ConfigError, load_runtime_config", DEPLOY_SH)
         self.assertIn("from proxy import ProxyServer", DEPLOY_SH)
-        self.assertIn("if [ -x .venv/bin/python ]", DEPLOY_SH)
+        self.assertIn("/home/ben/mobile-terminal/.venv/bin/python", DEPLOY_MANIFEST)
+        self.assertIn("/home/bperritt/mobile-terminal/.venv/bin/python", DEPLOY_MANIFEST)
+        self.assertNotIn("/home/ubuntu/mobile-terminal/.venv", DEPLOY_MANIFEST)
 
     def test_installer_enforces_owner_only_environment_file(self):
         self.assertGreaterEqual(INSTALL_SH.count('chmod 600 "$ENV_FILE"'), 2)
@@ -221,7 +230,7 @@ class SystemdBackendTemplateTest(unittest.TestCase):
 
 
 class TerminalEnvironmentTest(unittest.TestCase):
-    def test_internal_token_is_removed_only_from_terminal_children(self):
+    def test_access_and_internal_tokens_are_removed_from_terminal_children(self):
         with mock.patch.dict(
             os.environ,
             {
@@ -235,9 +244,37 @@ class TerminalEnvironmentTest(unittest.TestCase):
             child_env = terminal_child_environment()
         self.assertNotIn("MOBILE_TERMINAL_INTERNAL_TOKEN", child_env)
         self.assertNotIn("MOBILE_TERMINAL_INTERNAL_TOKEN_POWERHOUSE", child_env)
-        self.assertEqual(child_env["MOBILE_TERMINAL_TOKEN"], "external-secret")
+        self.assertNotIn("MOBILE_TERMINAL_TOKEN", child_env)
         self.assertEqual(child_env["PATH"], "/usr/bin")
-        self.assertTrue(terminal_command("/bin/bash -l").startswith("env -u MOBILE_TERMINAL_INTERNAL_TOKEN "))
+        command = terminal_command("/bin/bash -l")
+        self.assertTrue(command.startswith("env -u MOBILE_TERMINAL_INTERNAL_TOKEN "))
+        self.assertIn("-u MOBILE_TERMINAL_TOKEN", command)
+
+    def test_tailscale_and_ssh_children_use_sanitized_environment(self):
+        child_result = SimpleNamespace(
+            returncode=0,
+            stdout=b'{"path":"/home/test","entries":[],"truncated":false}\n',
+            stderr=b"",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MOBILE_TERMINAL_INTERNAL_TOKEN": "internal-secret",
+                "MOBILE_TERMINAL_TOKEN": "external-secret",
+                "PATH": "/usr/bin",
+            },
+            clear=True,
+        ):
+            with mock.patch("server.subprocess.run", return_value=child_result) as run:
+                tailscale_capture("ip", "-4", check=False)
+                tailscale_env = run.call_args.kwargs["env"]
+                ssh_file_payload("example", "list", "~")
+                ssh_env = run.call_args.kwargs["env"]
+
+        for child_env in (tailscale_env, ssh_env):
+            self.assertEqual(child_env["PATH"], "/usr/bin")
+            self.assertNotIn("MOBILE_TERMINAL_INTERNAL_TOKEN", child_env)
+            self.assertNotIn("MOBILE_TERMINAL_TOKEN", child_env)
 
 
 class TokenAuthenticatorTest(unittest.TestCase):

@@ -14,6 +14,16 @@
 - Follow-output mode that keeps the viewport pinned to the bottom while streaming.
 - Separate display controls for overall UI scale and terminal text size.
 
+## Operations and deployment
+
+Read [`docs/RUNBOOK.md`](docs/RUNBOOK.md) before changing a running installation. Subsystem references:
+
+- [`docs/deployment.md`](docs/deployment.md) — fleet topology, exact service boundaries, rollout gates, and rollback.
+- [`docs/tmux-sizing.md`](docs/tmux-sizing.md) — latest-interactive-client geometry and private-socket testing.
+- [`docs/provider-authority.md`](docs/provider-authority.md) — transcript-backed Copy/To-tab authority and shadow/enforce rollout.
+
+Use `scripts/verify-runtime.sh` for redacted, read-only local verification and `scripts/provider-mode.sh` for provider-mode previews and explicitly applied changes. `deploy.sh` requires `--dry-run` or `--apply` plus exact per-user targets and explicit ph/ps acceptance gates; see the deployment guide.
+
 ## Run
 
 ```bash
@@ -21,14 +31,13 @@ cd /path/to/mobile-terminal
 ./run.sh --host 0.0.0.0 --port 8085 --session mobile-terminal
 ```
 
-The server prints an access token. Open `http://<this-computer-ip>:8085` on your phone, enter the token, and the browser will attach to the `mobile-terminal` tmux session.
+The server reports whether access-token authentication is configured but never prints the token value. Configure `MOBILE_TERMINAL_TOKEN` in the owner-only `mobile-terminal.env` file before starting; `run.sh` loads that file and refuses to use any interpreter except this checkout's `.venv/bin/python`. Then open `http://<this-computer-ip>:8085` on your phone. Use `--no-token` only with the documented Tailscale, allowlist, or loopback safeguards.
 
 ## Useful options
 
 ```bash
-python3 server.py --help
-python3 server.py --host 0.0.0.0 --port 8085 --session mobile-terminal --cwd "$HOME" --shell "$SHELL"
-MOBILE_TERMINAL_TOKEN='choose-a-long-secret' ./run.sh --host 0.0.0.0 --port 8085
+./run.sh --help
+./run.sh --host 0.0.0.0 --port 8085 --session mobile-terminal --cwd "$HOME" --shell "$SHELL"
 ```
 
 ## Tailscale-only mode
@@ -145,7 +154,8 @@ chmod 600 mobile-terminal.env mobile-terminal-users.json /path/to/proxy-config.j
 ```
 
 `install.sh` enforces mode `0600` on `mobile-terminal.env`; token persistence uses
-owner-only replacement files, and the service templates use `UMask=0077`.
+owner-only replacement files, and the service templates use `UMask=0077`. Access and internal
+hop tokens are removed from terminal and tmux child environments.
 
 ## tmux scrolling
 
@@ -179,14 +189,14 @@ That setup enables tmux copy-mode on scroll and matches the scroll direction exp
 The repo includes a cross-platform installer:
 
 ```bash
-./install.sh
+./install.sh --apply
 ```
 
-What it does:
+The installer is non-mutating unless `--apply` is present. It:
 
 - Installs `python3`, `tmux`, `node`, and `npm` if they are missing.
 - Runs `npm ci` to populate `node_modules`.
-- Creates `mobile-terminal.env` if you do not already have one and enforces mode `0600`.
+- Creates `mobile-terminal.env` if needed, writes Bash/systemd-compatible quoted values, and records an auth-readiness marker. Existing token-mode installs must be migrated explicitly with `./install.sh --apply --migrate-token-auth`; this replaces the old token line with a generated bootstrap token without parsing or printing the old value. Existing `--no-token` envs are marked ready without adding a token. The file is always mode `0600`.
 - Installs and starts a user service:
   - Linux: `systemd --user`
   - macOS: `launchd`
@@ -194,9 +204,9 @@ What it does:
 Useful variants:
 
 ```bash
-./install.sh --tailscale --no-token
-./install.sh --port 8085 --session mobile-terminal --cwd "$HOME" --shell "$SHELL"
-./install.sh --service none
+./install.sh --apply --tailscale --no-token
+./install.sh --apply --port 8085 --session mobile-terminal --cwd "$HOME" --shell "$SHELL"
+./install.sh --apply --service none
 ```
 
 On Linux, the generated service is written to `~/.config/systemd/user/mobile-terminal.service`.
