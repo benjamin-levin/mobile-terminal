@@ -1,11 +1,12 @@
 # Provider-backed Copy Authority
 
-Claude and Codex add gutters and application-level wrapping before text reaches tmux. tmux cells cannot reliably distinguish provider layout from authored indentation or source line breaks. Provider authority therefore combines two sources:
+Claude and Codex add gutters and application-level wrapping before text reaches tmux. tmux cells cannot reliably distinguish provider layout from authored indentation or source line breaks. Provider authority therefore combines three sources:
 
 - the provider transcript supplies authored bytes and semantic hard breaks;
-- a fenced tmux snapshot supplies visible placement and selection coordinates.
+- a fenced tmux snapshot supplies pane identity, geometry, ownership, and binding context;
+- for alternate-screen panes, the authenticated browser supplies the bounded rendered rows on which the selection was made, because a repainting alternate screen has no retained tmux row identity.
 
-Terminal whitespace verifies transcript-derived candidates. It never invents, trims, dedents, or normalizes source content.
+Terminal or client-rendered whitespace verifies transcript-derived candidates. It never invents, trims, dedents, or normalizes provider-exact source content.
 
 ## Precedence and shared consumers
 
@@ -42,7 +43,7 @@ scripts/provider-mode.sh off --apply
 
 Without `--apply`, mode changes are previews. Enforcement is deliberately gated from `prefer` and requires the additional `--confirm-enforce` acknowledgement. Moving directly from `off` to `prefer` is allowed, but `shadow` remains the diagnostic rollout gate before live use. A successful test suite is not a substitute for a real ph/iPhone selection.
 
-In `prefer`, every provider-side rejection falls back to the same exact tmux extraction used for ordinary output. A provider binding or ownership signal makes the response carry only the sanitized `terminal-raw` indicator; Copy and To-tab use it for a non-blocking warning that line breaks and spaces may be terminal-rendered. A canonical transcript match carries `provider-exact`. Ordinary unowned selections carry no provider indicator, and no response exposes provider reason codes, transcript identifiers, or content beyond the selected result.
+In `prefer`, every provider-side rejection falls back to rendered cell extraction and carries only the sanitized `terminal-raw` indicator. Normal-buffer fallback uses the exact tmux cells. Alternate-screen fallback uses the validated client rows on which the selection was made, with physical row boundaries preserved, because the live pane may already have repainted. Copy and To-tab use the indicator for a non-blocking warning that line breaks and spaces may be terminal-rendered. A canonical transcript match carries `provider-exact`. Ordinary unowned selections carry no provider indicator, and no response exposes provider reason codes, transcript identifiers, or content beyond the selected result.
 
 ## Rollout gate
 
@@ -69,6 +70,14 @@ Rows retained by tmux from an earlier narrower window can be shorter than the cu
 - never call `strip()` or `rstrip()`;
 - preserve authored trailing spaces through source provenance.
 
+## Alternate-screen client anchor and trust
+
+Alternate-screen rows are repaintable positions rather than retained history identities. An alternate-screen `selection-request` therefore includes `clientRows` for exactly the selected viewport rows, in ascending contiguous `y` order. Each row contains the full rendered text with exact spacing and bounded style runs. The server requires the rows to cover `selection.start.y` through `selection.end.y`, validates all coordinates against the advertised viewport, accepts only the small provider-verification style vocabulary, and requires both the complete UTF-8 `selection-request` wire encoding and the compact decoded `clientRows` encoding to fit within 64 KiB. Invalid row data produces only the standard stale-selection error and a sanitized `client-rows-invalid` counter.
+
+The authenticated browser is trusted to report the rendered cells on which its user acted; it is not provider source authority. A `provider-exact` response still comes only from a uniquely matched, fenced provider transcript after live pane ownership and binding revalidation. Client text and styles may choose a candidate or cause ambiguity/rejection, but they cannot supply the returned provider-exact bytes. In `off`, `shadow` fallback, or `prefer` fallback, those rendered cells are the only faithful raw view after the alternate screen has repainted, so they are the explicit `terminal-raw` trust boundary.
+
+The server may hold later PTY output while resolving a selection. It sends `selection-result` before releasing that output, so a repaint cannot tear down the browser selection before Copy or To-tab receives its answer. Alternate selection no longer waits for output quiet or requires byte-revision equality; epoch, pane, layout, viewport geometry, coordinates, bounded client rows, provider binding, and transcript fences remain strict.
+
 ## Binding and transcript safety
 
 - Treat hook files and pane options as discovery caches, not authority.
@@ -80,7 +89,7 @@ Rows retained by tmux from an earlier narrower window can be shorter than the cu
 
 ## Diagnostics
 
-Diagnostics are bounded aggregate reason counters only. They may report counts and stable reason codes such as binding failure, unsupported renderer, ambiguous placement, or snapshot mismatch. They must not contain source text, selected text, terminal rows, tokens, credentials, or provider authentication data.
+Diagnostics are bounded aggregate reason counters only. They may report counts and stable reason codes such as binding failure, unsupported renderer, ambiguous placement, snapshot mismatch, or invalid client-row geometry. They must not contain source text, selected text, client row text/styles, terminal rows, tokens, credentials, or provider authentication data.
 
 Do not use `/proc/<pid>/environ` as the deployment verifier. It can be inaccessible under procfs hardening and can expose secrets if printed. Read only the configured authority mode from the owner-only env file and use provider binding validation for runtime authority.
 
@@ -93,5 +102,8 @@ Do not use `/proc/<pid>/environ` as the deployment verifier. It can be inaccessi
 - historical 45/90-column rows inside a current 180-column snapshot;
 - duplicate placement ambiguity and unsupported alias poisoning;
 - binding replay, process reuse, transcript append/truncate/rotation, and final fence revalidation;
+- client-anchored alternate-screen rows, bounded coordinate/style validation, repaint during matching, and result-before-held-output ordering;
+- one-row normal selections ignore wrap relationships outside the selected interval, unused tab stops, and styling while interior selected wrap changes remain stale;
+- scroll bursts coalesce/cancel before tmux and are drained in bounded responsive batches;
 - command provenance remains first and ordinary tmux output remains available outside provider-owned ranges;
 - Copy and To-tab use one authoritative result.

@@ -1939,6 +1939,131 @@ class RuntimeBindingCacheTest(unittest.TestCase):
             self.assertIsNone(fallback.text)
             self.assertEqual(fallback.authority, "terminal-raw")
 
+    def test_alternate_client_rows_anchor_provider_geometry_and_style(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            current = binding("claude", home / ".claude/projects/session.jsonl")
+            snapshot = SimpleNamespace(
+                pane_id="%9",
+                alternate=True,
+                cols=8,
+                seed_history=0,
+                physical_rows=["changed "],
+                plain_physical_rows=["changed "],
+            )
+            client_rows = (
+                (
+                    4,
+                    "● answer",
+                    (
+                        (0, 1, "plain;fg-indexed-231"),
+                        (1, 8, "plain"),
+                    ),
+                ),
+            )
+            with patch.dict(
+                os.environ,
+                {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "enforce"},
+            ), patch(
+                "provider_authority.resolve_provider_binding",
+                return_value=(current, None),
+            ), patch(
+                "provider_authority.authoritative_provider_match",
+                return_value=MatchResult(True, text="exact source"),
+            ) as match:
+                result = provider_selection(
+                    snapshot,
+                    2,
+                    4,
+                    8,
+                    4,
+                    home=home,
+                    client_rows=client_rows,
+                )
+
+            self.assertTrue(result.owned)
+            self.assertEqual(result.text, "exact source")
+            self.assertEqual(match.call_args.kwargs["plain_rows"], ("● answer",))
+            self.assertEqual(match.call_args.kwargs["selection_start"], (0, 2))
+            self.assertEqual(match.call_args.kwargs["selection_end"], (0, 8))
+            self.assertEqual(match.call_args.kwargs["style_rows"], (client_rows[0][2],))
+
+    def test_client_anchor_preserves_shadow_prefer_and_enforce_modes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            current = binding("claude", home / ".claude/projects/session.jsonl")
+            snapshot = SimpleNamespace(
+                pane_id="%9",
+                alternate=True,
+                cols=8,
+                seed_history=0,
+                physical_rows=["changed "],
+                plain_physical_rows=["changed "],
+            )
+            client_rows = ((0, "● answer", ((0, 8, "plain"),)),)
+            with patch(
+                "provider_authority.resolve_provider_binding",
+                return_value=(current, None),
+            ):
+                with patch.dict(
+                    os.environ,
+                    {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "shadow"},
+                ), patch(
+                    "provider_authority.authoritative_provider_match",
+                    return_value=MatchResult(True, text="exact source"),
+                ):
+                    matched = provider_selection(
+                        snapshot,
+                        0,
+                        0,
+                        8,
+                        0,
+                        home=home,
+                        client_rows=client_rows,
+                    )
+                self.assertEqual(
+                    (matched.owned, matched.text, matched.authority),
+                    (True, "exact source", "provider-exact"),
+                )
+
+                for mode, expected_authority in (("shadow", None), ("prefer", "terminal-raw")):
+                    with self.subTest(mode=mode), patch.dict(
+                        os.environ,
+                        {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": mode},
+                    ), patch(
+                        "provider_authority.authoritative_provider_match",
+                        return_value=MatchResult.failure("no-plain-placement"),
+                    ):
+                        fallback = provider_selection(
+                            snapshot,
+                            0,
+                            0,
+                            8,
+                            0,
+                            home=home,
+                            client_rows=client_rows,
+                        )
+                    self.assertFalse(fallback.owned)
+                    self.assertEqual(fallback.authority, expected_authority)
+
+                with patch.dict(
+                    os.environ,
+                    {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "enforce"},
+                ), patch(
+                    "provider_authority.authoritative_provider_match",
+                    return_value=MatchResult.failure("no-plain-placement"),
+                ):
+                    with self.assertRaisesRegex(ProviderAuthorityError, "no-plain-placement"):
+                        provider_selection(
+                            snapshot,
+                            0,
+                            0,
+                            8,
+                            0,
+                            home=home,
+                            client_rows=client_rows,
+                        )
+
     def test_prefer_binding_failure_falls_back_but_true_absence_is_unowned(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)

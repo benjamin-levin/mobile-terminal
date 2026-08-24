@@ -55,7 +55,7 @@ assert.equal(normalizeTerminalCopyText("crlf\r\nlone-cr\rfinal\r\n"),
 ''',
         )
 
-    def test_rendered_xterm_cells_are_never_textual_authority(self):
+    def test_rendered_xterm_cells_are_bounded_alternate_visual_authority_only(self):
         self.assertNotIn("staleVisualContinuationText", APP_JS)
         self.assertNotIn("extractTerminalSelectionText", APP_JS)
         self.assertNotIn("terminalSelectionText", APP_JS)
@@ -70,10 +70,13 @@ assert.equal(normalizeTerminalCopyText("crlf\r\nlone-cr\rfinal\r\n"),
             "revision: terminalRevision",
             "cutoff: terminalCutoff",
             "layoutGeneration: terminalLayoutGeneration",
-            "baseY: term.buffer.active.baseY",
-            "bufferType: term.buffer.active.type",
+            "baseY: buffer.baseY",
+            "bufferType: buffer.type",
+            "...(clientRows ? { clientRows } : {})",
         ):
             self.assertIn(field, APP_JS)
+        self.assertIn('buffer.type !== "alternate"', APP_JS)
+        self.assertIn("line.translateToString(false, 0, term.cols)", APP_JS)
         self.assertIn('type: "selection-request"', request)
         self.assertIn("selection: {", APP_JS)
 

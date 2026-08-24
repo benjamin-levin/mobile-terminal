@@ -26,7 +26,7 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlsplit
 
 import regex
-from wcwidth import wcwidth
+from wcwidth import wcwidth, wcswidth
 
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
@@ -449,6 +449,12 @@ def current_path(session_name: str, fallback: str) -> str:
 # top of its current window.
 CONNECT_HISTORY_LINES = 2000
 MAX_HISTORY_SEED_LINES = 20000
+MAX_SELECTION_REQUEST_BYTES = 64 * 1024
+MAX_CLIENT_SELECTION_ROWS_BYTES = 64 * 1024
+CLIENT_SELECTION_STYLE_RE = re.compile(
+    r"(?:plain|strong|emphasis|list-marker|code-inline|unsupported)"
+    r"(?:;fg-indexed-(?:[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))?"
+)
 TMUX_INPUT_CHUNK_BYTES = 1024
 AUTHORITATIVE_SELECTION_DIAGNOSTIC_FLUSH_EVERY = 128
 AUTHORITATIVE_SELECTION_REJECTION_REASONS = frozenset(
@@ -459,6 +465,7 @@ AUTHORITATIVE_SELECTION_REJECTION_REASONS = frozenset(
         "provenance-unavailable",
         "client-selection-check-false",
         "client-selection-check-timeout",
+        "client-rows-invalid",
         "output-changed",
         "selected-rows-changed",
         "selection-rows-unresolvable",
@@ -603,7 +610,6 @@ class AcceptedCommand:
 
 @dataclass(frozen=True)
 class SelectionRowSignature:
-    styled: str
     plain: str
     authored: str
     continues_from_previous: bool
@@ -743,14 +749,24 @@ class PaneRowTracker:
         stable_rows: tuple[tuple[int, SelectionRowSignature], ...],
     ) -> int | None:
         deltas = []
+        expected_signatures = tuple(signature for _, signature in stable_rows)
         for delta in range(max(0, expected_delta), len(self.plain_rows) + 1):
             first_row = self.first_row + delta
-            if all(
-                0 <= identity_row - first_row < len(row_signatures)
-                and row_signatures[identity_row - first_row] == signature
-                for identity_row, signature in stable_rows
-            ):
-                deltas.append(delta)
+            candidate_rows = []
+            for identity_row, _ in stable_rows:
+                index = identity_row - first_row
+                if not 0 <= index < len(row_signatures):
+                    break
+                signature = row_signatures[index]
+                if signature is None:
+                    break
+                candidate_rows.append((identity_row, signature))
+            else:
+                candidate_signatures = tuple(
+                    signature for _, signature in _scope_selection_rows(tuple(candidate_rows))
+                )
+                if candidate_signatures == expected_signatures:
+                    deltas.append(delta)
         if len(deltas) != 1:
             return None
         return deltas[0]
@@ -1288,7 +1304,6 @@ def _selection_row_signatures(
     mapping = _authored_physical_map(snapshot)
     return tuple(
         SelectionRowSignature(
-            styled=snapshot.physical_rows[index],
             plain=snapshot.plain_physical_rows[index],
             authored=authored,
             continues_from_previous=(
@@ -1297,9 +1312,31 @@ def _selection_row_signatures(
             continues_to_next=(
                 index + 1 < len(mapping) and mapping[index + 1][0] == logical_index
             ),
-            tab_stops=snapshot.tab_stops,
+            tab_stops=snapshot.tab_stops if "\t" in authored else (),
         )
         for index, (logical_index, authored) in enumerate(mapping)
+    )
+
+
+def _scope_selection_rows(
+    rows: tuple[tuple[int, SelectionRowSignature], ...],
+) -> tuple[tuple[int, SelectionRowSignature], ...]:
+    if not rows:
+        return ()
+    return tuple(
+        (
+            identity_row,
+            replace(
+                signature,
+                continues_from_previous=(
+                    signature.continues_from_previous and index > 0
+                ),
+                continues_to_next=(
+                    signature.continues_to_next and index + 1 < len(rows)
+                ),
+            ),
+        )
+        for index, (identity_row, signature) in enumerate(rows)
     )
 
 
@@ -1330,6 +1367,114 @@ def _slice_display_cells(
         else:
             selected.append(value)
     return "".join(selected)
+
+
+def _selection_request_wire_bytes(raw_message: str) -> int:
+    return len(raw_message.encode("utf-8", "surrogatepass"))
+
+
+def _client_row_display_tokens(text: str) -> tuple[list[tuple[str, int, int]], int]:
+    tokens: list[tuple[str, int, int]] = []
+    column = 0
+    for grapheme in GRAPHEME_RE.findall(text):
+        width = wcswidth(grapheme)
+        if width < 0:
+            raise ValueError("invalid client selection row")
+        if width:
+            tokens.append((grapheme, column, column + width))
+            column += width
+    return tokens, column
+
+
+def _slice_client_row_display_cells(text: str, start: int, end: int) -> str:
+    if end <= start:
+        return ""
+    return "".join(
+        grapheme
+        for grapheme, token_start, token_end in _client_row_display_tokens(text)[0]
+        if min(end, token_end) > max(start, token_start)
+    )
+
+
+def _validated_client_selection_rows(
+    value: Any,
+    cols: int,
+    rows: int,
+    start_y: int,
+    end_y: int,
+) -> tuple[tuple[int, str, tuple[tuple[int, int, str], ...]], ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > rows
+        or len(value) != end_y - start_y + 1
+    ):
+        raise ValueError("invalid client selection rows")
+    try:
+        encoded_size = len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+    except (RecursionError, TypeError, UnicodeEncodeError, ValueError) as exc:
+        raise ValueError("invalid client selection rows") from exc
+    if encoded_size > MAX_CLIENT_SELECTION_ROWS_BYTES:
+        raise ValueError("invalid client selection rows")
+
+    validated = []
+    for index, row in enumerate(value):
+        if not isinstance(row, dict):
+            raise ValueError("invalid client selection row")
+        y = row.get("y")
+        text = row.get("text")
+        styles = row.get("styles")
+        if (
+            isinstance(y, bool)
+            or not isinstance(y, int)
+            or y != start_y + index
+            or not 0 <= y < rows
+            or not isinstance(text, str)
+            or "\n" in text
+            or "\r" in text
+        ):
+            raise ValueError("invalid client selection row")
+        _, width = _client_row_display_tokens(text)
+        if width > cols or not isinstance(styles, list) or len(styles) > cols:
+            raise ValueError("invalid client selection row")
+        validated_styles = []
+        previous_end = 0
+        for style in styles:
+            if not isinstance(style, list) or len(style) != 3:
+                raise ValueError("invalid client selection style")
+            style_start, style_end, token = style
+            if (
+                isinstance(style_start, bool)
+                or isinstance(style_end, bool)
+                or not isinstance(style_start, int)
+                or not isinstance(style_end, int)
+                or style_start != previous_end
+                or not style_start < style_end <= cols
+                or not isinstance(token, str)
+                or CLIENT_SELECTION_STYLE_RE.fullmatch(token) is None
+            ):
+                raise ValueError("invalid client selection style")
+            validated_styles.append((style_start, style_end, token))
+            previous_end = style_end
+        if previous_end != cols:
+            raise ValueError("invalid client selection style")
+        validated.append((y, text, tuple(validated_styles)))
+    return tuple(validated)
+
+
+def _extract_client_selection_rows(
+    client_rows: tuple[tuple[int, str, tuple[tuple[int, int, str], ...]], ...],
+    start_x: int,
+    end_x: int,
+) -> str:
+    pieces = []
+    for index, (_, text, _) in enumerate(client_rows):
+        row_start = start_x if index == 0 else 0
+        row_end = end_x if index + 1 == len(client_rows) else 0x7FFFFFFF
+        pieces.append(_slice_client_row_display_cells(text, row_start, row_end))
+    return "\n".join(pieces)
 
 
 def extract_authoritative_selection(
@@ -1428,7 +1573,7 @@ def pane_scrolls_locally(session_name: str) -> bool:
     return not alternate_on and not mouse_tracking
 
 
-MAX_SCROLL_EVENTS_PER_CALL = 200
+MAX_SCROLL_EVENTS_PER_CALL = 48
 
 
 def scroll_session_history(pane_id: str, lines: int) -> None:
@@ -2680,6 +2825,7 @@ class TmuxBridge:
         self.seed_acks: dict[int, asyncio.Event] = {}
         self.flush_acks: dict[tuple[int, int], asyncio.Event] = {}
         self.selection_acks: dict[str, tuple[asyncio.Event, dict[str, Any]]] = {}
+        self.selection_hold_request_id: str | None = None
         self.selection_row_identity: SnapshotRowIdentity | None = None
 
     @staticmethod
@@ -3357,6 +3503,7 @@ class TmuxBridge:
             elif reason in ("history", "initial", "session-switch"):
                 self.provenance_state.invalidate_active()
             async with self.send_lock:
+                self.selection_hold_request_id = None
                 self.phase = "hold"
                 self.held = []
                 if next_pane_id:
@@ -3437,19 +3584,24 @@ class TmuxBridge:
             self.seed_acks.pop(epoch, None)
             await self._flush_seed_output(epoch, cutoff)
 
-    async def _flush_selection_hold(self) -> None:
+    async def _flush_selection_hold(self, request_id: str | None = None) -> None:
         async with self.send_lock:
+            if request_id is not None and self.selection_hold_request_id != request_id:
+                return
             pending = self.held
             self.held = []
             try:
                 for record in pending:
                     await self._send_output(record, "selection-held")
             finally:
+                self.selection_hold_request_id = None
                 self.phase = "forward"
 
     async def authoritative_selection_result(
         self,
         payload: dict[str, Any],
+        *,
+        defer_hold_release: bool = False,
     ) -> AuthoritativeSelectionResult:
         request_id = str(payload.get("requestId", ""))
         stale_message = "Terminal changed; select again."
@@ -3474,6 +3626,48 @@ class TmuxBridge:
         except (KeyError, TypeError, ValueError):
             return reject("payload-parse")
         if (
+            client_cols <= 0
+            or client_rows <= 0
+            or not 0 <= start_x <= client_cols
+            or not 0 <= end_x <= client_cols
+            or (end_y, end_x) < (start_y, start_x)
+            or buffer_type not in ("normal", "alternate")
+        ):
+            return reject("geometry-buffer-base-mismatch")
+        client_selection_rows: tuple[
+            tuple[int, str, tuple[tuple[int, int, str], ...]], ...
+        ] = ()
+        if buffer_type == "alternate":
+            request_wire_bytes = payload.get("_selectionRequestWireBytes")
+            if (
+                request_wire_bytes is not None
+                and (
+                    isinstance(request_wire_bytes, bool)
+                    or not isinstance(request_wire_bytes, int)
+                    or not 0 <= request_wire_bytes <= MAX_SELECTION_REQUEST_BYTES
+                )
+            ):
+                return reject("client-rows-invalid")
+            if base_y != 0 or not 0 <= start_y <= end_y < client_rows:
+                return reject("geometry-buffer-base-mismatch")
+            try:
+                client_selection_rows = _validated_client_selection_rows(
+                    payload.get("clientRows"),
+                    client_cols,
+                    client_rows,
+                    start_y,
+                    end_y,
+                )
+            except ValueError:
+                return reject("client-rows-invalid")
+        elif (
+            base_y < self.seed_history
+            or base_y > MAX_HISTORY_SEED_LINES
+            or not 0 <= start_y <= base_y + client_rows - 1
+            or not 0 <= end_y <= base_y + client_rows - 1
+        ):
+            return reject("geometry-buffer-base-mismatch")
+        if (
             payload.get("session") != self.session_name
             or payload.get("profile", "") != self.profile_id
             or payload.get("paneId") != self.pane_id
@@ -3488,13 +3682,10 @@ class TmuxBridge:
             async with self.write_lock:
                 async with self.send_lock:
                     alternate_request = buffer_type == "alternate"
-                    # Alternate-screen rows are repaintable positions, not retained
-                    # main-screen identities, so they keep the exact revision fence.
                     if (
                         self.phase != "forward"
                         or revision < cutoff
                         or revision > self.offset
-                        or (alternate_request and revision != self.offset)
                         or epoch != self.epoch_state["epoch"]
                         or cutoff != self.cutoff
                         or layout_generation != self.epoch_state["layout"]
@@ -3510,6 +3701,7 @@ class TmuxBridge:
                     ):
                         return reject("provenance-unavailable")
                     self.phase = "hold"
+                    self.selection_hold_request_id = request_id
                     self.held = []
                     stable_offset = self.offset
                     stable_epoch = self.epoch_state["epoch"]
@@ -3548,21 +3740,9 @@ class TmuxBridge:
                                 await asyncio.sleep(0)
                         raise RuntimeError("tmux pane snapshot is unavailable")
 
-                    if alternate_request:
-                        exception_reason = "provider-tmux-exception"
-                        self.last_output_at = time.monotonic()
-                        await self.quiet(0.1)
-                        if self.offset != stable_offset:
-                            return reject("output-changed")
                     exception_reason = "snapshot-capture"
                     snapshot = await capture_selection_snapshot(1 if alternate_request else 5)
                     snapshot_revision = self.offset
-                    if alternate_request:
-                        exception_reason = "provider-tmux-exception"
-                        self.last_output_at = time.monotonic()
-                        await self.quiet(0.05)
-                        if self.offset != stable_offset:
-                            return reject("output-changed")
                     if (
                         buffer_type not in ("normal", "alternate")
                         or snapshot.cols != client_cols
@@ -3586,6 +3766,40 @@ class TmuxBridge:
 
                     relative_start_row = start_y - base_y
                     relative_end_row = end_y - base_y
+                    if alternate_request:
+                        if (
+                            self.epoch_state["epoch"] != stable_epoch
+                            or self.epoch_state["layout"] != stable_layout
+                            or self.session_name != payload.get("session")
+                            or self.pane_id != snapshot.pane_id
+                        ):
+                            return reject("stability-recheck")
+                        exception_reason = "provider-tmux-exception"
+                        provider = await asyncio.to_thread(
+                            provider_selection,
+                            snapshot,
+                            start_x,
+                            relative_start_row,
+                            end_x,
+                            relative_end_row,
+                            client_rows=client_selection_rows,
+                        )
+                        if provider.owned:
+                            return AuthoritativeSelectionResult(
+                                text=provider.text or "",
+                                authority="provider-exact",
+                            )
+                        authority = getattr(provider, "authority", None)
+                        if authority != "terminal-raw":
+                            authority = None
+                        return AuthoritativeSelectionResult(
+                            text=_extract_client_selection_rows(
+                                client_selection_rows,
+                                start_x,
+                                end_x,
+                            ),
+                            authority=authority,
+                        )
                     entry_stable_rows: tuple[
                         tuple[int, SelectionRowSignature], ...
                     ] = ()
@@ -3616,7 +3830,7 @@ class TmuxBridge:
                             if signature is None:
                                 return reject("selection-rows-unresolvable")
                             entry_stable.append((identity_row, signature))
-                        entry_stable_rows = tuple(entry_stable)
+                        entry_stable_rows = _scope_selection_rows(tuple(entry_stable))
                     identity = self.provenance_state.row_tracker.observe(
                         snapshot,
                         snapshot_revision,
@@ -3679,17 +3893,19 @@ class TmuxBridge:
                     ):
                         return reject("selection-rows-unresolvable")
                     snapshot_row_signatures = _selection_row_signatures(snapshot)
-                    selected_rows = tuple(
-                        (
-                            identity_row,
-                            snapshot_row_signatures[
-                                _absolute_row(snapshot, identity, identity_row)
-                                - first_absolute_row
-                            ],
-                        )
-                        for identity_row in range(
-                            start_identity_row,
-                            end_identity_row + 1,
+                    selected_rows = _scope_selection_rows(
+                        tuple(
+                            (
+                                identity_row,
+                                snapshot_row_signatures[
+                                    _absolute_row(snapshot, identity, identity_row)
+                                    - first_absolute_row
+                                ],
+                            )
+                            for identity_row in range(
+                                start_identity_row,
+                                end_identity_row + 1,
+                            )
                         )
                     )
                     if entry_stable_rows and selected_rows != entry_stable_rows:
@@ -3780,10 +3996,11 @@ class TmuxBridge:
                             - verification_snapshot.seed_history
                         )
                         verification_indexes = []
+                        verification_rows = []
                         verification_row_signatures = _selection_row_signatures(
                             verification_snapshot
                         )
-                        for identity_row, signature in selected_rows:
+                        for identity_row, _ in selected_rows:
                             absolute_row = _absolute_row(
                                 verification_snapshot,
                                 verification_identity,
@@ -3795,10 +4012,13 @@ class TmuxBridge:
                             ):
                                 return reject("selection-rows-unresolvable")
                             verification_indexes.append(index)
-                            if verification_row_signatures[index] != signature:
-                                return reject("selected-rows-changed")
+                            verification_rows.append(
+                                (identity_row, verification_row_signatures[index])
+                            )
                         if len(set(verification_indexes)) != len(verification_indexes):
                             return reject("selection-rows-unresolvable")
+                        if _scope_selection_rows(tuple(verification_rows)) != selected_rows:
+                            return reject("selected-rows-changed")
 
                     if matched:
                         return AuthoritativeSelectionResult(text=exact_text or "")
@@ -3826,10 +4046,11 @@ class TmuxBridge:
                     return reject(exception_reason)
                 finally:
                     self.selection_acks.pop(request_id, None)
-                    try:
-                        await self._flush_selection_hold()
-                    except Exception:
-                        pass
+                    if not defer_hold_release:
+                        try:
+                            await self._flush_selection_hold(request_id)
+                        except Exception:
+                            pass
 
     async def authoritative_selection(
         self,
@@ -3969,6 +4190,9 @@ class AppServer:
             state["task"] = asyncio.create_task(self.drain_scroll_history(session_name, state))
 
     async def drain_scroll_history(self, session_name: str, state: dict[str, Any]) -> None:
+        # Yield once so wheel/touch deltas already queued on the socket can cancel
+        # or merge before starting a tmux subprocess.
+        await asyncio.sleep(0)
         # Deltas that arrive while a tmux call is in flight accumulate in
         # "pending" and get merged into one call on the next iteration, so the
         # event loop is never blocked and tmux sees at most one process at a
@@ -5302,10 +5526,14 @@ class AppServer:
             return
 
         if message_type == "selection-request":
-            result = await bridge.authoritative_selection_result(payload)
+            request_id = str(payload.get("requestId", ""))
+            result = await bridge.authoritative_selection_result(
+                payload,
+                defer_hold_release=True,
+            )
             response: dict[str, Any] = {
                 "type": "selection-result",
-                "requestId": str(payload.get("requestId", "")),
+                "requestId": request_id,
             }
             if result.error:
                 response["error"] = result.error
@@ -5313,7 +5541,10 @@ class AppServer:
                 response["text"] = result.text or ""
                 if result.authority in ("provider-exact", "terminal-raw"):
                     response["authority"] = result.authority
-            await self.send_json(connection, response)
+            try:
+                await self.send_json(connection, response)
+            finally:
+                await bridge._flush_selection_hold(request_id)
             return
 
         if message_type == "history-reseed":
@@ -5361,7 +5592,11 @@ class AppServer:
             return
 
         if message_type == "scroll-history":
-            lines = int(payload.get("lines", 0))
+            try:
+                lines = int(payload.get("lines", 0))
+            except (TypeError, ValueError):
+                return
+            lines = max(-MAX_SCROLL_EVENTS_PER_CALL, min(MAX_SCROLL_EVENTS_PER_CALL, lines))
             self.queue_scroll_history(session_name, bridge.pane_id, lines)
             return
 
@@ -6012,6 +6247,12 @@ class AppServer:
                     payload = json.loads(raw_message)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("type") == "selection-request":
+                    payload["_selectionRequestWireBytes"] = (
+                        _selection_request_wire_bytes(raw_message)
+                    )
                 if bridge.acknowledge(payload):
                     continue
                 await incoming.put(payload)

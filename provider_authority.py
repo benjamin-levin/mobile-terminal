@@ -2766,6 +2766,10 @@ def _provider_selection_locked(
     end_row: int,
     *,
     home: Path | str | None = None,
+    client_rows: Sequence[
+        tuple[int, str, tuple[tuple[int, int, str], ...]]
+    ]
+    | None = None,
 ) -> ProviderSelectionResult:
     mode = provider_authority_mode()
     if mode == "off":
@@ -2813,11 +2817,23 @@ def _provider_selection_locked(
         owned = _selection_is_owned(binding, cache, snapshot, start_row, end_row)
         if not owned:
             return decision("unowned", False, "selection-unowned")
-        normalized_plain_rows, style_rows = _normalize_captured_rows(
-            snapshot.physical_rows,
-            snapshot.plain_physical_rows,
-            snapshot.cols,
-        )
+        if client_rows is None:
+            normalized_plain_rows, style_rows = _normalize_captured_rows(
+                snapshot.physical_rows,
+                snapshot.plain_physical_rows,
+                snapshot.cols,
+            )
+            match_start = (start_row + snapshot.seed_history, start_x)
+            match_end = (end_row + snapshot.seed_history, end_x)
+        else:
+            first_client_row = client_rows[0][0]
+            normalized_plain_rows = normalize_plain_rows(
+                tuple(row[1] for row in client_rows),
+                snapshot.cols,
+            )
+            style_rows = tuple(row[2] for row in client_rows)
+            match_start = (start_row - first_client_row, start_x)
+            match_end = (end_row - first_client_row, end_x)
         key = (binding.provider, binding.transcript_path.absolute(), binding.generation)
         index = _transcript_index(key)
         result = authoritative_provider_match(
@@ -2826,8 +2842,8 @@ def _provider_selection_locked(
             transcript_root=_transcript_root(binding, provider_home),
             cols=snapshot.cols,
             plain_rows=normalized_plain_rows,
-            selection_start=(start_row + snapshot.seed_history, start_x),
-            selection_end=(end_row + snapshot.seed_history, end_x),
+            selection_start=match_start,
+            selection_end=match_end,
             style_rows=style_rows,
             before_final_revalidation=lambda: _revalidate_runtime_binding(
                 binding, cache, provider_home
@@ -2874,6 +2890,10 @@ def provider_selection(
     end_row: int,
     *,
     home: Path | str | None = None,
+    client_rows: Sequence[
+        tuple[int, str, tuple[tuple[int, int, str], ...]]
+    ]
+    | None = None,
 ) -> ProviderSelectionResult:
     with _PROVIDER_SELECTION_LOCK:
         return _provider_selection_locked(
@@ -2883,6 +2903,7 @@ def provider_selection(
             end_x,
             end_row,
             home=home,
+            client_rows=client_rows,
         )
 
 

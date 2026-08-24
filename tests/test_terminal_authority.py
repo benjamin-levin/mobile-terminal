@@ -129,6 +129,39 @@ class QueuedConnection:
 
 
 class AuthoritativeSelectionTest(unittest.TestCase):
+    def test_selection_wire_limit_counts_received_escape_encoding(self):
+        raw_message = (
+            '{"type":"selection-request","clientRows":[{"text":"'
+            + "\\u0020" * 11000
+            + '"}]}'
+        )
+        decoded = json.loads(raw_message)["clientRows"]
+        compact_size = len(
+            json.dumps(decoded, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+
+        self.assertLess(compact_size, server.MAX_CLIENT_SELECTION_ROWS_BYTES)
+        self.assertGreater(
+            server._selection_request_wire_bytes(raw_message),
+            server.MAX_SELECTION_REQUEST_BYTES,
+        )
+
+    def test_client_row_slicing_clamps_wide_grapheme_boundaries(self):
+        client_rows = ((0, "😀界X", ((0, 5, "plain"),)),)
+
+        cases = (
+            (0, 1, "😀"),
+            (1, 2, "😀"),
+            (2, 3, "界"),
+            (3, 4, "界"),
+        )
+        for start, end, expected in cases:
+            with self.subTest(start=start, end=end):
+                self.assertEqual(
+                    server._extract_client_selection_rows(client_rows, start, end),
+                    expected,
+                )
+
     def test_exact_tmux_views_define_soft_rows_and_hard_boundaries(self):
         pane = snapshot(
             cols=5,
@@ -2377,6 +2410,7 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         app.send_json = mock.AsyncMock()
         bridge = mock.Mock()
         bridge.authoritative_selection_result = mock.AsyncMock()
+        bridge._flush_selection_hold = mock.AsyncMock()
         state = {"session": "session", "user": ""}
         payload = {"type": "selection-request", "requestId": "request"}
         cases = (
@@ -2411,6 +2445,54 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
                         **expected,
                     },
                 )
+
+    async def test_selection_result_precedes_held_terminal_output(self):
+        app = object.__new__(AppServer)
+        order = []
+
+        async def send_json(_connection, payload):
+            order.append(payload["type"])
+
+        app.send_json = send_json
+        bridge = mock.Mock()
+        bridge.authoritative_selection_result = mock.AsyncMock(
+            return_value=AuthoritativeSelectionResult("exact")
+        )
+
+        async def flush(request_id):
+            order.append(f"flush:{request_id}")
+
+        bridge._flush_selection_hold = flush
+        payload = {"type": "selection-request", "requestId": "request"}
+        await app.handle_command(mock.Mock(), bridge, {"session": "session", "user": ""}, payload)
+
+        self.assertEqual(order, ["selection-result", "flush:request"])
+        bridge.authoritative_selection_result.assert_awaited_once_with(
+            payload,
+            defer_hold_release=True,
+        )
+
+    async def test_reseed_supersedes_deferred_selection_hold(self):
+        connection = QueuedConnection()
+        bridge = TmuxBridge(connection, "session", "/bin/sh", "/")
+        bridge.pane_id = "%1"
+        bridge.phase = "hold"
+        bridge.selection_hold_request_id = "selection"
+        bridge.held = [{"start": 0, "end": 1, "data": b"x"}]
+
+        reseeding = asyncio.create_task(bridge.reseed("pane-change", next_pane_id="%2"))
+        seed_start = await connection.payloads.get()
+        self.assertEqual(seed_start["type"], "seed-start")
+        self.assertEqual(bridge.phase, "hold")
+        self.assertIsNone(bridge.selection_hold_request_id)
+
+        await bridge._flush_selection_hold("selection")
+        self.assertEqual(bridge.phase, "hold")
+        self.assertEqual(bridge.pane_id, "%2")
+
+        reseeding.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await reseeding
 
     async def test_client_selection_check_false_has_distinct_sanitized_reason(self):
         connection = QueuedConnection()
@@ -3178,7 +3260,174 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((text, error), ("KEEP", None))
         self.assertEqual(select.call_args.args[1:], (0, -1, 4, -1))
 
-    async def test_epoch_layout_geometry_and_alternate_revision_remain_strict(self):
+    async def test_one_row_selection_ignores_outside_wrap_tabs_and_style_changes(self):
+        base = snapshot(
+            cols=4,
+            authored_lines=["KEEP", "tail"],
+            plain_physical_rows=["KEEP", "tail"],
+            physical_rows=["KEEP", "tail"],
+            rows=2,
+            tab_stops=(2,),
+        )
+        cases = (
+            replace(base, authored_lines=["KEEPtail"]),
+            replace(base, tab_stops=(1, 3)),
+            replace(base, physical_rows=["KEEP", "\x1b[1mtail\x1b[0m"]),
+        )
+        provider = mock.Mock(owned=False, text=None, authority=None)
+        for index, current in enumerate(cases):
+            with self.subTest(index=index):
+                bridge, payload = self.make_bridge(base, offset=5, revision=0)
+                with (
+                    mock.patch("server.capture_pane_snapshot", return_value=current),
+                    mock.patch("server.provider_selection", return_value=provider),
+                ):
+                    text, error = await bridge.authoritative_selection(payload)
+                self.assertEqual((text, error), ("KEEP", None))
+
+    async def test_alternate_client_rows_are_strictly_bounded_before_capture(self):
+        pane = replace(
+            snapshot(cols=8, authored_lines=["KEEP"], rows=1),
+            alternate=True,
+            seed_history=0,
+            history=0,
+        )
+        bridge, payload = self.make_bridge(pane)
+        payload.update({"bufferType": "alternate", "baseY": 0})
+        invalid_rows = (
+            None,
+            [],
+            [{"y": 1, "text": "KEEP    ", "styles": [[0, 8, "plain"]]}],
+            [{"y": 0, "text": "KEEP    ", "styles": [[0, 9, "plain"]]}],
+            [{"y": 0, "text": "KEEP    ", "styles": [[0, 4, "private"]]}],
+        )
+        for index, client_rows in enumerate(invalid_rows):
+            with self.subTest(index=index), mock.patch(
+                "server.capture_pane_snapshot"
+            ) as capture, mock.patch(
+                "server._record_authoritative_selection_rejection"
+            ) as rejected:
+                payload["requestId"] = uuid.uuid4().hex
+                payload["clientRows"] = client_rows
+                text, error = await bridge.authoritative_selection(payload)
+            self.assertEqual((text, error), (None, "Terminal changed; select again."))
+            rejected.assert_called_once_with("client-rows-invalid")
+            capture.assert_not_called()
+
+        payload.update(
+            {
+                "clientRows": [
+                    {"y": 0, "text": "KEEP    ", "styles": [[0, 8, "plain"]]}
+                ],
+                "_selectionRequestWireBytes": server.MAX_SELECTION_REQUEST_BYTES + 1,
+            }
+        )
+        with mock.patch("server.capture_pane_snapshot") as capture, mock.patch(
+            "server._record_authoritative_selection_rejection"
+        ) as rejected:
+            text, error = await bridge.authoritative_selection(payload)
+        self.assertEqual((text, error), (None, "Terminal changed; select again."))
+        rejected.assert_called_once_with("client-rows-invalid")
+        capture.assert_not_called()
+
+        payload.pop("_selectionRequestWireBytes")
+        payload.update(
+            {
+                "cols": 70000,
+                "clientRows": [
+                    {
+                        "y": 0,
+                        "text": "x" * 66000,
+                        "styles": [[0, 70000, "plain"]],
+                    }
+                ],
+            }
+        )
+        with mock.patch("server.capture_pane_snapshot") as capture:
+            text, error = await bridge.authoritative_selection(payload)
+        self.assertEqual((text, error), (None, "Terminal changed; select again."))
+        capture.assert_not_called()
+
+    async def test_alternate_terminal_raw_fallback_uses_client_grapheme_widths(self):
+        pane = replace(
+            snapshot(
+                cols=8,
+                authored_lines=["changed"],
+                plain_physical_rows=["changed "],
+                rows=1,
+            ),
+            alternate=True,
+            seed_history=0,
+            history=0,
+        )
+        bridge, payload = self.make_bridge(pane)
+        payload.update(
+            {
+                "bufferType": "alternate",
+                "baseY": 0,
+                "selection": {
+                    "start": {"x": 0, "y": 0},
+                    "end": {"x": 5, "y": 0},
+                },
+                "clientRows": [
+                    {
+                        "y": 0,
+                        "text": "😀é界",
+                        "styles": [[0, 8, "plain"]],
+                    }
+                ],
+            }
+        )
+        provider = mock.Mock(owned=False, text=None, authority="terminal-raw")
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.provider_selection", return_value=provider) as select,
+        ):
+            result = await bridge.authoritative_selection_result(payload)
+
+        self.assertEqual(result.text, "😀é界")
+        self.assertEqual(result.authority, "terminal-raw")
+        self.assertIsNone(result.error)
+        self.assertEqual(select.call_args.kwargs["client_rows"][0][1], "😀é界")
+
+    async def test_alternate_provider_exact_accepts_client_emoji_rows(self):
+        pane = replace(
+            snapshot(cols=8, authored_lines=["changed"], rows=1),
+            alternate=True,
+            seed_history=0,
+            history=0,
+        )
+        bridge, payload = self.make_bridge(pane)
+        payload.update(
+            {
+                "bufferType": "alternate",
+                "baseY": 0,
+                "selection": {
+                    "start": {"x": 0, "y": 0},
+                    "end": {"x": 7, "y": 0},
+                },
+                "clientRows": [
+                    {
+                        "y": 0,
+                        "text": "✅ KEEP",
+                        "styles": [[0, 8, "plain"]],
+                    }
+                ],
+            }
+        )
+        provider = mock.Mock(owned=True, text="exact source", authority="provider-exact")
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.provider_selection", return_value=provider) as select,
+        ):
+            result = await bridge.authoritative_selection_result(payload)
+
+        self.assertEqual(result.text, "exact source")
+        self.assertEqual(result.authority, "provider-exact")
+        self.assertIsNone(result.error)
+        self.assertEqual(select.call_args.kwargs["client_rows"][0][1], "✅ KEEP")
+
+    async def test_epoch_layout_geometry_stay_strict_and_alternate_uses_client_rows(self):
         pane = snapshot(cols=8, authored_lines=["KEEP"], rows=1)
         cases = (
             ("epoch", {"epoch": 1}),
@@ -3197,11 +3446,18 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
         alternate = replace(pane, alternate=True, seed_history=0, history=0)
         bridge, payload = self.make_bridge(alternate, offset=2, revision=1)
         payload["bufferType"] = "alternate"
-        with mock.patch("server.capture_pane_snapshot") as capture:
+        payload["baseY"] = 0
+        payload["clientRows"] = [
+            {"y": 0, "text": "KEEP    ", "styles": [[0, 8, "plain"]]}
+        ]
+        provider = mock.Mock(owned=True, text="anchored", authority="provider-exact")
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=alternate),
+            mock.patch("server.provider_selection", return_value=provider) as select,
+        ):
             text, error = await bridge.authoritative_selection(payload)
-        self.assertIsNone(text)
-        self.assertEqual(error, "Terminal changed; select again.")
-        capture.assert_not_called()
+        self.assertEqual((text, error), ("anchored", None))
+        self.assertEqual(select.call_args.kwargs["client_rows"][0][0:2], (0, "KEEP    "))
 
 
 class PrivateTmuxSelectionStabilityIntegrationTest(unittest.IsolatedAsyncioTestCase):
@@ -3322,6 +3578,83 @@ class PrivateTmuxSelectionStabilityIntegrationTest(unittest.IsolatedAsyncioTestC
             self.assertEqual(len(provider_calls), 1)
             self.assertEqual(provider_calls[0][1], provider_calls[0][4])
             self.assertEqual(provider_calls[0][1], provider_calls[0][3])
+
+    async def test_alternate_client_anchor_survives_streaming_on_private_socket(self):
+        await self.bridge.write(
+            "printf '\033[?1049hCLIENT-ANCHOR\033[2;1HREADY'\r"
+        )
+        await self.bridge.quiet(0.08)
+        pane = capture_pane_snapshot(
+            self.session_name,
+            self.bridge.pane_id,
+            server.MAX_HISTORY_SEED_LINES,
+        )
+        self.assertTrue(pane.alternate)
+        selected_y = next(
+            index
+            for index, row in enumerate(pane.plain_physical_rows)
+            if row.startswith("CLIENT-ANCHOR")
+        )
+        client_text = pane.plain_physical_rows[selected_y]
+        revision = self.bridge.offset
+        payload = {
+            "requestId": uuid.uuid4().hex,
+            "profile": "",
+            "session": self.session_name,
+            "paneId": self.bridge.pane_id,
+            "epoch": self.bridge.epoch_state["epoch"],
+            "revision": revision,
+            "cutoff": self.bridge.cutoff,
+            "layoutGeneration": self.bridge.epoch_state["layout"],
+            "cols": pane.cols,
+            "rows": pane.rows,
+            "baseY": 0,
+            "bufferType": "alternate",
+            "selection": {
+                "start": {"x": 0, "y": selected_y},
+                "end": {"x": len("CLIENT-ANCHOR"), "y": selected_y},
+            },
+            "clientRows": [
+                {
+                    "y": selected_y,
+                    "text": client_text,
+                    "styles": [[0, pane.cols, "plain"]],
+                }
+            ],
+        }
+
+        def stream_during_provider(
+            _snapshot,
+            _start_x,
+            _start_row,
+            _end_x,
+            _end_row,
+            *,
+            client_rows,
+        ):
+            self.assertEqual(client_rows[0][1], client_text)
+            before = self.bridge.offset
+            self.tmux.run(
+                "send-keys",
+                "-t",
+                self.bridge.pane_id,
+                "printf '\033[6;1HSTREAMING'",
+                "Enter",
+            )
+            deadline = threading.Event()
+            for _ in range(40):
+                if self.bridge.offset > before:
+                    break
+                deadline.wait(0.01)
+            self.assertGreater(self.bridge.offset, before)
+            return mock.Mock(owned=True, text="exact-client-anchor", authority="provider-exact")
+
+        with mock.patch("server.provider_selection", side_effect=stream_during_provider):
+            result = await self.bridge.authoritative_selection_result(payload)
+
+        self.assertEqual(result.text, "exact-client-anchor")
+        self.assertEqual(result.authority, "provider-exact")
+        self.assertIsNone(result.error)
 
     async def test_selected_identity_evicted_from_private_history_is_stale(self):
         await self.bridge.write(
@@ -3646,6 +3979,31 @@ class RenameProvenanceTransferTest(unittest.IsolatedAsyncioTestCase):
         input_bridge.command.assert_awaited_once_with("send-keys -t %1 -H 78")
 
 
+class ScrollCoalescingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_queued_scroll_deltas_coalesce_and_cancel_before_tmux(self):
+        app = object.__new__(AppServer)
+        app.scroll_states = {}
+        with mock.patch("server.asyncio.to_thread", new=mock.AsyncMock()) as to_thread:
+            app.queue_scroll_history("session", "%1", 30)
+            app.queue_scroll_history("session", "%1", -12)
+            app.queue_scroll_history("session", "%1", 5)
+            await app.scroll_states["session"]["task"]
+
+        to_thread.assert_awaited_once_with(server.scroll_session_history, "%1", 23)
+
+    async def test_scroll_batches_stay_responsive_and_preserve_remainder(self):
+        app = object.__new__(AppServer)
+        app.scroll_states = {}
+        with mock.patch("server.asyncio.to_thread", new=mock.AsyncMock()) as to_thread:
+            app.queue_scroll_history("session", "%1", 110)
+            await app.scroll_states["session"]["task"]
+
+        self.assertEqual(
+            [call.args[2] for call in to_thread.await_args_list],
+            [48, 48, 14],
+        )
+
+
 class ClientProtocolSourceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -3711,12 +4069,20 @@ class ClientProtocolSourceTest(unittest.TestCase):
         self.assertNotIn("activePaneLocalScroll = false", history)
         self.assertNotIn("copy-mode", history)
 
-    def test_selection_contract_includes_client_geometry(self):
+    def test_selection_contract_includes_client_geometry_and_anchored_alternate_rows(self):
         selection_start = self.source.index("  function terminalSelectionState()")
         selection_end = self.source.index("  function pendingSelectionRequestIsCurrent", selection_start)
         selection = self.source[selection_start:selection_end]
         self.assertIn("cols: term.cols", selection)
         self.assertIn("rows: term.rows", selection)
+        self.assertIn("...(clientRows ? { clientRows } : {})", selection)
+        client_rows = self.source[
+            self.source.index("  function terminalCellStyleToken(cell)") : selection_start
+        ]
+        self.assertIn('buffer.type !== "alternate"', client_rows)
+        self.assertIn("line.translateToString(false, 0, term.cols)", client_rows)
+        self.assertIn("styles.push([runStart, column, runToken])", client_rows)
+        self.assertIn("fg-indexed-", client_rows)
 
     def test_empty_authoritative_text_is_a_successful_copy_result(self):
         copy_start = self.source.index("  async function copyTerminalSelection()")

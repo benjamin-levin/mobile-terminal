@@ -1455,10 +1455,99 @@
     );
   }
 
+  function terminalCellStyleToken(cell) {
+    const bold = cell?.isBold?.() === true;
+    const italic = cell?.isItalic?.() === true;
+    const unsupported =
+      cell?.isUnderline?.() === true ||
+      cell?.isStrikethrough?.() === true ||
+      cell?.isBlink?.() === true ||
+      cell?.isInvisible?.() === true ||
+      cell?.isOverline?.() === true ||
+      (bold && italic);
+    let token;
+    if (unsupported) {
+      token = "unsupported";
+    } else if (
+      cell?.isInverse?.() === true ||
+      (typeof cell?.isBgDefault === "function" && !cell.isBgDefault())
+    ) {
+      token = "code-inline";
+    } else if (bold) {
+      token = "strong";
+    } else if (italic) {
+      token = "emphasis";
+    } else if (cell?.isDim?.() === true) {
+      token = "list-marker";
+    } else {
+      token = "plain";
+    }
+    if (typeof cell?.isFgDefault === "function" && !cell.isFgDefault()) {
+      if (cell?.isFgPalette?.() === true) {
+        const color = Number(cell.getFgColor?.());
+        if (Number.isInteger(color) && color >= 0 && color <= 255) {
+          token += `;fg-indexed-${color}`;
+        } else {
+          token = "unsupported";
+        }
+      } else {
+        token = "unsupported";
+      }
+    }
+    return token;
+  }
+
+  function terminalSelectionClientRows(buffer, selection) {
+    if (buffer.type !== "alternate") {
+      return undefined;
+    }
+    const rows = [];
+    for (let y = selection.start.y; y <= selection.end.y; y += 1) {
+      if (y < 0 || y >= term.rows) {
+        return null;
+      }
+      const line = buffer.getLine(buffer.viewportY + y);
+      if (!line) {
+        return null;
+      }
+      const styles = [];
+      let runStart = 0;
+      let runToken = null;
+      for (let column = 0; column < term.cols; column += 1) {
+        const cell = line.getCell(column);
+        const token =
+          cell?.getWidth?.() === 0 && runToken !== null
+            ? runToken
+            : terminalCellStyleToken(cell);
+        if (runToken !== token) {
+          if (runToken !== null) {
+            styles.push([runStart, column, runToken]);
+          }
+          runStart = column;
+          runToken = token;
+        }
+      }
+      if (runToken !== null) {
+        styles.push([runStart, term.cols, runToken]);
+      }
+      rows.push({
+        y,
+        text: line.translateToString(false, 0, term.cols),
+        styles,
+      });
+    }
+    return rows;
+  }
+
   function terminalSelectionState() {
     const selection =
       typeof term.getSelectionPosition === "function" ? term.getSelectionPosition() : null;
     if (!selection || !term.buffer?.active) {
+      return null;
+    }
+    const buffer = term.buffer.active;
+    const clientRows = terminalSelectionClientRows(buffer, selection);
+    if (buffer.type === "alternate" && !clientRows) {
       return null;
     }
     return {
@@ -1475,8 +1564,9 @@
       layoutGeneration: terminalLayoutGeneration,
       cols: term.cols,
       rows: term.rows,
-      baseY: term.buffer.active.baseY,
-      bufferType: term.buffer.active.type,
+      baseY: buffer.baseY,
+      bufferType: buffer.type,
+      ...(clientRows ? { clientRows } : {}),
     };
   }
 
