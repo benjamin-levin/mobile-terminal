@@ -41,7 +41,7 @@ Apply uploads the complete closure to a fresh remote staging directory, smoke-ch
 | Gate | OS user | Code path | Service | Notes |
 |---|---|---|---|---|
 | ph | `powerhouse` | `/home/powerhouse/mobile-terminal` | user `mobile-terminal.service` | Local canary; not a remote-copy target |
-| ps | `powerhouse` | `/home/powerhouse/mobile-terminal` | user `mobile-terminal.service` | Exact target `ps-powerhouse` |
+| ps | `powerhouse` | `/home/powerhouse/mobile-terminal` | user `mobile-terminal-proxy.service` | Exact target `ps-powerhouse`; proxy serves gen+bh backends |
 | lat | `ben` | `/home/ben/mobile-terminal` | system `mobile-terminal@ben.service` | Exact target `lat-ben`; own repository virtualenv |
 | lat | `bperritt` | `/home/bperritt/mobile-terminal` | system `mobile-terminal@bperritt.service` | Exact target `lat-bperritt`; own repository virtualenv |
 | mbp | `powerhouse` | `/Users/powerhouse/mobile-terminal` | launchd `com.mobile-terminal.server` | Exact target `mbp-powerhouse` |

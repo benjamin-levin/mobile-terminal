@@ -24,7 +24,7 @@ validate_runtime_tuple() {
   [[ "$repo" == /* && "$interpreter" == "$repo/.venv/bin/python" ]] || fail "invalid repository interpreter"
 
   case "$scope|$service|$runtime_user" in
-    "user-systemd|mobile-terminal.service|powerhouse"|"system-systemd|mobile-terminal@ben.service|ben"|"system-systemd|mobile-terminal@bperritt.service|bperritt"|"launchd|com.mobile-terminal.server|powerhouse") ;;
+    "user-systemd|mobile-terminal.service|powerhouse"|"user-systemd|mobile-terminal-proxy.service|powerhouse"|"system-systemd|mobile-terminal@ben.service|ben"|"system-systemd|mobile-terminal@bperritt.service|bperritt"|"launchd|com.mobile-terminal.server|powerhouse") ;;
     *) fail "service is not allowlisted for runtime user" ;;
   esac
 
