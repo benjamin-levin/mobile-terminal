@@ -233,11 +233,81 @@ async function resolveResult(payload) {
             "  function isTerminalCopyTarget(target)",
             "  function handleImagePaste(file)",
         )
-        self.assertIn("copyTerminalSelection().catch", native_copy)
+        self.assertIn("copyTerminalSelectionAndDismiss().catch", native_copy)
         self.assertIn("event.stopPropagation();", native_copy)
         self.assertIn('document.addEventListener("copy", handleNativeTerminalCopy, true);', native_copy)
         self.assertNotIn("clipboardData.setData", native_copy)
         self.assertNotIn("getSelection", native_copy)
+
+    def test_copy_teardown_runs_for_error_exception_and_clipboard_failure(self):
+        self.run_node(
+            [
+                "normalizeTerminalCopyText",
+                "beginAuthoritativeClipboardWrite",
+                "copyTextWithFallback",
+                "copyClipboardTextWithFallback",
+                "copyTerminalSelection",
+                "copyTerminalSelectionAndDismiss",
+            ],
+            r'''
+(async () => {
+  Object.defineProperty(global, "ClipboardItem", { value: undefined, configurable: true });
+  Object.defineProperty(global, "navigator", {
+    value: { clipboard: { async writeText() {} } },
+    configurable: true,
+  });
+  global.document = { createElement() { throw new Error("legacy clipboard blocked"); } };
+  const toasts = [];
+  let dismissals = 0;
+  global.showToast = (message) => { toasts.push(message); };
+  global.dismissTerminalSelection = () => { dismissals += 1; };
+
+  global.requestAuthoritativeSelection = () => Promise.resolve({ error: "Exact selection failed." });
+  await copyTerminalSelectionAndDismiss();
+  assert.equal(dismissals, 1);
+  assert.deepEqual(toasts, ["Exact selection failed."]);
+
+  global.requestAuthoritativeSelection = () => Promise.resolve({ text: null });
+  await assert.rejects(copyTerminalSelectionAndDismiss(), TypeError);
+  assert.equal(dismissals, 2);
+
+  navigator.clipboard.writeText = async () => { throw new Error("clipboard denied"); };
+  global.requestAuthoritativeSelection = () => Promise.resolve({ text: "selected" });
+  await copyTerminalSelectionAndDismiss();
+  assert.equal(dismissals, 3);
+  assert.equal(toasts.at(-1), "Clipboard copy is blocked by this browser.");
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+''',
+        )
+
+    def test_to_tab_teardown_runs_for_error_and_thrown_exception(self):
+        self.run_node(
+            [
+                "normalizeTerminalCopyText",
+                "pasteSelectionToRecentTab",
+                "pasteSelectionToRecentTabAndDismiss",
+            ],
+            r'''
+(async () => {
+  const toasts = [];
+  let dismissals = 0;
+  let pendingPasteAfterSwitch = null;
+  global.showToast = (message) => { toasts.push(message); };
+  global.dismissTerminalSelection = () => { dismissals += 1; };
+  global.recentOtherSession = () => "other";
+  global.switchSession = () => {};
+
+  global.requestAuthoritativeSelection = () => Promise.resolve({ error: "Selection unavailable." });
+  await pasteSelectionToRecentTabAndDismiss();
+  assert.equal(dismissals, 1);
+  assert.deepEqual(toasts, ["Selection unavailable."]);
+
+  global.requestAuthoritativeSelection = () => { throw new Error("selection request crashed"); };
+  await assert.rejects(pasteSelectionToRecentTabAndDismiss(), /selection request crashed/);
+  assert.equal(dismissals, 2);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+''',
+        )
 
     def test_promised_clipboard_write_starts_before_authority_and_uses_exact_text(self):
         self.run_node(
@@ -418,7 +488,7 @@ const terminalElement = {
 let selected = true;
 let copyCalls = 0;
 function terminalHasSelection() { return selected; }
-function copyTerminalSelection() { copyCalls += 1; return Promise.resolve(); }
+function copyTerminalSelectionAndDismiss() { copyCalls += 1; return Promise.resolve(); }
 function showToast() {}
 function copyEvent(target) {
   return {

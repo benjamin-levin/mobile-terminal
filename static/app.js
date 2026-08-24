@@ -899,7 +899,7 @@
       return;
     }
     if (trimmed === "{COPY}") {
-      copyTerminalSelection();
+      copyTerminalSelectionAndDismiss();
       return;
     }
     if (trimmed === "{PASTE}") {
@@ -1647,6 +1647,14 @@
     showToast("Clipboard copy is blocked by this browser.");
   }
 
+  async function copyTerminalSelectionAndDismiss() {
+    try {
+      await copyTerminalSelection();
+    } finally {
+      dismissTerminalSelection();
+    }
+  }
+
   // The most recent tab other than the current one. Prefers the tab the user
   // last came from (previousSessionName); falls back to the nearest other open
   // tab so the "To tab" chip always has a target when >1 tab is open.
@@ -1693,8 +1701,15 @@
       authority: result.authority === "terminal-raw" ? "terminal-raw" : undefined,
       ready: false,
     };
-    dismissTerminalSelection();
     switchSession(target);
+  }
+
+  async function pasteSelectionToRecentTabAndDismiss() {
+    try {
+      await pasteSelectionToRecentTab();
+    } finally {
+      dismissTerminalSelection();
+    }
   }
 
   function handlePendingPasteReady() {
@@ -2423,10 +2438,30 @@
   }
 
   function dismissTerminalSelection() {
-    if (typeof term.clearSelection === "function") {
-      term.clearSelection();
+    if (termSel && termSel.timer) {
+      window.clearTimeout(termSel.timer);
     }
-    clearTerminalSelectionUI();
+    termSel = null;
+    selectionTapCopy = null;
+    touchScrollState = null;
+    if (terminalSelectionSyncFrameId !== null) {
+      window.cancelAnimationFrame(terminalSelectionSyncFrameId);
+      terminalSelectionSyncFrameId = null;
+    }
+    terminalSelectionSyncForced = false;
+    try {
+      if (typeof term.clearSelection === "function") {
+        term.clearSelection();
+      }
+    } finally {
+      clearTerminalSelectionUI();
+    }
+  }
+
+  function resetStaleTerminalSelectionAtTouchStart(event) {
+    if (event.touches.length === 1 && termSel) {
+      dismissTerminalSelection();
+    }
   }
 
   function ensureSelectionHandles() {
@@ -2505,6 +2540,7 @@
       );
       btn.addEventListener("touchcancel", () => {
         touchStartPoint = null;
+        dismissTerminalSelection();
       });
       btn.addEventListener("click", async (event) => {
         event.preventDefault();
@@ -2518,11 +2554,10 @@
       return btn;
     };
     const copy = makeChip("Copy", async () => {
-      await copyTerminalSelection();
-      dismissTerminalSelection();
+      await copyTerminalSelectionAndDismiss();
     });
     const paste = makeChip("To tab", async () => {
-      await pasteSelectionToRecentTab();
+      await pasteSelectionToRecentTabAndDismiss();
     });
     const chips = document.createElement("div");
     chips.className = "term-select-chips";
@@ -2758,14 +2793,18 @@
         return;
       }
       event.stopPropagation();
-      const touch = event.changedTouches && event.changedTouches[0];
-      const clientX = touch ? touch.clientX : termSel.anchor.clientX;
-      const clientY = touch ? touch.clientY : termSel.anchor.clientY;
-      const point = clampTerminalSelectionDragPoint(clientX, clientY);
-      dispatchTerminalMouse("mouseup", point.x, point.y, 1);
-      endSelectionDragFeedback();
+      const selection = termSel;
       termSel = null;
-      scheduleTerminalSelectionUISync();
+      try {
+        const touch = event.changedTouches && event.changedTouches[0];
+        const clientX = touch ? touch.clientX : selection.anchor.clientX;
+        const clientY = touch ? touch.clientY : selection.anchor.clientY;
+        const point = clampTerminalSelectionDragPoint(clientX, clientY);
+        dispatchTerminalMouse("mouseup", point.x, point.y, 1);
+      } finally {
+        endSelectionDragFeedback();
+        scheduleTerminalSelectionUISync();
+      }
     };
     handle.addEventListener("touchend", finishHandleDrag, { passive: false });
     handle.addEventListener("touchcancel", finishHandleDrag, { passive: false });
@@ -2856,17 +2895,21 @@
     if (!termSel || termSel.draggingHandle) {
       return;
     }
-    if (termSel.timer) {
-      window.clearTimeout(termSel.timer);
-    }
-    if (termSel.active) {
-      const point = clampTerminalSelectionDragPoint(termSel.lastX, termSel.lastY);
-      dispatchTerminalMouse("mouseup", point.x, point.y, 1);
-      endSelectionDragFeedback();
-      suppressNextTerminalClick = true;
-      scheduleTerminalSelectionUISync(true);
+    const selection = termSel;
+    if (selection.timer) {
+      window.clearTimeout(selection.timer);
     }
     termSel = null;
+    if (selection.active) {
+      try {
+        const point = clampTerminalSelectionDragPoint(selection.lastX, selection.lastY);
+        dispatchTerminalMouse("mouseup", point.x, point.y, 1);
+      } finally {
+        endSelectionDragFeedback();
+        suppressNextTerminalClick = true;
+        scheduleTerminalSelectionUISync(true);
+      }
+    }
   }
 
   function cancelTerminalSelectionPress() {
@@ -5125,6 +5168,7 @@
       "touchstart",
       (event) => {
         cancelTouchInertia();
+        resetStaleTerminalSelectionAtTouchStart(event);
         if (event.touches.length >= 2) {
           // Second finger down: switch from scrolling to the gesture recognizer.
           touchScrollState = null;
@@ -5265,10 +5309,20 @@
     );
 
     const finishTouchScroll = (event) => {
+      const cancelled = event.type === "touchcancel";
       if (gestureState) {
         // Let the recognizer settle the lifted finger (tap counting, cleanup);
         // don't fall back into a scroll or inertia fling.
-        gestureTouchEnd(event);
+        if (cancelled) {
+          gestureState = null;
+          if (gestureTap && gestureTap.timer) {
+            window.clearTimeout(gestureTap.timer);
+          }
+          gestureTap = null;
+          cancelTouchInertia();
+        } else {
+          gestureTouchEnd(event);
+        }
         touchScrollState = null;
         cancelTerminalSelectionPress();
         selectionTapCopy = null;
@@ -5279,7 +5333,13 @@
         selectionTapCopy = null;
         touchScrollState = null;
         suppressNextTerminalClick = true;
-        copyTerminalSelection().then(dismissTerminalSelection);
+        if (cancelled) {
+          dismissTerminalSelection();
+        } else {
+          copyTerminalSelectionAndDismiss().catch(() => {
+            showToast("Clipboard copy is blocked by this browser.");
+          });
+        }
         return;
       }
       // A completed double-tap selection needs no scroll/inertia handling.
@@ -5291,7 +5351,17 @@
       // Did this contact engage a long-press selection? (Set before finishing.)
       const wasLongPressSelection = !!(termSel && termSel.active);
       // Finalize a long-press selection (no-op for a quick tap or a scroll).
-      finishTerminalSelectionPress();
+      try {
+        finishTerminalSelectionPress();
+      } catch (_error) {
+        dismissTerminalSelection();
+        return;
+      }
+      if (cancelled) {
+        touchScrollState = null;
+        cancelTouchInertia();
+        return;
+      }
       // Remember this lift as a candidate first tap of a double-tap.
       const tapTouch = event.changedTouches && event.changedTouches[0];
       if (tapTouch) {
@@ -5320,19 +5390,8 @@
       }
       touchScrollState = null;
     };
-    const cancelTouchScroll = () => {
-      touchScrollState = null;
-      selectionTapCopy = null;
-      cancelTerminalSelectionPress();
-      gestureState = null;
-      if (gestureTap && gestureTap.timer) {
-        window.clearTimeout(gestureTap.timer);
-      }
-      gestureTap = null;
-      cancelTouchInertia();
-    };
     terminalRoot.addEventListener("touchend", finishTouchScroll, { passive: true });
-    terminalRoot.addEventListener("touchcancel", cancelTouchScroll, { passive: true });
+    terminalRoot.addEventListener("touchcancel", finishTouchScroll, { passive: true });
   }
 
   function installTabStripScrollHandlers() {
@@ -5824,7 +5883,7 @@
           return;
         }
         if (normalizedSequence === "{COPY}") {
-          copyTerminalSelection();
+          copyTerminalSelectionAndDismiss();
           restoreShortcutKeyboardState(shortcutKeyboardWasFocused);
           return;
         }
@@ -9023,7 +9082,7 @@
     }
     event.preventDefault();
     event.stopPropagation();
-    copyTerminalSelection().catch(() => {
+    copyTerminalSelectionAndDismiss().catch(() => {
       showToast("Clipboard copy is blocked by this browser.");
     });
   }

@@ -451,8 +451,8 @@ assert.deepEqual(
             "  function ensureSelectionHandles()",
             "  // Reposition the handles",
         )
-        self.assertIn("await copyTerminalSelection();\n      dismissTerminalSelection();", handles)
-        self.assertIn("await pasteSelectionToRecentTab();", handles)
+        self.assertIn("await copyTerminalSelectionAndDismiss();", handles)
+        self.assertIn("await pasteSelectionToRecentTabAndDismiss();", handles)
         self.assertIn('handle.addEventListener("touchend", finishHandleDrag', APP_JS)
         self.assertIn('handle.addEventListener("touchcancel", finishHandleDrag', APP_JS)
 
@@ -473,6 +473,119 @@ assert.deepEqual(
         self.assertIn("clearTerminalSelectionUI();", switch_session)
         self.assertIn("clearTerminalSelectionUI();", ready)
         self.assertIn("clearTerminalSelectionUI();", selection_change)
+
+    def test_dismiss_selection_fully_tears_down_every_transient_state(self):
+        script = "\n".join(
+            [
+                'const assert = require("node:assert/strict");',
+                "const events = [];",
+                "const window = {",
+                "  clearTimeout(id) { events.push(`timeout:${id}`); },",
+                "  cancelAnimationFrame(id) { events.push(`frame:${id}`); },",
+                "};",
+                "const term = { clearSelection() { events.push('clear-selection'); } };",
+                "let termSel = { active: true, timer: 11 };",
+                "let selectionTapCopy = { x: 1, y: 2 };",
+                "let touchScrollState = { lastY: 3 };",
+                "let terminalSelectionSyncFrameId = 44;",
+                "let terminalSelectionSyncForced = true;",
+                "let selectionDragFeedbackGeneration = 0;",
+                "let selectionDragFeedback = { timerId: 22, frameId: 33 };",
+                "let termSelHandles = { layer: { style: { display: 'block' } } };",
+                "function hideSelectionMagnifier(clearSnapshot) {",
+                "  events.push(`magnifier:${clearSnapshot}`);",
+                "}",
+                extract_function("endSelectionDragFeedback"),
+                extract_function("clearTerminalSelectionUI"),
+                extract_function("dismissTerminalSelection"),
+                "dismissTerminalSelection();",
+                "assert.equal(termSel, null);",
+                "assert.equal(selectionTapCopy, null);",
+                "assert.equal(touchScrollState, null);",
+                "assert.equal(selectionDragFeedback, null);",
+                "assert.equal(terminalSelectionSyncFrameId, null);",
+                "assert.equal(terminalSelectionSyncForced, false);",
+                "assert.equal(termSelHandles.layer.style.display, 'none');",
+                "assert.deepEqual(events, [",
+                "  'timeout:11', 'frame:44', 'clear-selection', 'timeout:22', 'frame:33', 'magnifier:true',",
+                "]);",
+                "dismissTerminalSelection();",
+                "assert.equal(termSel, null);",
+                "assert.equal(selectionTapCopy, null);",
+                "assert.equal(touchScrollState, null);",
+            ]
+        )
+        self.run_node_source(script)
+
+    def test_fresh_single_touch_resets_stale_selection_without_affecting_second_finger(self):
+        self.run_node(
+            ["resetStaleTerminalSelectionAtTouchStart"],
+            r'''
+let termSel = { active: true };
+let dismissals = 0;
+function dismissTerminalSelection() { dismissals += 1; termSel = null; }
+resetStaleTerminalSelectionAtTouchStart({ touches: [{ identifier: 1 }] });
+assert.equal(dismissals, 1);
+assert.equal(termSel, null);
+
+termSel = { active: true };
+resetStaleTerminalSelectionAtTouchStart({
+  touches: [{ identifier: 1 }, { identifier: 2 }],
+});
+assert.equal(dismissals, 1);
+assert.deepEqual(termSel, { active: true });
+''',
+        )
+        touchstart = app_section(
+            '    terminalRoot.addEventListener(\n      "touchstart"',
+            '    terminalRoot.addEventListener(\n      "touchmove"',
+        )
+        self.assertLess(
+            touchstart.index("resetStaleTerminalSelectionAtTouchStart(event);"),
+            touchstart.index("if (event.touches.length >= 2)"),
+        )
+
+    def test_long_press_and_double_tap_flows_remain_intact(self):
+        press = app_section(
+            "  function beginTerminalSelectionPress(touch)",
+            "  function persistActiveSession(sessionName)",
+        )
+        for marker in (
+            "cancelTerminalSelectionPress();",
+            "window.setTimeout(activateTerminalSelection, TERM_LONGPRESS_MS)",
+            "termSel.active = true;",
+            "touchScrollState = null; // this contact is a selection, not a scroll",
+            'dispatchTerminalMouse("mousedown", termSel.startX, termSel.startY, 2);',
+            "beginSelectionDragFeedback({ x: termSel.startX, y: termSel.startY });",
+        ):
+            self.assertIn(marker, press)
+
+        touchstart = app_section(
+            '    terminalRoot.addEventListener(\n      "touchstart"',
+            '    terminalRoot.addEventListener(\n      "touchmove"',
+        )
+        self.assertIn("now - lastTermTapAt < TERM_DOUBLETAP_MS", touchstart)
+        self.assertIn("TERM_DOUBLETAP_DIST", touchstart)
+        self.assertIn("termSel = { doubleTap: true };", touchstart)
+        self.assertIn("composerInput.blur();", touchstart)
+        self.assertIn("selectWordAt(touch.clientX, touch.clientY);", touchstart)
+        self.assertIn("beginTerminalSelectionPress(touch);", touchstart)
+
+    def test_touchcancel_uses_the_selection_finalizer(self):
+        handlers = app_section(
+            "    const finishTouchScroll = (event) => {",
+            "  function installTabStripScrollHandlers()",
+        )
+        self.assertIn('const cancelled = event.type === "touchcancel";', handlers)
+        self.assertIn("finishTerminalSelectionPress();", handlers)
+        self.assertIn(
+            'terminalRoot.addEventListener("touchend", finishTouchScroll',
+            handlers,
+        )
+        self.assertIn(
+            'terminalRoot.addEventListener("touchcancel", finishTouchScroll',
+            handlers,
+        )
 
     def test_magnifier_clones_only_renderer_rows_and_raf_coalesces_refresh(self):
         snapshot = extract_function("refreshSelectionMagnifierSnapshot")
@@ -628,6 +741,11 @@ assert.deepEqual(
         self.assertIn('magnifier.setAttribute("aria-hidden", "true");', handles)
         self.assertIn("layer.append(start, end, chips, magnifier);", handles)
         self.assertIn('btn.addEventListener(\n        "touchend"', handles)
+        self.assertIn(
+            'btn.addEventListener("touchcancel", () => {\n'
+            "        touchStartPoint = null;\n        dismissTerminalSelection();",
+            handles,
+        )
         self.assertIn("touchStartPoint.moved = true;", handles)
         self.assertIn("{ passive: false }", handles)
         guard = extract_function("guardTerminalHelperTextarea")
