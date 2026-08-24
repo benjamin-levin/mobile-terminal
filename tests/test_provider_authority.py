@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import provider_authority as provider_authority_module
 from provider_authority import (
     AssistantTextRecord,
     MatchResult,
@@ -1158,6 +1159,41 @@ class RuntimeBindingCacheTest(unittest.TestCase):
             ), patch.dict(os.environ, {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "shadow"}):
                 self.assertFalse(provider_selection(snapshot, 0, 0, 0, 0, home=home).owned)
 
+    def test_provider_diagnostics_are_bounded_aggregate_reason_codes(self):
+        with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
+            saved = provider_authority_module._PROVIDER_DIAGNOSTICS.copy()
+            saved_total = provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL
+            provider_authority_module._PROVIDER_DIAGNOSTICS.clear()
+            provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = 0
+        try:
+            provider_authority_module._record_provider_diagnostic(
+                "shadow",
+                "fallback",
+                "secret/path?credential=value",
+            )
+            for index in range(MAX_TRANSCRIPT_INDEXES * 3):
+                provider_authority_module._record_provider_diagnostic(
+                    "enforce",
+                    "rejected",
+                    f"reason-{index}",
+                )
+            self.assertLessEqual(
+                len(provider_authority_module._PROVIDER_DIAGNOSTICS),
+                provider_authority_module.MAX_PROVIDER_DIAGNOSTIC_REASONS,
+            )
+            with patch("builtins.print") as output:
+                provider_authority_module._flush_provider_diagnostics()
+            diagnostic = output.call_args.args[0]
+            self.assertIn("invalid-reason", diagnostic)
+            self.assertNotIn("secret", diagnostic)
+            self.assertNotIn("path", diagnostic)
+            self.assertNotIn("credential", diagnostic)
+        finally:
+            with provider_authority_module._PROVIDER_DIAGNOSTIC_LOCK:
+                provider_authority_module._PROVIDER_DIAGNOSTICS.clear()
+                provider_authority_module._PROVIDER_DIAGNOSTICS.update(saved)
+                provider_authority_module._PROVIDER_DIAGNOSTIC_TOTAL = saved_total
+
     def test_transcript_indexes_are_lru_bounded_and_generations_supersede(self):
         _TRANSCRIPT_INDEXES.clear()
         try:
@@ -1290,6 +1326,173 @@ class ProviderAuthorityFlowTest(unittest.TestCase):
         result = self.match()
         self.assertTrue(result.matched)
         self.assertEqual(result.text, "final answer")
+
+    def test_inline_code_before_and_after_supported_island_matches_exact_source(self):
+        source = "before `code`\nselected  fragment  \nafter `code`"
+        write_jsonl(self.path, [claude_text(source)])
+        prefix = "before `code`\n"
+        island = render_semantic_candidate(
+            replace(self.record, text="selected  fragment  "),
+            version="2.1.241",
+            cols=24,
+            source_byte_offset=len(prefix.encode("utf-8")),
+            first_record_island=False,
+        )
+        result = authoritative_provider_match(
+            self.binding,
+            TranscriptIndex(),
+            transcript_root=self.root,
+            cols=24,
+            plain_rows=island.plain_rows,
+            selection_start=island.selection_start,
+            selection_end=island.selection_end,
+            proc_start_reader=lambda pid: "77",
+            proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+        )
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "selected  fragment  ")
+        self.assertEqual(result.source_start, len(prefix.encode("utf-8")))
+        self.assertEqual(
+            result.source_end,
+            len((prefix + "selected  fragment  ").encode("utf-8")),
+        )
+
+    def test_inline_code_island_touching_and_crossing_fail_closed(self):
+        source = "before `code`\nselected fragment\nafter `code`"
+        write_jsonl(self.path, [claude_text(source)])
+        island = render_semantic_candidate(
+            replace(self.record, text="selected fragment"),
+            version="2.1.241",
+            cols=24,
+            source_byte_offset=len("before `code`\n".encode("utf-8")),
+            first_record_island=False,
+        )
+        rows = ("before".ljust(24), *island.plain_rows, "after".ljust(24))
+
+        def match(start, end):
+            return authoritative_provider_match(
+                self.binding,
+                TranscriptIndex(),
+                transcript_root=self.root,
+                cols=24,
+                plain_rows=rows,
+                selection_start=start,
+                selection_end=end,
+                proc_start_reader=lambda pid: "77",
+                proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+            )
+
+        touching = match((0, 24), (1, island.selection_end[1]))
+        crossing = match((1, island.selection_start[1]), (2, 1))
+        self.assertFalse(touching.matched)
+        self.assertFalse(crossing.matched)
+        self.assertEqual(
+            touching.internal_reason,
+            "no-unique-canonical-provider-block",
+        )
+        self.assertEqual(
+            crossing.internal_reason,
+            "no-unique-canonical-provider-block",
+        )
+
+    def test_duplicate_supported_inline_code_islands_are_ambiguous(self):
+        source = "`before`\nsame\n`middle`\nsame\n`after`"
+        write_jsonl(self.path, [claude_text(source)])
+        island = render_semantic_candidate(
+            replace(self.record, text="same"),
+            version="2.1.241",
+            cols=24,
+            first_record_island=False,
+        )
+        rows = (
+            "before".ljust(24),
+            *island.plain_rows,
+            "middle".ljust(24),
+            *island.plain_rows,
+            "after".ljust(24),
+        )
+        result = authoritative_provider_match(
+            self.binding,
+            TranscriptIndex(),
+            transcript_root=self.root,
+            cols=24,
+            plain_rows=rows,
+            selection_start=(1, island.selection_start[1]),
+            selection_end=(1, island.selection_end[1]),
+            proc_start_reader=lambda pid: "77",
+            proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+        )
+        self.assertFalse(result.matched)
+        self.assertEqual(result.internal_reason, "ambiguous-provider-block")
+
+    def test_historical_mixed_width_rows_normalize_to_current_geometry(self):
+        candidate = render_semantic_candidate(self.record, version="2.1.241", cols=180)
+        rows = ("unrelated".ljust(90), candidate.plain_rows[0][:45])
+        styled_rows = (
+            rows[0],
+            f"\x1b[38;5;231m{rows[1][0]}\x1b[0m{rows[1][1:]}",
+        )
+        styles = normalize_styled_rows(styled_rows, rows)
+        result = authoritative_provider_match(
+            self.binding,
+            TranscriptIndex(),
+            transcript_root=self.root,
+            cols=180,
+            plain_rows=rows,
+            selection_start=(1, candidate.selection_start[1]),
+            selection_end=(1, candidate.selection_end[1]),
+            style_rows=styles,
+            proc_start_reader=lambda pid: "77",
+            proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+        )
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "final answer")
+        self.assertEqual([len(row) for row in rows], [90, 45])
+
+    def test_inline_code_island_matches_historical_width_with_exact_copy(self):
+        source = "before `code`\nselected  fragment  \nafter `code`"
+        write_jsonl(self.path, [claude_text(source)])
+        island = render_semantic_candidate(
+            replace(self.record, text="selected  fragment  "),
+            version="2.1.241",
+            cols=180,
+            source_byte_offset=len("before `code`\n".encode("utf-8")),
+            first_record_island=False,
+        )
+        rows = ("unrelated".ljust(90), island.plain_rows[0][:45])
+        result = authoritative_provider_match(
+            self.binding,
+            TranscriptIndex(),
+            transcript_root=self.root,
+            cols=180,
+            plain_rows=rows,
+            selection_start=(1, island.selection_start[1]),
+            selection_end=(1, island.selection_end[1]),
+            proc_start_reader=lambda pid: "77",
+            proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+        )
+        self.assertTrue(result.matched)
+        self.assertEqual(result.text, "selected  fragment  ")
+
+    def test_historical_width_overflow_and_unsafe_wide_cells_fail_closed(self):
+        for rows, reason in (
+            (("x" * 181,), "captured-row-overflow"),
+            (("😀",), "unsafe-captured-wide-cell"),
+        ):
+            with self.subTest(reason=reason):
+                result = authoritative_provider_match(
+                    self.binding,
+                    TranscriptIndex(),
+                    transcript_root=self.root,
+                    cols=180,
+                    plain_rows=rows,
+                    selection_start=self.candidate.selection_start,
+                    selection_end=self.candidate.selection_end,
+                    proc_start_reader=lambda pid: "77",
+                    proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+                )
+                self.assertFalse(result.matched)
+                self.assertEqual(result.internal_reason, reason)
 
     def test_compilable_unsupported_alias_poisons_only_matching_geometry(self):
         write_jsonl(

@@ -1,9 +1,11 @@
+import atexit
 import html
 import json
 import os
 import re
 import stat
 import threading
+import unicodedata
 from collections import OrderedDict, deque
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -19,12 +21,17 @@ DEFAULT_MAX_SCAN_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_IRRELEVANT_RECORD_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_INDEX_RECORDS = 128
 MAX_TRANSCRIPT_INDEXES = 32
+MAX_PROVIDER_DIAGNOSTIC_REASONS = 64
+PROVIDER_DIAGNOSTIC_FLUSH_EVERY = 128
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
 PANE_RE = re.compile(r"^%[0-9]+$")
 GRAPHEME_RE = regex.compile(r"\X")
+REGIONAL_INDICATOR_RE = regex.compile(r"\A\p{Regional_Indicator}\Z")
+EXTENDED_PICTOGRAPHIC_RE = regex.compile(r"\p{Extended_Pictographic}")
+EMOJI_MODIFIER_RE = regex.compile(r"\p{Emoji_Modifier}")
 HTML_ENTITY_RE = re.compile(
     r"&(?:#[xX][0-9A-Fa-f]+|#[0-9]+|[A-Za-z][A-Za-z0-9]+);"
 )
@@ -118,6 +125,8 @@ class RenderCandidate:
     selection_start: tuple[int, int]
     selection_end: tuple[int, int]
     unsupported: bool = False
+    source_start: int = 0
+    source_end: int = 0
 
 
 @dataclass(frozen=True)
@@ -137,6 +146,8 @@ class MatchResult:
     provider: str | None = None
     record_id: str | None = None
     placement_row: int | None = None
+    source_start: int | None = None
+    source_end: int | None = None
     public_error: str | None = None
     internal_reason: str | None = None
 
@@ -724,9 +735,10 @@ class TranscriptIndex:
 
 
 class _SemanticLexer:
-    def __init__(self, source: str):
+    def __init__(self, source: str, *, source_byte_offset: int = 0):
         self.source = source
-        self.byte_offsets = [0]
+        self.source_byte_offset = source_byte_offset
+        self.byte_offsets = [source_byte_offset]
         for character in source:
             self.byte_offsets.append(self.byte_offsets[-1] + len(character.encode("utf-8")))
         self.tokens: list[SemanticToken] = []
@@ -869,19 +881,21 @@ class _SemanticLexer:
             raise ProviderAuthorityError("unsupported-markdown")
 
     def _validate_coverage(self) -> None:
-        expected = 0
+        expected = self.source_byte_offset
         for token in self.tokens:
             if token.source_start != expected or token.source_end <= token.source_start:
                 raise ProviderAuthorityError("source-byte-coverage")
             expected = token.source_end
-        if expected != len(self.source.encode("utf-8")):
+        if expected != self.source_byte_offset + len(self.source.encode("utf-8")):
             raise ProviderAuthorityError("source-byte-coverage")
 
 
-def lex_semantic_source(source: str) -> tuple[SemanticToken, ...]:
+def lex_semantic_source(source: str, *, source_byte_offset: int = 0) -> tuple[SemanticToken, ...]:
     if not isinstance(source, str):
         raise TypeError("source must be text")
-    return _SemanticLexer(source).lex()
+    if source_byte_offset < 0:
+        raise ValueError("source byte offset must be non-negative")
+    return _SemanticLexer(source, source_byte_offset=source_byte_offset).lex()
 
 
 def _grapheme_width(value: str) -> int:
@@ -891,6 +905,57 @@ def _grapheme_width(value: str) -> int:
     width = sum(widths)
     if width not in (1, 2):
         raise ProviderAuthorityError("unsupported-grapheme-width")
+    return width
+
+
+def _is_verified_cjk_base(character: str) -> bool:
+    value = ord(character)
+    return (
+        0x3000 <= value <= 0x30FF
+        or 0x3400 <= value <= 0x4DBF
+        or 0x4E00 <= value <= 0x9FFF
+        or 0xAC00 <= value <= 0xD7A3
+        or 0xF900 <= value <= 0xFAFF
+        or 0xFF01 <= value <= 0xFF60
+        or 0xFFE0 <= value <= 0xFFE6
+    )
+
+
+def _captured_grapheme_width(grapheme: str) -> int:
+    if grapheme == "♥︎":
+        return 1
+    if all(REGIONAL_INDICATOR_RE.fullmatch(character) for character in grapheme):
+        if len(grapheme) == 2:
+            return 2
+        raise ProviderAuthorityError("unsafe-captured-wide-cell")
+    if any(REGIONAL_INDICATOR_RE.fullmatch(character) for character in grapheme):
+        raise ProviderAuthorityError("unsafe-captured-wide-cell")
+    if (
+        "‍" in grapheme
+        or "️" in grapheme
+        or "⃣" in grapheme
+        or any(0xFE00 <= ord(character) <= 0xFE0F for character in grapheme)
+        or any(0xE0100 <= ord(character) <= 0xE01EF for character in grapheme)
+        or EXTENDED_PICTOGRAPHIC_RE.search(grapheme)
+        or EMOJI_MODIFIER_RE.search(grapheme)
+    ):
+        raise ProviderAuthorityError("unsafe-captured-wide-cell")
+    widths = [wcwidth(character) for character in grapheme]
+    if (
+        not widths
+        or widths[0] <= 0
+        or unicodedata.category(grapheme[0])[0] in "CM"
+        or any(
+            width != 0 or unicodedata.category(character)[0] != "M"
+            for character, width in zip(grapheme[1:], widths[1:])
+        )
+    ):
+        raise ProviderAuthorityError("invalid-captured-cell")
+    width = widths[0]
+    if width == 2 and not _is_verified_cjk_base(grapheme[0]):
+        raise ProviderAuthorityError("unsafe-captured-wide-cell")
+    if width not in (1, 2):
+        raise ProviderAuthorityError("invalid-captured-cell")
     return width
 
 
@@ -1004,14 +1069,23 @@ def render_semantic_candidate(
     cols: int,
     profile: RendererProfile | None = None,
     allow_unsupported: bool = False,
+    source_byte_offset: int = 0,
+    first_record_island: bool = True,
 ) -> RenderCandidate:
     if record.unsupported and not allow_unsupported:
         raise ProviderAuthorityError("unsupported-assistant-record")
     selected_profile = profile or renderer_profile(record.provider, version)
     if selected_profile.provider != record.provider or selected_profile.version != version or cols <= 0:
         raise ProviderAuthorityError("renderer-profile-mismatch")
+    if not first_record_island:
+        selected_profile = replace(
+            selected_profile,
+            first_gutter=selected_profile.continuation_gutter,
+            first_gutter_styles=(),
+        )
     copy_text, lines, boundaries = _compile_render_lines(
-        lex_semantic_source(record.text), selected_profile
+        lex_semantic_source(record.text, source_byte_offset=source_byte_offset),
+        selected_profile,
     )
     if any(line.heading_level == 1 for line in lines):
         raise ProviderAuthorityError("unsupported-heading-style")
@@ -1270,7 +1344,159 @@ def render_semantic_candidate(
         selection_start=(first.row, first.column),
         selection_end=(last_cell.row, last_cell.column + last_cell.width),
         unsupported=record.unsupported,
+        source_start=source_byte_offset,
+        source_end=source_byte_offset + len(record.text.encode("utf-8")),
     )
+
+
+def _inline_code_spans(body: str) -> tuple[tuple[int, int], ...] | None:
+    runs: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(body):
+        if body[cursor] != "`":
+            cursor += 1
+            continue
+        escaped = 0
+        backslash = cursor - 1
+        while backslash >= 0 and body[backslash] == "\\":
+            escaped += 1
+            backslash -= 1
+        end = cursor + 1
+        while end < len(body) and body[end] == "`":
+            end += 1
+        if escaped % 2 == 0:
+            runs.append((cursor, end))
+        cursor = end
+    if not runs:
+        return ()
+    spans = []
+    cursor = 0
+    while cursor < len(runs):
+        opening = runs[cursor]
+        width = opening[1] - opening[0]
+        closing_index = next(
+            (
+                index
+                for index in range(cursor + 1, len(runs))
+                if runs[index][1] - runs[index][0] == width
+            ),
+            None,
+        )
+        if closing_index is None:
+            return None
+        spans.append((opening[0], runs[closing_index][1]))
+        cursor = closing_index + 1
+    return tuple(spans)
+
+
+def _inline_code_islands(source: str) -> tuple[tuple[int, int], ...]:
+    lines: list[tuple[int, int, int, str]] = []
+    cursor = 0
+    for line in source.splitlines(keepends=True):
+        body_end = cursor + len(line) - (1 if line.endswith("\n") else 0)
+        lines.append((cursor, cursor + len(line), body_end, source[cursor:body_end]))
+        cursor += len(line)
+    if not lines and source == "":
+        return ()
+
+    unsupported: set[int] = set()
+    for line_index, (_, _, _, body) in enumerate(lines):
+        spans = _inline_code_spans(body)
+        if spans is None:
+            raise ProviderAuthorityError("unsupported-inline-code")
+        if not spans:
+            lex_semantic_source(body)
+            continue
+        masked = list(body)
+        for start, end in spans:
+            masked[start:end] = "x" * (end - start)
+        lex_semantic_source("".join(masked))
+        unsupported.add(line_index)
+    if not unsupported:
+        raise ProviderAuthorityError("unsupported-inline-code")
+
+    for line_index in tuple(unsupported):
+        before = line_index - 1
+        while before >= 0 and not lines[before][3].strip(" \t"):
+            unsupported.add(before)
+            before -= 1
+        after = line_index + 1
+        while after < len(lines) and not lines[after][3].strip(" \t"):
+            unsupported.add(after)
+            after += 1
+
+    islands = []
+    line_index = 0
+    while line_index < len(lines):
+        if line_index in unsupported:
+            line_index += 1
+            continue
+        first = line_index
+        while line_index + 1 < len(lines) and line_index + 1 not in unsupported:
+            line_index += 1
+        last = line_index
+        start = lines[first][0]
+        end = lines[last][1]
+        if last + 1 < len(lines):
+            end = lines[last][2]
+        if start < end and source[start:end].strip(" \t\n"):
+            islands.append((start, end))
+        line_index += 1
+    return tuple(islands)
+
+
+def _render_record_candidates(
+    record: AssistantTextRecord,
+    *,
+    version: str,
+    cols: int,
+    profile: RendererProfile,
+) -> tuple[tuple[RenderCandidate, ...], tuple[str, ...]]:
+    try:
+        return (
+            (
+                render_semantic_candidate(
+                    record,
+                    version=version,
+                    cols=cols,
+                    profile=profile,
+                    allow_unsupported=record.unsupported,
+                ),
+            ),
+            (),
+        )
+    except ProviderAuthorityError as exc:
+        if exc.reason != "unsupported-inline-code":
+            raise
+
+    islands = _inline_code_islands(record.text)
+    if not islands:
+        raise ProviderAuthorityError("unsupported-inline-code")
+    candidates = []
+    unsupported_texts = []
+    cursor = 0
+    byte_offsets = [0]
+    for character in record.text:
+        byte_offsets.append(byte_offsets[-1] + len(character.encode("utf-8")))
+    for start, end in islands:
+        if cursor < start:
+            unsupported_texts.append(record.text[cursor:start])
+        island_record = replace(record, text=record.text[start:end])
+        candidates.append(
+            render_semantic_candidate(
+                island_record,
+                version=version,
+                cols=cols,
+                profile=profile,
+                allow_unsupported=record.unsupported,
+                source_byte_offset=byte_offsets[start],
+                first_record_island=start == 0,
+            )
+        )
+        cursor = end
+    if cursor < len(record.text):
+        unsupported_texts.append(record.text[cursor:])
+    return tuple(candidates), tuple(unsupported_texts)
 
 
 def normalize_styled_rows(
@@ -1370,9 +1596,9 @@ def normalize_styled_rows(
             if grapheme_match is None:
                 raise ProviderAuthorityError("unsupported-styled-row")
             grapheme = grapheme_match.group(0)
-            if any(ord(character) < 32 and character != "\t" for character in grapheme):
+            if any(ord(character) < 32 for character in grapheme):
                 raise ProviderAuthorityError("unsupported-styled-row")
-            width = _grapheme_width(grapheme) if grapheme != "\t" else 8 - (column % 8)
+            width = _captured_grapheme_width(grapheme)
             if underline or strike or (bold and italic):
                 style = "unsupported"
             elif reverse or background:
@@ -1394,6 +1620,27 @@ def normalize_styled_rows(
         if "".join(visible) != plain:
             raise ProviderAuthorityError("styled-row-text-mismatch")
         normalized.append(tuple(spans))
+    return tuple(normalized)
+
+
+def normalize_plain_rows(
+    plain_rows: Sequence[str],
+    cols: int,
+) -> tuple[str, ...]:
+    if cols <= 0:
+        raise ProviderAuthorityError("invalid-captured-geometry")
+    normalized = []
+    for row in plain_rows:
+        if not isinstance(row, str):
+            raise ProviderAuthorityError("invalid-captured-row")
+        width = 0
+        for grapheme in GRAPHEME_RE.findall(row):
+            if any(ord(character) < 32 for character in grapheme):
+                raise ProviderAuthorityError("invalid-captured-cell")
+            width += _captured_grapheme_width(grapheme)
+            if width > cols:
+                raise ProviderAuthorityError("captured-row-overflow")
+        normalized.append(row + " " * (cols - width))
     return tuple(normalized)
 
 
@@ -1624,6 +1871,8 @@ def match_complete_provider_block(
             provider=candidate.provider,
             record_id=candidate.record_id,
             placement_row=placement,
+            source_start=candidate.source_start,
+            source_end=candidate.source_end,
         )
     except Exception:
         return MatchResult.failure("provider-match-failed")
@@ -1674,24 +1923,31 @@ def authoritative_provider_match(
         fence = open_transcript_fence(binding, root=transcript_root, owner_uid=owner_uid)
         records = index.update(fence, binding)
         profile = renderer_profile(binding.provider, binding.version)
+        normalized_plain_rows = normalize_plain_rows(plain_rows, cols)
+        if style_rows is not None:
+            if len(style_rows) != len(normalized_plain_rows) or any(
+                start < 0 or end <= start or end > cols
+                for row in style_rows
+                for start, end, _ in row
+            ):
+                raise ProviderAuthorityError("styled-row-geometry")
         candidates = []
         render_failed_texts: list[str] = []
         for record in records:
             try:
-                candidates.append(
-                    render_semantic_candidate(
-                        record,
-                        version=binding.version,
-                        cols=cols,
-                        profile=profile,
-                        allow_unsupported=record.unsupported,
-                    )
+                rendered, unsupported_texts = _render_record_candidates(
+                    record,
+                    version=binding.version,
+                    cols=cols,
+                    profile=profile,
                 )
+                candidates.extend(rendered)
+                render_failed_texts.extend(unsupported_texts)
             except ProviderAuthorityError:
                 render_failed_texts.append(record.text)
         result = match_complete_provider_block(
             tuple(candidates),
-            plain_rows,
+            normalized_plain_rows,
             selection_start,
             selection_end,
             style_rows=style_rows,
@@ -1702,7 +1958,10 @@ def authoritative_provider_match(
             (
                 candidate
                 for candidate in candidates
-                if not candidate.unsupported and candidate.record_id == result.record_id
+                if not candidate.unsupported
+                and candidate.record_id == result.record_id
+                and candidate.source_start == result.source_start
+                and candidate.source_end == result.source_end
             ),
             None,
         )
@@ -1737,6 +1996,56 @@ class ProviderSelectionResult:
 
 _TRANSCRIPT_INDEXES: OrderedDict[tuple[str, Path, int], TranscriptIndex] = OrderedDict()
 _PROVIDER_SELECTION_LOCK = threading.Lock()
+_PROVIDER_DIAGNOSTIC_LOCK = threading.Lock()
+_PROVIDER_DIAGNOSTICS: OrderedDict[tuple[str, str, str], int] = OrderedDict()
+_PROVIDER_DIAGNOSTIC_TOTAL = 0
+
+
+def _flush_provider_diagnostics() -> None:
+    global _PROVIDER_DIAGNOSTIC_TOTAL
+    with _PROVIDER_DIAGNOSTIC_LOCK:
+        if not _PROVIDER_DIAGNOSTICS:
+            return
+        counters = [
+            {
+                "mode": mode,
+                "decision": decision,
+                "reason": reason,
+                "count": count,
+            }
+            for (mode, decision, reason), count in _PROVIDER_DIAGNOSTICS.items()
+        ]
+        _PROVIDER_DIAGNOSTICS.clear()
+        _PROVIDER_DIAGNOSTIC_TOTAL = 0
+    try:
+        print(
+            "provider authority diagnostics "
+            + json.dumps(counters, separators=(",", ":"), sort_keys=True)
+        )
+    except Exception:
+        pass
+
+
+def _record_provider_diagnostic(mode: str, decision: str, reason: str) -> None:
+    global _PROVIDER_DIAGNOSTIC_TOTAL
+    if not re.fullmatch(r"[a-z0-9-]{1,64}", reason):
+        reason = "invalid-reason"
+    key = (mode, decision, reason)
+    flush = False
+    with _PROVIDER_DIAGNOSTIC_LOCK:
+        if (
+            key not in _PROVIDER_DIAGNOSTICS
+            and len(_PROVIDER_DIAGNOSTICS) >= MAX_PROVIDER_DIAGNOSTIC_REASONS - 1
+        ):
+            key = ("aggregate", "overflow", "other-reason")
+        _PROVIDER_DIAGNOSTICS[key] = _PROVIDER_DIAGNOSTICS.get(key, 0) + 1
+        _PROVIDER_DIAGNOSTIC_TOTAL += 1
+        flush = _PROVIDER_DIAGNOSTIC_TOTAL >= PROVIDER_DIAGNOSTIC_FLUSH_EVERY
+    if flush:
+        _flush_provider_diagnostics()
+
+
+atexit.register(_flush_provider_diagnostics)
 
 
 def _transcript_index(key: tuple[str, Path, int]) -> TranscriptIndex:
@@ -1957,6 +2266,11 @@ def _provider_selection_locked(
     mode = provider_authority_mode()
     if mode == "off":
         return ProviderSelectionResult(False)
+
+    def decision(owned: bool, reason: str, text: str | None = None) -> ProviderSelectionResult:
+        _record_provider_diagnostic(mode, "matched" if owned else "unowned", reason)
+        return ProviderSelectionResult(owned, text)
+
     provider_home = Path(home) if home is not None else Path.home()
     cache: Mapping[str, Any] | None = None
     cached: ProviderBinding | None = None
@@ -1970,22 +2284,22 @@ def _provider_selection_locked(
                 if not cache["active"]:
                     if owned:
                         raise ProviderAuthorityError("binding-cache-stale")
-                    return ProviderSelectionResult(False)
+                    return decision(False, "inactive-unowned")
             elif not cache["active"]:
                 if bool(snapshot.alternate):
                     raise ProviderAuthorityError("binding-cache-stale")
-                return ProviderSelectionResult(False)
+                return decision(False, "inactive-unowned")
         try:
             binding, cache = resolve_provider_binding(snapshot.pane_id, home=provider_home)
         except ProviderAuthorityError:
             if cached is not None and cached.provider == "claude" and not bool(snapshot.alternate):
-                return ProviderSelectionResult(False)
+                return decision(False, "inactive-unowned")
             raise
         if binding is None:
-            return ProviderSelectionResult(False)
+            return decision(False, "binding-unavailable")
         owned = _selection_is_owned(binding, cache, snapshot, start_row, end_row)
         if not owned:
-            return ProviderSelectionResult(False)
+            return decision(False, "selection-unowned")
         style_rows = normalize_styled_rows(snapshot.physical_rows, snapshot.plain_physical_rows)
         key = (binding.provider, binding.transcript_path.absolute(), binding.generation)
         index = _transcript_index(key)
@@ -2004,14 +2318,18 @@ def _provider_selection_locked(
         )
         if not result.matched:
             raise ProviderAuthorityError(result.internal_reason or "provider-match-failed")
-        return ProviderSelectionResult(True, result.text)
-    except ProviderAuthorityError:
+        return decision(True, "canonical-match", result.text)
+    except ProviderAuthorityError as exc:
         if mode == "shadow":
+            _record_provider_diagnostic(mode, "fallback", exc.reason)
             return ProviderSelectionResult(False)
+        _record_provider_diagnostic(mode, "rejected", exc.reason)
         raise
     except Exception as exc:
         if mode == "shadow":
+            _record_provider_diagnostic(mode, "fallback", "provider-internal-failure")
             return ProviderSelectionResult(False)
+        _record_provider_diagnostic(mode, "rejected", "provider-internal-failure")
         raise ProviderAuthorityError("provider-internal-failure") from exc
 
 
