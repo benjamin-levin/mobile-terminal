@@ -77,6 +77,97 @@ assert.equal(normalizeTerminalCopyText("crlf\r\nlone-cr\rfinal\r\n"),
         self.assertIn('type: "selection-request"', request)
         self.assertIn("selection: {", APP_JS)
 
+    def test_selection_check_uses_retained_pending_state_without_live_selection_reads(self):
+        self.run_node(
+            ["pendingSelectionRequestIsCurrent", "handleServerMessage"],
+            r'''
+let terminalAuthoritative = true;
+let terminalEpoch = 42;
+const pendingSelectionRequests = new Map();
+const sent = [];
+function sendMessage(message) { sent.push(message); return true; }
+let liveSelectionCalls = 0;
+const term = { getSelectionPosition: null };
+
+(async () => {
+  const liveSelectionBehaviors = [
+    () => ({ start: { x: 9, y: 9 }, end: { x: 10, y: 10 } }),
+    () => null,
+    () => { throw new Error("live selection must not be read"); },
+  ];
+
+  for (const [index, behavior] of liveSelectionBehaviors.entries()) {
+    term.getSelectionPosition = () => {
+      liveSelectionCalls += 1;
+      return behavior();
+    };
+    const requestId = `retained-${index}`;
+    const state = Object.freeze({
+      selection: Object.freeze({
+        start: Object.freeze({ x: 1, y: 2 }),
+        end: Object.freeze({ x: 3, y: 4 }),
+      }),
+      epoch: 42,
+    });
+    pendingSelectionRequests.set(requestId, Object.freeze({ state }));
+    await handleServerMessage({ type: "selection-check", requestId });
+    assert.deepEqual(sent.pop(), {
+      type: "selection-check-ack",
+      requestId,
+      epoch: 42,
+      unchanged: true,
+    });
+  }
+  assert.equal(liveSelectionCalls, 0);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+''',
+        )
+
+    def test_selection_check_fails_closed_without_current_authoritative_pending_state(self):
+        self.run_node(
+            ["pendingSelectionRequestIsCurrent", "handleServerMessage"],
+            r'''
+let terminalAuthoritative = true;
+let terminalEpoch = 42;
+const pendingSelectionRequests = new Map();
+const sent = [];
+function sendMessage(message) { sent.push(message); return true; }
+const term = {
+  getSelectionPosition() { throw new Error("live selection must not be read"); },
+};
+
+(async () => {
+  await handleServerMessage({ type: "selection-check", requestId: "missing" });
+  assert.equal(sent.pop().unchanged, false);
+
+  pendingSelectionRequests.set("not-authoritative", { state: { epoch: 42 } });
+  terminalAuthoritative = false;
+  await handleServerMessage({ type: "selection-check", requestId: "not-authoritative" });
+  assert.equal(sent.pop().unchanged, false);
+
+  pendingSelectionRequests.set("wrong-epoch", { state: { epoch: 41 } });
+  terminalAuthoritative = true;
+  await handleServerMessage({ type: "selection-check", requestId: "wrong-epoch" });
+  assert.equal(sent.pop().unchanged, false);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+''',
+        )
+
+    def test_selection_check_handler_has_no_live_selection_comparison(self):
+        selection_check = app_section(
+            '    if (payload.type === "selection-check") {',
+            '    if (payload.type === "selection-result") {',
+        )
+        self.assertIn("unchanged: pendingSelectionRequestIsCurrent(pending),", selection_check)
+        for forbidden in (
+            "terminalSelectionState",
+            "getSelectionPosition",
+            "JSON.stringify",
+            "sameTerminalSelectionState",
+        ):
+            self.assertNotIn(forbidden, selection_check)
+        self.assertNotIn("sameTerminalSelectionState", APP_JS)
+
     def test_copy_to_tab_and_native_copy_share_authoritative_request(self):
         copy = app_section(
             "  async function copyTerminalSelection()",

@@ -1480,8 +1480,13 @@
     };
   }
 
-  function sameTerminalSelectionState(left, right) {
-    return Boolean(left && right && JSON.stringify(left) === JSON.stringify(right));
+  function pendingSelectionRequestIsCurrent(pending) {
+    return Boolean(
+      pending &&
+      terminalAuthoritative &&
+      pending.state &&
+      pending.state.epoch === terminalEpoch
+    );
   }
 
   function requestAuthoritativeSelection() {
@@ -7291,11 +7296,7 @@
         type: "selection-check-ack",
         requestId: payload.requestId,
         epoch: terminalEpoch,
-        unchanged: Boolean(
-          pending &&
-          terminalAuthoritative &&
-          sameTerminalSelectionState(pending.state, terminalSelectionState()),
-        ),
+        unchanged: pendingSelectionRequestIsCurrent(pending),
       });
       return;
     }

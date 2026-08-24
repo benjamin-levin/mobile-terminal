@@ -3239,7 +3239,7 @@ class ClientProtocolSourceTest(unittest.TestCase):
 
     def test_selection_contract_includes_client_geometry(self):
         selection_start = self.source.index("  function terminalSelectionState()")
-        selection_end = self.source.index("  function sameTerminalSelectionState", selection_start)
+        selection_end = self.source.index("  function pendingSelectionRequestIsCurrent", selection_start)
         selection = self.source[selection_start:selection_end]
         self.assertIn("cols: term.cols", selection)
         self.assertIn("rows: term.rows", selection)
