@@ -187,8 +187,13 @@ preflight() {
       exec_start=$(service_property ExecStart)
       [[ "$load_state" == "loaded" ]] || fail "exact service is not loaded"
       [[ "$workdir" == "$repo" ]] || fail "service working directory mismatch"
-      [[ "$exec_start" == *"$interpreter"* && "$exec_start" == *"$repo/server.py"* ]] ||
-        fail "service interpreter or entrypoint mismatch"
+      if [[ "$service" == "mobile-terminal-proxy.service" ]]; then
+        [[ "$exec_start" == *"$repo/ps-proxy-up.sh"* ]] ||
+          fail "service interpreter or entrypoint mismatch"
+      else
+        [[ "$exec_start" == *"$interpreter"* && "$exec_start" == *"$repo/server.py"* ]] ||
+          fail "service interpreter or entrypoint mismatch"
+      fi
       ;;
     launchd)
       launch_state=$(launchctl print "gui/$(id -u)/$service") || fail "exact launchd service is not loaded"
