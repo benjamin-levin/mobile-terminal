@@ -4834,6 +4834,22 @@
   let pendingScrollFrameId = null;
   let scrollRepaintTimer = null;
 
+  function resetTerminalInteractionState() {
+    dismissTerminalSelection();
+    selectionTapCopy = null;
+    if (pendingScrollFrameId !== null) {
+      window.cancelAnimationFrame(pendingScrollFrameId);
+      pendingScrollFrameId = null;
+    }
+    pendingScrollLines = 0;
+    scrollLineRemainder = 0;
+    if (scrollRepaintTimer !== null) {
+      window.clearTimeout(scrollRepaintTimer);
+      scrollRepaintTimer = null;
+    }
+    cancelTouchInertia();
+  }
+
   function scheduleScrollRepaint() {
     if (scrollRepaintTimer !== null) {
       window.clearTimeout(scrollRepaintTimer);
@@ -7649,7 +7665,7 @@
     }
     if (payload.type === "ready") {
       terminalAuthoritative = false;
-      clearTerminalSelectionUI();
+      resetTerminalInteractionState();
       const readyIsHidden = document.visibilityState === "hidden";
       applyTerminalReadyVisibility(readyIsHidden);
       if (Array.isArray(payload.profiles) || payload.activeProfile) {
@@ -7676,9 +7692,9 @@
       resetComposerRevisionState();
       resetSemanticPromptState();
       resetTerminalBufferSyncState();
-      // New pane: assume local scroll until the server reports whether the pane
-      // owns scrolling through an alternate screen or mouse tracking.
-      activePaneLocalScroll = true;
+      activePaneLocalScroll = Object.prototype.hasOwnProperty.call(payload, "paneLocalScroll")
+        ? payload.paneLocalScroll === true
+        : true;
       if (payload.multiTenant) {
         currentUser = payload.user || currentUser;
         currentUserLabel = payload.userLabel || currentUser;
@@ -8256,7 +8272,7 @@
     // Remember the tab we're leaving so the selection "To tab" chip can target
     // the most recent *other* tab.
     previousSessionName = selectedSessionName || activeSessionName;
-    clearTerminalSelectionUI();
+    resetTerminalInteractionState();
     addOpenTab(sessionName);
     activeTabKey = terminalTabKey(sessionName);
     selectedSessionName = sessionName;

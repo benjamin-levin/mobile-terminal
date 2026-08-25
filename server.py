@@ -6286,9 +6286,11 @@ class AppServer:
                     continue
                 await incoming.put(payload)
 
+        prev_local = None
+
         async def watch_tabs() -> None:
+            nonlocal prev_local
             previous = ""
-            prev_local = None
             while True:
                 if state.get("switching"):
                     await asyncio.sleep(0.05)
@@ -6327,13 +6329,14 @@ class AppServer:
                 "user": user if self.multi_tenant else None,
                 "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
                 "principal": forwarded_principal,
+                "paneLocalScroll": pane_scrolls_locally(state["session"]),
             }
             if initial:
                 payload["openTabs"] = self.open_tabs_for(user)
             await self.send_json(connection, payload)
 
         async def switch_session(target: str) -> None:
-            nonlocal bridge
+            nonlocal bridge, prev_local
             new_session, new_created = self.resolve_user_session(state["user"], str(target).strip())
             if new_session == state["session"]:
                 return
@@ -6360,6 +6363,7 @@ class AppServer:
                 await self.open_live_terminal(bridge, state)
                 new_session = getattr(bridge, "session_name", state["session"])
                 state["session"] = new_session
+                prev_local = None
                 await send_ready()
                 if pane_scrolls_locally(new_session) and pane_in_mode(new_session):
                     tmux_capture("send-keys", "-t", new_session, "-X", "cancel", check=False)

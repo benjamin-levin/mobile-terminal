@@ -45,6 +45,31 @@ class StubConnection:
         raise StopAsyncIteration
 
 
+class ReadySwitchConnection(StubConnection):
+    def __init__(self, messages=(), target="alternate"):
+        super().__init__(messages)
+        self.target = target
+        self.initial_pane_scroll = asyncio.Event()
+        self.switched_pane_scroll = asyncio.Event()
+        self.switch_sent = False
+
+    async def send(self, message):
+        await super().send(message)
+        pane_scroll_count = sum(item.get("type") == "pane-scroll" for item in self.sent)
+        if pane_scroll_count >= 1:
+            self.initial_pane_scroll.set()
+        if pane_scroll_count >= 2:
+            self.switched_pane_scroll.set()
+
+    async def __anext__(self):
+        if not self.switch_sent:
+            await self.initial_pane_scroll.wait()
+            self.switch_sent = True
+            return json.dumps({"type": "switch-session", "session": self.target})
+        await self.switched_pane_scroll.wait()
+        raise StopAsyncIteration
+
+
 class StubPasskeys:
     def __init__(self, credentials=()):
         self.credentials = list(credentials)
@@ -83,6 +108,7 @@ class StubPasskeys:
 class FakeBridge:
     def __init__(self, *args, **kwargs):
         self.process = None
+        self.session_name = args[1]
         self.pane_id = "%1"
         self.bytes_out = 0
         self.pane_change = asyncio.Event()
@@ -194,6 +220,31 @@ class StandalonePasskeyIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(record)
         self.assertEqual(fallback["token"], "external-secret")
         self.assertNotIn("finish-auth", [call[0] for call in passkeys.calls])
+
+    async def test_ready_carries_scroll_ownership_on_connect_and_session_switch(self):
+        app = self.app(StubPasskeys())
+        connection = ReadySwitchConnection([self.auth_frame()])
+        self.prepare_handler(app)
+        app.resolve_user_session = mock.Mock(
+            side_effect=lambda _user, requested: (requested or "mobile-terminal", False)
+        )
+
+        with (
+            mock.patch("server.device_pubkey", return_value="enrolled-key"),
+            mock.patch("server.verify_device_signature", return_value=True),
+            mock.patch("server.TmuxBridge", FakeBridge),
+            mock.patch("server.pane_scrolls_locally", return_value=False),
+            mock.patch("server.pane_metadata", return_value=("%1",)),
+        ):
+            await asyncio.wait_for(app.websocket_handler(connection), timeout=3)
+
+        ready = [message for message in connection.sent if message["type"] == "ready"]
+        self.assertEqual(
+            [(message["session"], message["paneLocalScroll"]) for message in ready],
+            [("mobile-terminal", False), ("alternate", False)],
+        )
+        pane_scroll = [message for message in connection.sent if message["type"] == "pane-scroll"]
+        self.assertEqual([message["local"] for message in pane_scroll], [False, False])
 
     async def test_public_private_trusted_and_identity_bootstrap_require_registration(self):
         cases = (

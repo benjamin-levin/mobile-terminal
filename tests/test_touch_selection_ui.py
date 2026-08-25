@@ -468,6 +468,7 @@ assert.deepEqual(
         )
         switch_profile = extract_function("switchProfile")
         switch_session = extract_function("switchSession")
+        reset_interaction = extract_function("resetTerminalInteractionState")
         ready = app_section('    if (payload.type === "ready") {', '    if (payload.type === "tabs") {')
         selection_change = app_section("    term.onSelectionChange(() => {", "    wheelTarget.addEventListener(")
         self.assertIn("dismissTerminalSelection();", to_tab)
@@ -476,9 +477,55 @@ assert.deepEqual(
             "    resetComposerTracking(true);\n    term.reset();",
             switch_profile,
         )
-        self.assertIn("clearTerminalSelectionUI();", switch_session)
-        self.assertIn("clearTerminalSelectionUI();", ready)
+        self.assertIn("resetTerminalInteractionState();", switch_session)
+        self.assertIn("resetTerminalInteractionState();", ready)
+        self.assertIn("dismissTerminalSelection();", reset_interaction)
         self.assertIn("clearTerminalSelectionUI();", selection_change)
+
+    def test_ready_uses_authoritative_scroll_ownership_and_keeps_updates_working(self):
+        ready = app_section('    if (payload.type === "ready") {', '    if (payload.type === "tabs") {')
+        self.assertIn(
+            'Object.prototype.hasOwnProperty.call(payload, "paneLocalScroll")',
+            ready,
+        )
+        self.assertIn("? payload.paneLocalScroll === true\n        : true;", ready)
+        pane_scroll = app_section(
+            '    if (payload.type === "pane-scroll") {',
+            '    if (payload.type === "notice") {',
+        )
+        self.assertIn("activePaneLocalScroll = payload.local === true;", pane_scroll)
+
+    def test_session_switch_teardown_cancels_all_scroll_pipeline_state(self):
+        script = "\n".join(
+            [
+                'const assert = require("node:assert/strict");',
+                "const events = [];",
+                "const window = {",
+                "  cancelAnimationFrame(id) { events.push(`frame:${id}`); },",
+                "  clearTimeout(id) { events.push(`timeout:${id}`); },",
+                "};",
+                "let selectionTapCopy = { x: 1, y: 2 };",
+                "let pendingScrollFrameId = 41;",
+                "let pendingScrollLines = 9;",
+                "let scrollLineRemainder = 0.75;",
+                "let scrollRepaintTimer = 42;",
+                "function dismissTerminalSelection() { events.push('selection'); }",
+                "function cancelTouchInertia() { events.push('inertia'); }",
+                extract_function("resetTerminalInteractionState"),
+                "resetTerminalInteractionState();",
+                "assert.equal(selectionTapCopy, null);",
+                "assert.equal(pendingScrollFrameId, null);",
+                "assert.equal(pendingScrollLines, 0);",
+                "assert.equal(scrollLineRemainder, 0);",
+                "assert.equal(scrollRepaintTimer, null);",
+                "assert.deepEqual(events, ['selection', 'frame:41', 'timeout:42', 'inertia']);",
+                "resetTerminalInteractionState();",
+                "assert.deepEqual(events, [",
+                "  'selection', 'frame:41', 'timeout:42', 'inertia', 'selection', 'inertia',",
+                "]);",
+            ]
+        )
+        self.run_node_source(script)
 
     def test_dismiss_selection_fully_tears_down_every_transient_state(self):
         script = "\n".join(
