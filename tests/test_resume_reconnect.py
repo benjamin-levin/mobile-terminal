@@ -185,6 +185,72 @@ class ResumeReconnectWiringTest(unittest.TestCase):
         )
 
 
+    def test_config_failure_retries_without_fabricating_token_auth_and_restarts_normally(self):
+        load = re.search(r"  async function loadServerConfig\(\).*?\n  \}", self.source, re.DOTALL)
+        retry = re.search(r"  function showAuthConfigRetrying\(\).*?\n  \}", self.source, re.DOTALL)
+        poll = re.search(r"  function scheduleAuthConfigPolling\(\).*?\n  \}", self.source, re.DOTALL)
+        startup = re.search(
+            r"  async function startAuthenticationClient\(\).*?\n  \}",
+            self.source,
+            re.DOTALL,
+        )
+        for match in (load, retry, poll, startup):
+            self.assertIsNotNone(match)
+        self.assertIn("serverConfigAvailable = false;\n      return false;", load.group(0))
+        self.assertNotIn("requireToken: true", load.group(0))
+        self.assertIn('loginMessage.textContent =', retry.group(0))
+        self.assertIn('tokenInput.classList.add("hidden");', retry.group(0))
+        self.assertIn("await startAuthenticationClient();", poll.group(0))
+        self.assertNotIn("requireToken", poll.group(0))
+        self.assertLess(
+            startup.group(0).index("await loadServerConfig()"),
+            startup.group(0).index("showAuthConfigRetrying();"),
+        )
+        self.assertLess(
+            startup.group(0).index("const authenticationReady = await prepareAuthenticationClient();"),
+            startup.group(0).index("connect();"),
+        )
+        self.assertIn("startAuthenticationClient();", self.source)
+
+    def test_device_enrollment_ack_success_failure_and_legacy_timeout(self):
+        functions = []
+        for name in ("finishDeviceKeyEnrollmentCompatibility", "finishDeviceKeyEnrollment"):
+            match = re.search(rf"  function {name}\(.*?\n  \}}", self.source, re.DOTALL)
+            self.assertIsNotNone(match)
+            functions.append(match.group(0))
+        script = "\n".join(
+            (
+                "let pendingDeviceEnrollment = null; let hasDeviceKey = false;",
+                "const authenticationScope = () => 'realm:mine';",
+                "const window = {clearTimeout: () => {}};",
+                *functions,
+                "pendingDeviceEnrollment = {enrollmentId: 'ok', scope: 'realm:mine', previousHasDeviceKey: false, timer: 1};",
+                "const success = finishDeviceKeyEnrollment({type: 'register-key-ok', enrollmentId: 'ok'});",
+                "const afterSuccess = hasDeviceKey; hasDeviceKey = false;",
+                "pendingDeviceEnrollment = {enrollmentId: 'bad', scope: 'realm:mine', previousHasDeviceKey: false, timer: 2};",
+                "const failure = finishDeviceKeyEnrollment({type: 'register-key-error', enrollmentId: 'bad'});",
+                "const afterFailure = hasDeviceKey;",
+                "pendingDeviceEnrollment = {enrollmentId: 'legacy', scope: 'realm:mine', previousHasDeviceKey: false, timer: 3};",
+                "const timeout = finishDeviceKeyEnrollmentCompatibility('legacy', 'realm:mine');",
+                "process.stdout.write(JSON.stringify({success, afterSuccess, failure, afterFailure, timeout, afterTimeout: hasDeviceKey, pendingDeviceEnrollment}));",
+            )
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.stdout,
+            '{"success":true,"afterSuccess":true,"failure":true,"afterFailure":false,'
+            '"timeout":true,"afterTimeout":true,"pendingDeviceEnrollment":null}',
+        )
+        enroll = re.search(r"  async function enrollDeviceKey\(.*?\n  \}", self.source, re.DOTALL)
+        self.assertIsNotNone(enroll)
+        self.assertIn("}, 3000)", enroll.group(0))
+        self.assertNotIn("hasDeviceKey = true;", enroll.group(0))
+
     def test_passkey_policy_matrix_fails_closed_at_idle_threshold(self):
         parse = re.search(
             r"  function parseAuthenticationTimestamp\(.*?\n  \}",
@@ -202,6 +268,7 @@ class ResumeReconnectWiringTest(unittest.TestCase):
             (
                 parse.group(0),
                 decision.group(0),
+                "const AUTHENTICATION_TIMESTAMP_MAX_FUTURE_MS = 24 * 60 * 60 * 1000;",
                 'const off = { mode: "off", idleMinutes: 15 };',
                 'const idle = { mode: "idle", idleMinutes: 15 };',
                 'const every = { mode: "every-open", idleMinutes: 15 };',
@@ -217,7 +284,9 @@ class ResumeReconnectWiringTest(unittest.TestCase):
                 "  idleUnder: passkeyRequiredAfterBackground(idle, now, now - threshold + 1, false, now),",
                 "  idleExact: passkeyRequiredAfterBackground(idle, now, now - threshold, false, now),",
                 "  idleOver: passkeyRequiredAfterBackground(idle, now, now - threshold - 1, false, now),",
-                "  idleFuture: passkeyRequiredAfterBackground(idle, now, now + 1, false, now),",
+                "  idleFutureCorrection: passkeyRequiredAfterBackground(idle, now, now + 2 * 60 * 1000, false, now),",
+                "  idleFutureDay: passkeyRequiredAfterBackground(idle, now, now + 24 * 60 * 60 * 1000, false, now),",
+                "  idleGrossFuture: passkeyRequiredAfterBackground(idle, now, now + 24 * 60 * 60 * 1000 + 1, false, now),",
                 "};",
                 "process.stdout.write(JSON.stringify(results));",
             )
@@ -232,7 +301,8 @@ class ResumeReconnectWiringTest(unittest.TestCase):
             result.stdout,
             '{"off":false,"everyInitial":true,"everyNoMarker":false,'
             '"everyMarker":true,"idleMissing":true,"idleMalformed":true,'
-            '"idleUnder":false,"idleExact":true,"idleOver":true,"idleFuture":true}',
+            '"idleUnder":false,"idleExact":true,"idleOver":true,'
+            '"idleFutureCorrection":false,"idleFutureDay":false,"idleGrossFuture":true}',
         )
 
     def test_resume_marker_preserves_background_timestamp_and_pagehide_records_it(self):
@@ -315,6 +385,15 @@ class ResumeReconnectWiringTest(unittest.TestCase):
         ready = self.source[ready_start:ready_end]
         self.assertIn("if (completedPasskeyInteraction)", ready)
         self.assertIn("recordUserInteraction(loginRealm, Date.now(), true);", ready)
+        self.assertLess(ready.index("removeAuthenticationStorage();"), ready.index("recordUserInteraction("))
+        self.assertLess(
+            ready.index("resetAuthenticationLifecycle({ locked: readyIsHidden });"),
+            ready.index("initialResumeDecisionMade = true;"),
+        )
+        self.assertLess(
+            ready.index("initialResumeDecisionMade = true;"),
+            ready.index("recordUserInteraction("),
+        )
         self.assertNotIn("writeBackgroundedAt", ready)
         self.assertIn('reportForcedActivity(false);', self.source)
 
@@ -501,6 +580,7 @@ class ResumeReconnectWiringTest(unittest.TestCase):
                 "let passkeyInteractionPending = true;",
                 "let passkeyCeremonyController = {abort: () => {}};",
                 "const cancelPasskeyCeremony = () => { passkeyCeremonyController = null; };",
+                "const cancelPendingDeviceEnrollment = () => {};",
                 "let resumeDecisionPromise = Promise.resolve();",
                 "let initialResumeDecisionMade = true;",
                 "let handledResumeMarker = 'old:123';",
@@ -571,6 +651,16 @@ class ResumeReconnectWiringTest(unittest.TestCase):
         )
         self.assertEqual(result.stdout, '{"unrelated":"keep"}')
         self.assertIn("removeAuthenticationStorage();", self.source)
+
+    def test_auth_close_clears_token_only_for_rejected_token_reason(self):
+        close_start = self.source.index('socket.addEventListener("close", (event) => {')
+        close_end = self.source.index("\n    });", close_start)
+        close_handler = self.source[close_start:close_end]
+        auth_failure = close_handler[close_handler.index("if (event.code === 4001)") :]
+        self.assertIn('const tokenRejected = event.reason === "token rejected";', auth_failure)
+        self.assertIn("const passkeyRetryAvailable = !tokenRejected && loginSupportsPasskey();", auth_failure)
+        self.assertIn("if (tokenRejected) {\n          localStorage.removeItem(tokenStorageKey());", auth_failure)
+        self.assertNotIn("localStorage.removeItem(tokenStorageKey());\n        scheduleAuthConfigPolling", auth_failure)
 
     def test_closed_socket_reconnects_instead_of_dropping_refresh(self):
         marker = "if (!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING)"

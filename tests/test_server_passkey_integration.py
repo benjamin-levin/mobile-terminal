@@ -422,6 +422,14 @@ class StandalonePasskeyIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     needs_passkey,
                 )
 
+    async def test_invalid_token_uses_rejected_token_close_reason(self):
+        connection = StubConnection([self.auth_frame(token="wrong-token")])
+
+        await self.run_handler(self.app(StubPasskeys()), connection)
+
+        self.assertEqual(connection.closed, (4001, "token rejected"))
+        self.assertEqual(connection.sent[-1]["message"], "Invalid access token.")
+
     async def test_existing_passkey_cannot_fall_back_to_token(self):
         passkeys = StubPasskeys([{"credentialId": "credential", "principal": "standalone"}])
         connection = StubConnection(
@@ -500,10 +508,48 @@ class StandalonePasskeyIntegrationTest(unittest.IsolatedAsyncioTestCase):
         }
 
         with mock.patch("server.register_device_key") as register:
-            app.handle_register_key(connection, state, payload)
-            app.handle_register_key(connection, state, payload)
+            await app.handle_register_key(connection, state, payload)
+            await app.handle_register_key(connection, state, payload)
 
         register.assert_called_once_with("", "device-id", public_key, "device")
+        self.assertEqual(
+            [message["type"] for message in connection.sent[-2:]],
+            ["register-key-ok", "register-key-error"],
+        )
+        self.assertEqual(connection.sent[-2]["enrollmentId"], enrollment.enrollment_id)
+        self.assertIsNone(state["enrollment"])
+
+    async def test_enrollment_failure_is_acknowledged_and_retried_after_reauthentication(self):
+        app = self.app(StubPasskeys())
+        connection = StubConnection()
+        state = {
+            "user": "",
+            "deviceId": "device-id",
+            "needsEnroll": True,
+            "enrollment": None,
+        }
+        await app.maybe_enroll_device(connection, state)
+        enrollment = state["enrollment"]
+        payload = {
+            **enrollment.message(),
+            "type": "register-key",
+            "deviceId": "device-id",
+            "publicKey": "invalid",
+            "signature": "invalid",
+        }
+
+        with mock.patch("server.register_device_key") as register:
+            await app.handle_register_key(connection, state, payload)
+
+        register.assert_not_called()
+        self.assertEqual(
+            connection.sent[-1],
+            {
+                "type": "register-key-error",
+                "enrollmentId": enrollment.enrollment_id,
+            },
+        )
+        self.assertTrue(state["needsEnroll"])
         self.assertIsNone(state["enrollment"])
 
     async def test_killing_active_session_switches_on_authenticated_socket(self):

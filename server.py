@@ -5639,7 +5639,7 @@ class AppServer:
             return
 
         if message_type == "register-key":
-            self.handle_register_key(connection, state, payload)
+            await self.handle_register_key(connection, state, payload)
             return
 
         if message_type == "forget-key":
@@ -6032,27 +6032,39 @@ class AppServer:
         state["enrollment"] = enrollment
         await self.send_json(connection, enrollment.message())
 
-    def handle_register_key(
+    async def handle_register_key(
         self,
         connection: ServerConnection,
         state: dict[str, Any],
         payload: dict[str, Any],
     ) -> None:
+        enrollment_id = str(payload.get("enrollmentId", ""))
         enrollment = state.get("enrollment")
+        registered = False
         if (
-            not isinstance(enrollment, PendingDeviceEnrollment)
-            or payload.get("enrollmentId") != enrollment.enrollment_id
+            isinstance(enrollment, PendingDeviceEnrollment)
+            and enrollment_id == enrollment.enrollment_id
         ):
-            return
-        state["enrollment"] = None
-        state["needsEnroll"] = False
-        if not enrollment.verify(payload):
-            return
-        register_device_key(
-            state.get("user", ""),
-            enrollment.device_id,
-            str(payload.get("publicKey", "")),
-            device_label(connection.request.headers.get("User-Agent", "")),
+            state["enrollment"] = None
+            if enrollment.verify(payload):
+                try:
+                    register_device_key(
+                        state.get("user", ""),
+                        enrollment.device_id,
+                        str(payload.get("publicKey", "")),
+                        device_label(connection.request.headers.get("User-Agent", "")),
+                    )
+                except OSError:
+                    pass
+                else:
+                    registered = True
+            state["needsEnroll"] = not registered
+        await self.send_json(
+            connection,
+            {
+                "type": "register-key-ok" if registered else "register-key-error",
+                "enrollmentId": enrollment_id,
+            },
         )
 
     async def websocket_handler(self, connection: ServerConnection) -> None:
@@ -6196,7 +6208,7 @@ class AppServer:
                         err = "Invalid access token."
                     if not token_ok:
                         await self.send_json(connection, {"type": "auth-error", "message": err})
-                        await connection.close(code=4001, reason="auth failed")
+                        await connection.close(code=4001, reason="token rejected")
                         return
                     try:
                         await self.register_passkey(

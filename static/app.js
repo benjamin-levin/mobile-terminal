@@ -33,6 +33,7 @@
   const DEFAULT_TERMINAL_FONT = 10;
   const DEFAULT_AUTHENTICATION_MODE = "every-open";
   const DEFAULT_AUTHENTICATION_IDLE_MINUTES = 15;
+  const AUTHENTICATION_TIMESTAMP_MAX_FUTURE_MS = 24 * 60 * 60 * 1000;
   const AUTHENTICATION_MODES = new Set(["off", "idle", "every-open"]);
   const KEYBOARD_THRESHOLD = 80;
   const VIEWPORT_SETTLE_DELAYS = [80, 220, 420, 700, 1000, 1400];
@@ -206,16 +207,8 @@
   const fileBookmarkButton = document.getElementById("fileBookmarkButton");
   const useHomeRootButton = document.getElementById("useHomeRootButton");
 
-  let serverConfig = {
-    requireToken: true,
-    tailscaleMode: false,
-    allowedClients: [],
-    multiTenant: false,
-    profileMode: false,
-    profiles: [],
-    deviceKeyAuth: false,
-    passkeyAuth: false,
-  };
+  let serverConfig = {};
+  let serverConfigAvailable = false;
   let profiles = [];
   let activeProfileId = localStorage.getItem(STORAGE_ACTIVE_PROFILE_KEY) || "";
   let pendingProfileId = "";
@@ -234,6 +227,7 @@
   let passkeyRetryPending = false;
   let passkeyInteractionPending = false;
   let passkeyCeremonyController = null;
+  let pendingDeviceEnrollment = null;
   let resumeDecisionPromise = null;
   let resumeHandlingReady = false;
   let initialResumeDecisionMade = false;
@@ -357,8 +351,16 @@
     }
   }
 
+  function cancelPendingDeviceEnrollment() {
+    if (pendingDeviceEnrollment) {
+      window.clearTimeout(pendingDeviceEnrollment.timer);
+      pendingDeviceEnrollment = null;
+    }
+  }
+
   function resetAuthenticationLifecycle({ locked = true } = {}) {
     cancelPasskeyCeremony();
+    cancelPendingDeviceEnrollment();
     authenticationByRealm = {};
     hostAuthenticationDefault = normalizeAuthenticationSettings(null);
     authenticationSettings = normalizeAuthenticationSettings(null);
@@ -3330,24 +3332,30 @@
     }
   }
 
+  function showAuthConfigRetrying() {
+    closeBootSocket();
+    setPasskeyLocked(true);
+    setPasskeyRetryUi(false);
+    loginOverlay.classList.remove("hidden");
+    tokenFieldLabel.classList.add("hidden");
+    tokenInput.classList.add("hidden");
+    loginSubmitButton.classList.add("hidden");
+    if (userField) {
+      userField.classList.add("hidden");
+    }
+    loginMessage.textContent =
+      navigator.onLine === false
+        ? "Offline. Connecting to the server and retrying…"
+        : "Connecting to the server. Retrying…";
+  }
+
   function scheduleAuthConfigPolling() {
-    if (authConfigPollTimer) {
+    if (authConfigPollTimer || serverConfigAvailable) {
       return;
     }
     authConfigPollTimer = window.setTimeout(async () => {
       authConfigPollTimer = 0;
-      const savedToken = localStorage.getItem(tokenStorageKey());
-      if (!loginOverlay || loginOverlay.classList.contains("hidden") || savedToken) {
-        return;
-      }
-      await loadServerConfig();
-      if (!serverConfig.requireToken) {
-        loginOverlay.classList.add("hidden");
-        loginMessage.textContent = "";
-        connect();
-        return;
-      }
-      scheduleAuthConfigPolling();
+      await startAuthenticationClient();
     }, 1500);
   }
 
@@ -4402,18 +4410,15 @@
       if (!response.ok) {
         throw new Error(`config ${response.status}`);
       }
-      serverConfig = await response.json();
+      const config = await response.json();
+      if (!config || typeof config !== "object") {
+        throw new Error("invalid config");
+      }
+      serverConfig = config;
+      serverConfigAvailable = true;
     } catch (_error) {
-      serverConfig = {
-        requireToken: true,
-        tailscaleMode: false,
-        allowedClients: [],
-        multiTenant: false,
-        profileMode: false,
-        profiles: [],
-        deviceKeyAuth: false,
-        passkeyAuth: false,
-      };
+      serverConfigAvailable = false;
+      return false;
     }
     profiles = Array.isArray(serverConfig.profiles) ? serverConfig.profiles : [];
     if (serverConfig.profileMode && profiles.length) {
@@ -4450,7 +4455,10 @@
       !Boolean(serverConfig.passkeyAuth) && !profiles.some((profile) => profile.deviceKeyAuth),
     );
     applyActiveProfile();
+    setPasskeyRetryUi(false);
+    loginSubmitButton.classList.remove("hidden");
     syncLoginFields();
+    return true;
   }
 
   function ensurePasskeyHelper() {
@@ -4482,6 +4490,23 @@
     loginOverlay.classList.remove("hidden");
     loginMessage.textContent = "Passkey support could not be loaded. Refresh and try again.";
     return false;
+  }
+
+  async function startAuthenticationClient() {
+    if (!(await loadServerConfig())) {
+      showAuthConfigRetrying();
+      scheduleAuthConfigPolling();
+      return false;
+    }
+    stopAuthConfigPolling();
+    const authenticationReady = await prepareAuthenticationClient();
+    if (!serverConfig.requireToken) {
+      loginOverlay.classList.add("hidden");
+    }
+    if (authenticationReady) {
+      connect();
+    }
+    return authenticationReady;
   }
 
   function activeTab() {
@@ -7069,6 +7094,32 @@
     }
   }
 
+  function finishDeviceKeyEnrollmentCompatibility(enrollmentId, scope) {
+    if (pendingDeviceEnrollment?.enrollmentId !== enrollmentId) {
+      return false;
+    }
+    pendingDeviceEnrollment = null;
+    // Servers predating register-key-ok don't acknowledge enrollment.
+    // Preserve their optimistic behavior after a bounded compatibility wait.
+    if (scope === authenticationScope()) {
+      hasDeviceKey = true;
+    }
+    return true;
+  }
+
+  function finishDeviceKeyEnrollment(payload) {
+    const pending = pendingDeviceEnrollment;
+    if (!pending || payload?.enrollmentId !== pending.enrollmentId) {
+      return false;
+    }
+    window.clearTimeout(pending.timer);
+    pendingDeviceEnrollment = null;
+    if (pending.scope === authenticationScope()) {
+      hasDeviceKey = payload.type === "register-key-ok" ? true : pending.previousHasDeviceKey;
+    }
+    return true;
+  }
+
   async function enrollDeviceKey(payload, enrollmentSocket = socket) {
     const enrollmentId = payload?.enrollmentId;
     const nonce = payload?.nonce;
@@ -7106,6 +7157,9 @@
       ) {
         return;
       }
+      const scope = authenticationScope(keyRealm);
+      const previousHasDeviceKey = hasDeviceKey;
+      cancelPendingDeviceEnrollment();
       enrollmentSocket.send(
         JSON.stringify({
           type: "register-key",
@@ -7118,9 +7172,14 @@
           signature,
         }),
       );
-      if (authenticationScope(keyRealm) === authenticationScope()) {
-        hasDeviceKey = true;
-      }
+      pendingDeviceEnrollment = {
+        enrollmentId,
+        scope,
+        previousHasDeviceKey,
+        timer: window.setTimeout(() => {
+          finishDeviceKeyEnrollmentCompatibility(enrollmentId, scope);
+        }, 3000),
+      };
     } catch (e) {
       /* enrollment is best-effort */
     }
@@ -7238,7 +7297,10 @@
       return true;
     }
     const elapsed = now - lastInteractionAt;
-    return elapsed < 0 || elapsed >= settings.idleMinutes * 60 * 1000;
+    if (elapsed < -AUTHENTICATION_TIMESTAMP_MAX_FUTURE_MS) {
+      return true;
+    }
+    return Math.max(0, elapsed) >= settings.idleMinutes * 60 * 1000;
   }
 
   async function runResumeDecision() {
@@ -7528,10 +7590,21 @@
       }
       if (event.code === 4001) {
         waitingForProxyAuth = false;
-        setPasskeyRetryUi(false);
+        const tokenRejected = event.reason === "token rejected";
+        const passkeyRetryAvailable = !tokenRejected && loginSupportsPasskey();
+        if (passkeyRetryAvailable) {
+          passkeyRequiredScope = authenticationScope(loginRealm);
+        }
+        setPasskeyRetryUi(passkeyRetryAvailable);
         loginOverlay.classList.remove("hidden");
-        loginMessage.textContent = "Authentication failed. Check the token and try again.";
-        localStorage.removeItem(tokenStorageKey());
+        loginMessage.textContent = tokenRejected
+          ? "Authentication failed. Check the token and try again."
+          : passkeyRetryAvailable
+            ? "Authentication was interrupted. Tap Use passkey to try again."
+            : "Authentication failed. Try again.";
+        if (tokenRejected) {
+          localStorage.removeItem(tokenStorageKey());
+        }
         scheduleAuthConfigPolling();
         return;
       }
@@ -7758,6 +7831,10 @@
       if (profileMenuOpen) renderProfileMenu();
       return;
     }
+    if (payload.type === "register-key-ok" || payload.type === "register-key-error") {
+      finishDeviceKeyEnrollment(payload);
+      return;
+    }
     if (payload.type === "enroll-key") {
       enrollDeviceKey(payload, socket);
       return;
@@ -7777,25 +7854,6 @@
       }
       waitingForProxyAuth = false;
       const completedPasskeyInteraction = passkeyInteractionPending;
-      passkeyInteractionPending = false;
-      passkeyRequiredScope = "";
-      passkeyRetryPending = false;
-      setPasskeyRetryUi(false);
-      if (completedPasskeyInteraction) {
-        recordUserInteraction(loginRealm, Date.now(), true);
-      }
-      if (serverConfig.profileMode && loginSupportsPasskey()) {
-        localStorage.removeItem(tokenStorageKey(activeProfile()?.authRealm || loginRealm));
-      }
-      if (serverConfig.profileMode && payload.principal) {
-        currentUserLabel = payload.principal;
-      }
-      resetComposerRevisionState();
-      resetSemanticPromptState();
-      resetTerminalBufferSyncState();
-      activePaneLocalScroll = Object.prototype.hasOwnProperty.call(payload, "paneLocalScroll")
-        ? payload.paneLocalScroll === true
-        : true;
       if (payload.multiTenant) {
         currentUser = payload.user || currentUser;
         currentUserLabel = payload.userLabel || currentUser;
@@ -7826,6 +7884,26 @@
           }
         }
       }
+      passkeyInteractionPending = false;
+      passkeyRequiredScope = "";
+      passkeyRetryPending = false;
+      setPasskeyRetryUi(false);
+      if (completedPasskeyInteraction) {
+        initialResumeDecisionMade = true;
+        recordUserInteraction(loginRealm, Date.now(), true);
+      }
+      if (serverConfig.profileMode && loginSupportsPasskey()) {
+        localStorage.removeItem(tokenStorageKey(activeProfile()?.authRealm || loginRealm));
+      }
+      if (serverConfig.profileMode && payload.principal) {
+        currentUserLabel = payload.principal;
+      }
+      resetComposerRevisionState();
+      resetSemanticPromptState();
+      resetTerminalBufferSyncState();
+      activePaneLocalScroll = Object.prototype.hasOwnProperty.call(payload, "paneLocalScroll")
+        ? payload.paneLocalScroll === true
+        : true;
       updateUserBadge();
       activeSessionName = payload.session || "";
       selectedSessionName = activeSessionName;
@@ -10151,22 +10229,7 @@
   document.fonts?.ready?.then(() => {
     scheduleLayoutRefresh();
   });
-  loadServerConfig()
-    // Learn whether this device already holds a silent key before deciding
-    // whether to prompt for a token, so enrolled devices never see the overlay.
-    .then(prepareAuthenticationClient, async () => {
-      resumeHandlingReady = true;
-      await resumeApplication();
-      return true;
-    })
-    .then((authenticationReady) => {
-      if (!serverConfig.requireToken) {
-        loginOverlay.classList.add("hidden");
-      }
-      if (authenticationReady) {
-        connect();
-      }
-    });
+  startAuthenticationClient();
 
   // Cache the UI shell for instant, round-trip-free loads. Only registers in a
   // secure context (HTTPS/localhost); over plain HTTP `navigator.serviceWorker`

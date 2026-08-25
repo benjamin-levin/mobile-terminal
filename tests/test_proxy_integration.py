@@ -609,6 +609,13 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                 "ben",
                 "test browser",
             )
+            self.assertEqual(
+                [message["type"] for message in connection.sent],
+                ["register-key-ok", "register-key-error"],
+            )
+            self.assertTrue(
+                all(message["enrollmentId"] == ticket.enrollment_id for message in connection.sent)
+            )
             self.assertEqual(pending, {})
 
     async def test_enrollment_rejects_bad_mismatch_expired_and_preserves_unrelated_ticket(self):
@@ -633,16 +640,26 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                 else:
                     now = ticket.expires_at
                 pending = {ticket.enrollment_id: ticket}
+                connection = StubConnection()
                 with (
                     mock.patch("proxy.time.monotonic", return_value=now),
                     mock.patch.object(proxy.device_keys, "register") as register,
                 ):
                     self.assertTrue(
                         await proxy._handle_device_key_message(
-                            StubConnection(), profile, "ben", pending, payload
+                            connection, profile, "ben", pending, payload
                         )
                     )
                 register.assert_not_called()
+                self.assertEqual(
+                    connection.sent,
+                    [
+                        {
+                            "type": "register-key-error",
+                            "enrollmentId": ticket.enrollment_id,
+                        }
+                    ],
+                )
                 self.assertEqual(pending, {})
 
         proxy, profile = self.passkey_proxy(StubPasskeys())

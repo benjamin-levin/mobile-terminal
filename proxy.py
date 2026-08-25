@@ -806,19 +806,27 @@ class ProxyServer:
                 del pending_enrollments[enrollment_id]
         if message_type == "register-key":
             enrollment_id = payload.get("enrollmentId")
-            if not isinstance(enrollment_id, str):
-                return True
-            enrollment = pending_enrollments.pop(enrollment_id, None)
-            if enrollment is None:
-                return True
-            if enrollment.verify(payload, now=now):
-                self.device_keys.register(
-                    enrollment.realm,
-                    enrollment.device_id,
-                    str(payload.get("publicKey", "")),
-                    enrollment.principal,
-                    connection.request.headers.get("User-Agent", "device"),
-                )
+            registered = False
+            if isinstance(enrollment_id, str):
+                enrollment = pending_enrollments.pop(enrollment_id, None)
+                if enrollment is not None and enrollment.verify(payload, now=now):
+                    try:
+                        registered = self.device_keys.register(
+                            enrollment.realm,
+                            enrollment.device_id,
+                            str(payload.get("publicKey", "")),
+                            enrollment.principal,
+                            connection.request.headers.get("User-Agent", "device"),
+                        )
+                    except OSError:
+                        registered = False
+            await self.send_json(
+                connection,
+                {
+                    "type": "register-key-ok" if registered else "register-key-error",
+                    "enrollmentId": enrollment_id if isinstance(enrollment_id, str) else "",
+                },
+            )
             return True
         if message_type == "forget-key":
             if (
