@@ -13,6 +13,11 @@ SW_JS = (ROOT / "static" / "sw.js").read_text()
 PASSKEY_JS = (ROOT / "static" / "passkey.js").read_text()
 
 
+def section(source, start_marker, end_marker):
+    start = source.index(start_marker)
+    return source[start : source.index(end_marker, start)]
+
+
 class ProfileClientWiringTest(unittest.TestCase):
     def test_profile_switch_protocol_and_ui_are_wired(self):
         for marker in (
@@ -61,6 +66,179 @@ class ProfileClientWiringTest(unittest.TestCase):
         )
         self.assertEqual(result.stdout, "true")
         self.assertGreaterEqual(APP_JS.count("loginRequiresToken()"), 3)
+
+    def test_profile_switch_is_transactional_and_reconnects_with_the_target(self):
+        switch_profile = section(
+            APP_JS,
+            "  function switchProfile(profileId)",
+            "  function renderSessionMenu()",
+        )
+        self.assertNotIn("localStorage", switch_profile)
+        self.assertNotIn("term.reset()", switch_profile)
+        script = "\n".join(
+            (
+                'const assert = require("node:assert/strict");',
+                'const WebSocket = { OPEN: 1 };',
+                'const profiles = [',
+                '  { id: "alpha", authRealm: "alpha-realm" },',
+                '  { id: "beta", authRealm: "beta-realm" },',
+                '];',
+                'let activeProfileId = "alpha";',
+                'let pendingProfileId = "";',
+                'let loginRealm = "alpha-realm";',
+                'let selectedSessionName = "alpha-session";',
+                'let terminalAuthoritative = true;',
+                'let socket = { readyState: WebSocket.OPEN };',
+                'let sendSucceeds = true;',
+                'let events = [];',
+                'function snapshotActiveSession() { events.push("snapshot"); }',
+                'function loadActiveSession(profileId) {',
+                '  events.push(`load-session:${profileId}`);',
+                '  return `${profileId}-session`;',
+                '}',
+                'function closeProfileMenu() { events.push("close-profile"); }',
+                'function closeSessionMenu() { events.push("close-session"); }',
+                'function closeTabMenu() { events.push("close-tab"); }',
+                'function sendMessage(payload) {',
+                '  events.push(["send", payload]);',
+                '  return sendSucceeds;',
+                '}',
+                'function reconnectSocket() { events.push("reconnect"); }',
+                'function loadActiveProfileState(previousProfileId) {',
+                '  events.push(`load-state:${previousProfileId}`);',
+                '}',
+                'function clearTerminalSelectionUI() { events.push("clear-selection"); }',
+                'function resetComposerTracking() { events.push("reset-composer"); }',
+                'function applyActiveProfile() { events.push("apply-profile"); }',
+                'function renderProfileMenu() { events.push("render-profile-menu"); }',
+                'function syncOpenTabsToSessions() { events.push("sync-tabs"); }',
+                switch_profile,
+                'switchProfile("beta");',
+                'assert.equal(activeProfileId, "beta");',
+                'assert.equal(pendingProfileId, "beta");',
+                'assert.equal(loginRealm, "beta-realm");',
+                'const sentIndex = events.findIndex((event) => Array.isArray(event));',
+                'assert.ok(sentIndex >= 0);',
+                'assert.deepEqual(events[sentIndex][1], {',
+                '  type: "switch-profile", profile: "beta", session: "beta-session",',
+                '});',
+                'assert.ok(sentIndex < events.indexOf("load-state:alpha"));',
+                'assert.ok(sentIndex < events.indexOf("clear-selection"));',
+                'events = [];',
+                'activeProfileId = "alpha";',
+                'pendingProfileId = "";',
+                'loginRealm = "alpha-realm";',
+                'terminalAuthoritative = true;',
+                'socket = { readyState: WebSocket.OPEN };',
+                'sendSucceeds = false;',
+                'switchProfile("beta");',
+                'assert.equal(activeProfileId, "alpha");',
+                'assert.equal(pendingProfileId, "beta");',
+                'assert.equal(loginRealm, "beta-realm");',
+                'assert.ok(events.some((event) => Array.isArray(event)));',
+                'assert.ok(events.includes("reconnect"));',
+                'assert.ok(!events.includes("load-state:alpha"));',
+                'assert.ok(!events.includes("clear-selection"));',
+                'events = [];',
+                'activeProfileId = "alpha";',
+                'pendingProfileId = "";',
+                'loginRealm = "alpha-realm";',
+                'socket = { readyState: 3 };',
+                'sendSucceeds = true;',
+                'switchProfile("beta");',
+                'assert.equal(activeProfileId, "alpha");',
+                'assert.equal(pendingProfileId, "beta");',
+                'assert.ok(!events.some((event) => Array.isArray(event)));',
+                'assert.ok(events.includes("reconnect"));',
+                'assert.ok(!events.includes("load-state:alpha"));',
+            )
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_profile_reconnect_url_and_ready_confirmation_use_pending_target(self):
+        ws_url = section(APP_JS, "  function wsUrl()", "  function stopAuthConfigPolling()")
+        update_inventory = section(
+            APP_JS,
+            "  function updateProfileInventory(",
+            "  function migrateLegacyProfileState(",
+        )
+        ready = section(
+            APP_JS,
+            '    if (payload.type === "ready")',
+            '    if (payload.type === "tabs")',
+        )
+        self.assertIn("profileSwitchConfirmed", ready)
+        self.assertIn("profileSwitchConfirmed,", ready)
+        script = "\n".join(
+            (
+                'const assert = require("node:assert/strict");',
+                'const window = { location: { href: "https://terminal.test/app", protocol: "https:" } };',
+                'let activeProfileId = "alpha";',
+                'let pendingProfileId = "beta";',
+                'let selectedSessionName = "alpha-session";',
+                'function loadActiveSession(profileId) { return `${profileId}-session`; }',
+                ws_url,
+                'let url = new URL(wsUrl());',
+                'assert.equal(url.searchParams.get("profile"), "beta");',
+                'assert.equal(url.searchParams.get("session"), "beta-session");',
+                'pendingProfileId = "";',
+                'url = new URL(wsUrl());',
+                'assert.equal(url.searchParams.get("profile"), "alpha");',
+                'assert.equal(url.searchParams.get("session"), "alpha-session");',
+                'let profiles = [',
+                '  { id: "alpha", authRealm: "alpha-realm" },',
+                '  { id: "beta", authRealm: "beta-realm" },',
+                '];',
+                'pendingProfileId = "beta";',
+                'let loginRealm = "alpha-realm";',
+                'const writes = [];',
+                'const loaded = [];',
+                'const scopes = [];',
+                'const deviceRealms = [];',
+                'const STORAGE_ACTIVE_PROFILE_KEY = "active-profile";',
+                'const localStorage = { setItem: (key, value) => writes.push([key, value]) };',
+                'let profileMenuOpen = false;',
+                'function activeProfile() {',
+                '  return profiles.find((profile) => profile.id === activeProfileId) || null;',
+                '}',
+                'function applyAuthenticationScope(realm) { scopes.push(realm); }',
+                'function refreshDeviceKeyFlag(realm) { deviceRealms.push(realm); }',
+                'function loadActiveProfileState(profileId) { loaded.push(profileId); }',
+                'function applyActiveProfile() {}',
+                'function renderProfileMenu() {}',
+                'function positionProfileMenu() {}',
+                update_inventory,
+                'updateProfileInventory(profiles, "beta");',
+                'assert.equal(activeProfileId, "alpha");',
+                'assert.deepEqual(writes, []);',
+                'assert.deepEqual(loaded, []);',
+                'updateProfileInventory(profiles, "beta", true);',
+                'assert.equal(activeProfileId, "beta");',
+                'assert.equal(loginRealm, "beta-realm");',
+                'assert.deepEqual(writes, [["active-profile", "beta"]]);',
+                'assert.deepEqual(loaded, ["alpha"]);',
+                'assert.deepEqual(scopes, ["beta-realm"]);',
+                'assert.deepEqual(deviceRealms, ["beta-realm"]);',
+                'writes.length = 0;',
+                'loaded.length = 0;',
+                'updateProfileInventory(profiles, "beta", true);',
+                'assert.deepEqual(writes, [["active-profile", "beta"]]);',
+                'assert.deepEqual(loaded, []);',
+            )
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_proxy_shell_and_message_router_load_passkey_helper(self):
         self.assertIn('<script defer src="/static/passkey.js"></script>', PROXY_PY)

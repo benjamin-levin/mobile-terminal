@@ -525,7 +525,7 @@ assert.deepEqual(
         self.assertIn("dismissTerminalSelection();", to_tab)
         self.assertIn(
             "clearTerminalSelectionUI();\n    terminalAuthoritative = false;\n"
-            "    resetComposerTracking(true);\n    term.reset();",
+            "    resetComposerTracking(true);",
             switch_profile,
         )
         self.assertIn("resetTerminalInteractionState();", switch_session)

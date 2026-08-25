@@ -3374,11 +3374,13 @@
 
   function wsUrl() {
     const url = new URL("/_ws", window.location.href);
-    if (activeProfileId) {
-      url.searchParams.set("profile", activeProfileId);
+    const profileId = pendingProfileId || activeProfileId;
+    const sessionName = pendingProfileId ? loadActiveSession(profileId) : selectedSessionName;
+    if (profileId) {
+      url.searchParams.set("profile", profileId);
     }
-    if (selectedSessionName) {
-      url.searchParams.set("session", selectedSessionName);
+    if (sessionName) {
+      url.searchParams.set("session", sessionName);
     }
     url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     return url.toString();
@@ -4398,20 +4400,30 @@
     profileButton.setAttribute("aria-expanded", profileMenuOpen ? "true" : "false");
   }
 
-  function updateProfileInventory(nextProfiles, nextActiveProfile = activeProfileId) {
+  function updateProfileInventory(
+    nextProfiles,
+    nextActiveProfile = activeProfileId,
+    confirmPendingProfile = false,
+  ) {
     if (Array.isArray(nextProfiles)) {
       profiles = nextProfiles;
     }
-    if (nextActiveProfile && nextActiveProfile !== activeProfileId) {
+    const canUpdateActiveProfile = !pendingProfileId || confirmPendingProfile;
+    const activeProfileChanged = nextActiveProfile !== activeProfileId;
+    if (
+      nextActiveProfile &&
+      canUpdateActiveProfile &&
+      (activeProfileChanged || confirmPendingProfile)
+    ) {
       const previousProfileId = activeProfileId;
       activeProfileId = nextActiveProfile;
       localStorage.setItem(STORAGE_ACTIVE_PROFILE_KEY, activeProfileId);
-      if (!pendingProfileId) {
-        loginRealm = activeProfile()?.authRealm || "";
-        applyAuthenticationScope(loginRealm);
-        refreshDeviceKeyFlag(loginRealm);
+      loginRealm = activeProfile()?.authRealm || "";
+      applyAuthenticationScope(loginRealm);
+      refreshDeviceKeyFlag(loginRealm);
+      if (activeProfileChanged) {
+        loadActiveProfileState(previousProfileId);
       }
-      loadActiveProfileState(previousProfileId);
     }
     applyActiveProfile();
     if (profileMenuOpen) {
@@ -6272,24 +6284,35 @@
       return;
     }
 
-    snapshotActiveSession();
-    const previousProfileId = activeProfileId;
-    activeProfileId = profileId;
-    loginRealm = profile.authRealm || "";
-    pendingProfileId = profileId;
-    localStorage.setItem(STORAGE_ACTIVE_PROFILE_KEY, activeProfileId);
-    loadActiveProfileState(previousProfileId);
+    if (!pendingProfileId) {
+      snapshotActiveSession();
+    }
+    const targetSessionName = loadActiveSession(profileId);
     closeProfileMenu();
     closeSessionMenu();
     closeTabMenu();
+    if (
+      !socket ||
+      socket.readyState !== WebSocket.OPEN ||
+      !sendMessage({ type: "switch-profile", profile: profileId, session: targetSessionName })
+    ) {
+      pendingProfileId = profileId;
+      loginRealm = profile.authRealm || "";
+      reconnectSocket();
+      return;
+    }
+
+    const previousProfileId = activeProfileId;
+    pendingProfileId = profileId;
+    activeProfileId = profileId;
+    loginRealm = profile.authRealm || "";
+    loadActiveProfileState(previousProfileId);
     clearTerminalSelectionUI();
     terminalAuthoritative = false;
     resetComposerTracking(true);
-    term.reset();
     applyActiveProfile();
     renderProfileMenu();
     syncOpenTabsToSessions();
-    sendMessage({ type: "switch-profile", profile: profileId, session: selectedSessionName });
   }
 
   function renderSessionMenu() {
@@ -8239,10 +8262,17 @@
       resetTerminalInteractionState();
       const readyIsHidden = document.visibilityState === "hidden";
       applyTerminalReadyVisibility(readyIsHidden);
+      const profileSwitchConfirmed = Boolean(
+        pendingProfileId && payload.activeProfile === pendingProfileId
+      );
       if (Array.isArray(payload.profiles) || payload.activeProfile) {
-        updateProfileInventory(payload.profiles, payload.activeProfile);
+        updateProfileInventory(
+          payload.profiles,
+          payload.activeProfile,
+          profileSwitchConfirmed,
+        );
       }
-      if (!pendingProfileId || payload.activeProfile === pendingProfileId) {
+      if (!pendingProfileId || profileSwitchConfirmed) {
         pendingProfileId = "";
       }
       waitingForProxyAuth = false;
@@ -9948,9 +9978,16 @@
     }
     if (pendingProfileId && socket && socket.readyState === WebSocket.OPEN) {
       const profileId = pendingProfileId;
-      pendingProfileId = "";
       loginOverlay.classList.add("hidden");
-      sendMessage({ type: "switch-profile", profile: profileId, session: loadActiveSession(profileId) });
+      if (
+        !sendMessage({
+          type: "switch-profile",
+          profile: profileId,
+          session: loadActiveSession(profileId),
+        })
+      ) {
+        reconnectSocket();
+      }
       return;
     }
     connect();
