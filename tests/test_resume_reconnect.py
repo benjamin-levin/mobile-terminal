@@ -321,7 +321,11 @@ class ResumeReconnectWiringTest(unittest.TestCase):
             record.group(0).index("setPasskeyLocked(true);"),
             record.group(0).index("writeBackgroundedAt(realm, backgroundedAt);"),
         )
-        self.assertIn('window.addEventListener("pagehide", recordBackgrounded);', self.source)
+        pagehide = self.source[self.source.index('window.addEventListener("pagehide", (event) => {') :]
+        pagehide = pagehide[: pagehide.index("  });")]
+        self.assertIn("clearActiveShortcutRepeatTimers();", pagehide)
+        self.assertIn("cancelPasskeyCeremony();", pagehide)
+        self.assertIn("recordBackgrounded(event);", pagehide)
 
 
     def test_real_interaction_is_realm_scoped_and_persisted_without_a_timer(self):

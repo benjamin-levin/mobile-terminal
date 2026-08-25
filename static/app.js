@@ -44,6 +44,9 @@
   const FILE_BOOKMARK_LIMIT = 40;
   const ACTIVITY_REPORT_INTERVAL_MS = 1000;
   const FORCED_ACTIVITY_DEDUPE_MS = 250;
+  const IDB_TIMEOUT_MS = 3000;
+  const SERVICE_WORKER_EARLY_RELOAD_MS = 5000;
+  const clientStartedAt = performance.now();
   let decoder = new TextDecoder();
   const defaultShortcuts = [
     { label: "Esc", sequence: "{ESC}", visible: true },
@@ -227,6 +230,7 @@
   let passkeyRetryPending = false;
   let passkeyInteractionPending = false;
   let passkeyCeremonyController = null;
+  let passkeyCeremonyPromise = null;
   let pendingDeviceEnrollment = null;
   let resumeDecisionPromise = null;
   let resumeHandlingReady = false;
@@ -234,6 +238,8 @@
   let handledResumeMarker = "";
   let backgroundRecordedScope = "";
   let terminalReadyWhileHidden = false;
+  let serviceWorkerReloaded = false;
+  let serviceWorkerReloadDeferred = false;
 
   function normalizeAuthenticationSettings(raw) {
     const source = raw && typeof raw === "object" ? raw : {};
@@ -414,24 +420,77 @@
   }
   function idbOpen() {
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open(DEVICE_KEY_DB, 1);
-      req.onupgradeneeded = () => req.result.createObjectStore(DEVICE_KEY_STORE);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      let settled = false;
+      let req;
+      const timer = window.setTimeout(() => {
+        settled = true;
+        reject(new Error("IndexedDB open timed out"));
+      }, IDB_TIMEOUT_MS);
+      try {
+        req = indexedDB.open(DEVICE_KEY_DB, 1);
+      } catch (error) {
+        window.clearTimeout(timer);
+        reject(error);
+        return;
+      }
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains(DEVICE_KEY_STORE)) {
+          req.result.createObjectStore(DEVICE_KEY_STORE);
+        }
+      };
+      req.onsuccess = () => {
+        if (settled) {
+          req.result.close();
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timer);
+        resolve(req.result);
+      };
+      req.onerror = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        reject(req.error);
+      };
     });
   }
-  function idbRun(mode, fn) {
-    return idbOpen().then(
-      (db) =>
-        new Promise((resolve, reject) => {
-          const tx = db.transaction(DEVICE_KEY_STORE, mode);
-          const store = tx.objectStore(DEVICE_KEY_STORE);
-          const out = fn(store);
-          tx.oncomplete = () => resolve(out && out.result !== undefined ? out.result : undefined);
-          tx.onerror = () => reject(tx.error);
-          tx.onabort = () => reject(tx.error);
-        }),
-    );
+  async function idbRun(mode, fn) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let tx;
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        db.close();
+        if (error) {
+          reject(error);
+        } else {
+          resolve(value);
+        }
+      };
+      const timer = window.setTimeout(() => {
+        try {
+          tx?.abort();
+        } catch (_error) {
+          // A completed transaction cannot be aborted.
+        }
+        finish(new Error("IndexedDB transaction timed out"));
+      }, IDB_TIMEOUT_MS);
+      try {
+        tx = db.transaction(DEVICE_KEY_STORE, mode);
+        const store = tx.objectStore(DEVICE_KEY_STORE);
+        const out = fn(store);
+        tx.oncomplete = () =>
+          finish(null, out && out.result !== undefined ? out.result : undefined);
+        tx.onerror = () => finish(tx.error || new Error("IndexedDB transaction failed"));
+        tx.onabort = () => finish(tx.error || new Error("IndexedDB transaction aborted"));
+      } catch (error) {
+        finish(error);
+      }
+    });
   }
   async function loadDeviceKey(realm = loginRealm) {
     if (!deviceKeySupported()) return null;
@@ -626,6 +685,7 @@
   let selectionRequestCounter = 0;
   const pendingSelectionRequests = new Map();
   let reconnectTimer = null;
+  let connectionGeneration = 0;
   let resumeProbeTimer = null;
   let socketConnectStartedAt = 0;
   let lastServerMessageAt = 0;
@@ -702,6 +762,7 @@
   let suppressTabClickUntil = 0;
   let shortcutDragState = null;
   let suppressShortcutClickUntil = 0;
+  const activeShortcutRepeatTimers = new Set();
   let speechInputState = {
     lastPhrase: "",
     lastAt: 0,
@@ -4675,11 +4736,16 @@
     return sequence;
   }
 
-  async function applyTerminalSeed(payload) {
+  function connectionGenerationIsCurrent(generation) {
+    return generation === connectionGeneration;
+  }
+
+  async function applyTerminalSeed(payload, generation = connectionGeneration) {
     const meta = payload.meta;
     if (!meta || !Array.isArray(payload.physicalRows)) {
       throw new Error("Invalid terminal seed");
     }
+    if (!connectionGenerationIsCurrent(generation)) return false;
     decoder = new TextDecoder();
     term.resize(Number(meta.cols), Number(meta.rows));
     let reset = `\x1b[?1049l${terminalReplayBaselineSequence()}\x1b[3J\x1b[2J\x1b[H`;
@@ -4687,9 +4753,13 @@
       reset += `\x1b[?1049h${terminalReplayBaselineSequence()}\x1b[2J\x1b[H`;
     }
     await writeTerminal(reset);
+    if (!connectionGenerationIsCurrent(generation)) return false;
     await writeTerminal(terminalTabStopsSequence(meta));
+    if (!connectionGenerationIsCurrent(generation)) return false;
     await writeTerminal(payload.physicalRows.join("\r\n"));
+    if (!connectionGenerationIsCurrent(generation)) return false;
     await writeTerminal(terminalModeSequence(meta));
+    if (!connectionGenerationIsCurrent(generation)) return false;
     terminalEpoch = Number(payload.epoch);
     terminalPaneId = String(payload.paneId || meta.paneId || "");
     terminalCutoff = Number(payload.cutoff);
@@ -4700,9 +4770,11 @@
     pendingSeedScrollTarget = Number.isFinite(Number(payload.scrollTarget))
       ? Number(payload.scrollTarget)
       : null;
+    return true;
   }
 
-  async function handleTerminalBinary(data) {
+  async function handleTerminalBinary(data, generation = connectionGeneration) {
+    if (!connectionGenerationIsCurrent(generation)) return false;
     const metadata = pendingTerminalOutput;
     pendingTerminalOutput = null;
     if (!metadata) {
@@ -4711,7 +4783,9 @@
     let chunk = data;
     if (chunk instanceof Blob) {
       chunk = await chunk.arrayBuffer();
+      if (!connectionGenerationIsCurrent(generation)) return false;
     }
+    if (!connectionGenerationIsCurrent(generation)) return false;
     const bytes = new Uint8Array(chunk);
     if (
       String(metadata.paneId || "") !== terminalPaneId ||
@@ -4724,9 +4798,10 @@
     }
     if (!terminalAuthoritative && metadata.kind === "live") {
       terminalRevision = Number(metadata.end);
-      return;
+      return true;
     }
     await writeTerminal(decoder.decode(bytes, { stream: true }));
+    if (!connectionGenerationIsCurrent(generation)) return false;
     terminalRevision = Number(metadata.end);
     if (followOutput || performance.now() < bottomPinUntil) {
       term.scrollToBottom();
@@ -4737,6 +4812,7 @@
     if (terminalHorizontallyOverflows()) {
       scheduleLayoutRefresh();
     }
+    return true;
   }
 
   function scheduleLayoutRefresh({ preserveTerminalCols = false } = {}) {
@@ -6105,7 +6181,15 @@
     });
   }
 
+  function clearActiveShortcutRepeatTimers() {
+    for (const timer of activeShortcutRepeatTimers) {
+      window.clearTimeout(timer);
+    }
+    activeShortcutRepeatTimers.clear();
+  }
+
   function renderShortcutBar() {
+    clearActiveShortcutRepeatTimers();
     shortcutBar.innerHTML = "";
     shortcuts.filter((shortcut) => shortcut.visible !== false).forEach((shortcut) => {
       const button = document.createElement("button");
@@ -6122,6 +6206,8 @@
       const clearRepeatTimers = () => {
         window.clearTimeout(repeatDelayTimer);
         window.clearInterval(repeatIntervalTimer);
+        activeShortcutRepeatTimers.delete(repeatDelayTimer);
+        activeShortcutRepeatTimers.delete(repeatIntervalTimer);
         repeatDelayTimer = null;
         repeatIntervalTimer = null;
       };
@@ -6179,6 +6265,11 @@
           if (event.pointerType === "mouse" && event.button !== 0) {
             return;
           }
+          try {
+            button.setPointerCapture(event.pointerId);
+          } catch (_error) {
+            // Pointer capture is unavailable for a pointer that already ended.
+          }
           shortcutKeyboardWasFocused = composerHasKeyboardFocus();
           preserveComposerFocus = shortcutKeyboardWasFocused;
           if (preserveComposerFocus) {
@@ -6190,12 +6281,16 @@
             return;
           }
           repeatDelayTimer = window.setTimeout(() => {
+            activeShortcutRepeatTimers.delete(repeatDelayTimer);
+            repeatDelayTimer = null;
             suppressClickAfterRepeat = true;
             activateShortcut();
             repeatIntervalTimer = window.setInterval(() => {
               activateShortcut();
             }, SHORTCUT_REPEAT_INTERVAL_MS);
+            activeShortcutRepeatTimers.add(repeatIntervalTimer);
           }, SHORTCUT_REPEAT_DELAY_MS);
+          activeShortcutRepeatTimers.add(repeatDelayTimer);
         },
         { passive: false },
       );
@@ -7393,19 +7488,34 @@
     if (resumeDecisionPromise) {
       return resumeDecisionPromise;
     }
-    resumeDecisionPromise = (async () => {
+    const decision = (async () => {
       if (document.visibilityState === "hidden") {
         await waitForVisibleResume();
       }
       return runResumeDecision();
-    })().finally(() => {
-      resumeDecisionPromise = null;
+    })();
+    const trackedDecision = decision.finally(() => {
+      if (resumeDecisionPromise === trackedDecision) {
+        resumeDecisionPromise = null;
+      }
     });
-    return resumeDecisionPromise;
+    resumeDecisionPromise = trackedDecision;
+    return trackedDecision;
+  }
+
+  function scheduleConnect(delay) {
+    window.clearTimeout(reconnectTimer);
+    const scheduledGeneration = connectionGeneration;
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      if (!connectionGenerationIsCurrent(scheduledGeneration)) return;
+      connect();
+    }, delay);
   }
 
   function reconnectSocket() {
     cancelPasskeyCeremony();
+    clearActiveShortcutRepeatTimers();
     window.clearTimeout(reconnectTimer);
     window.clearTimeout(resumeProbeTimer);
     reconnectTimer = null;
@@ -7459,6 +7569,27 @@
   }
 
   function connect() {
+    window.clearTimeout(reconnectTimer);
+    window.clearTimeout(resumeProbeTimer);
+    reconnectTimer = null;
+    resumeProbeTimer = null;
+    cancelPasskeyCeremony();
+    clearActiveShortcutRepeatTimers();
+    const previousSocket = socket;
+    socket = null;
+    connectionGeneration += 1;
+    reconnectForSessionSwitch = false;
+    if (
+      previousSocket &&
+      (previousSocket.readyState === WebSocket.CONNECTING || previousSocket.readyState === WebSocket.OPEN)
+    ) {
+      try {
+        previousSocket.close();
+      } catch (_error) {
+        // A dead iOS socket may already be detached from its network process.
+      }
+    }
+
     const token = localStorage.getItem(tokenStorageKey());
     currentUser = localStorage.getItem(STORAGE_USER_KEY) || "";
     // Auto-login by Tailscale identity (behind `tailscale serve`): the server
@@ -7481,10 +7612,6 @@
       return;
     }
 
-    window.clearTimeout(reconnectTimer);
-    window.clearTimeout(resumeProbeTimer);
-    reconnectTimer = null;
-    resumeProbeTimer = null;
     stopAuthConfigPolling();
     loginOverlay.classList.add("hidden");
 
@@ -7503,6 +7630,7 @@
     }
     socketConnectStartedAt = performance.now();
     const thisSocket = socket;
+    const thisConnectionGeneration = connectionGeneration;
     socket.binaryType = "arraybuffer";
     socketMessageChain = Promise.resolve();
     pendingTerminalOutput = null;
@@ -7529,7 +7657,10 @@
     });
 
     const processSocketMessage = async (event) => {
-      if (socket !== thisSocket) {
+      if (
+        socket !== thisSocket ||
+        !connectionGenerationIsCurrent(thisConnectionGeneration)
+      ) {
         return;
       }
       lastServerMessageAt = performance.now();
@@ -7537,18 +7668,21 @@
       resumeProbeTimer = null;
       if (typeof event.data === "string") {
         const payload = JSON.parse(event.data);
-        await handleServerMessage(payload);
+        await handleServerMessage(payload, thisConnectionGeneration, thisSocket);
         return;
       }
-      await handleTerminalBinary(event.data);
+      await handleTerminalBinary(event.data, thisConnectionGeneration);
     };
     const onSocketMessage = (event) => {
       socketMessageChain = socketMessageChain
         .then(() => processSocketMessage(event))
         .catch((error) => {
           console.error(error);
-          terminalAuthoritative = false;
-          if (socket === thisSocket) {
+          if (
+            socket === thisSocket &&
+            connectionGenerationIsCurrent(thisConnectionGeneration)
+          ) {
+            terminalAuthoritative = false;
             reconnectSocket();
           }
         });
@@ -7566,6 +7700,9 @@
       if (socket !== thisSocket) {
         return;
       }
+      connectionGeneration += 1;
+      cancelPasskeyCeremony();
+      clearActiveShortcutRepeatTimers();
       terminalAuthoritative = false;
       resetDeliveredTerminalSize();
       updateProfileConnectionState();
@@ -7573,7 +7710,7 @@
       resumeProbeTimer = null;
       if (reconnectForSessionSwitch) {
         reconnectForSessionSwitch = false;
-        window.setTimeout(connect, 80);
+        scheduleConnect(80);
         return;
       }
       if (passkeyRetryPending) {
@@ -7612,7 +7749,7 @@
         showToast("This device is not allowed to connect.");
         return;
       }
-      reconnectTimer = window.setTimeout(connect, 1500);
+      scheduleConnect(1500);
     });
   }
 
@@ -7638,7 +7775,96 @@
     tokenInput.focus();
   }
 
-  async function handleServerMessage(payload) {
+  function startPasskeyCeremony(
+    payload,
+    authenticationSocket = socket,
+    generation = connectionGeneration,
+  ) {
+    cancelPasskeyCeremony();
+    const ceremonyController =
+      typeof AbortController === "function" ? new AbortController() : null;
+    passkeyCeremonyController = ceremonyController;
+    const authenticatingExistingPasskey = payload.type === "webauthn-auth-options";
+    const ceremony = (async () => {
+      waitingForProxyAuth = true;
+      pendingProfileId = payload.profile || pendingProfileId || activeProfileId;
+      const authenticationRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
+      try {
+        if (serverConfig.profileMode && authenticationRealm) {
+          await applyAuthoritativeAuthenticationScope(authenticationRealm);
+        } else {
+          loginRealm = authenticationRealm;
+        }
+        if (
+          !connectionGenerationIsCurrent(generation) ||
+          authenticationSocket !== socket ||
+          ceremonyController?.signal.aborted
+        ) {
+          return;
+        }
+        if (authenticatingExistingPasskey) {
+          passkeyRequiredScope = passkeyRequiredScope || authenticationScope(loginRealm);
+        }
+        passkeyRetryPending = true;
+        const sendAuthenticationMessage = (message) => {
+          if (
+            !connectionGenerationIsCurrent(generation) ||
+            authenticationSocket !== socket ||
+            authenticationSocket?.readyState !== WebSocket.OPEN
+          ) {
+            return;
+          }
+          authenticationSocket.send(JSON.stringify(message));
+        };
+        if (
+          await window.MobileTerminalPasskeys.handleMessage(
+            payload,
+            sendAuthenticationMessage,
+            ceremonyController?.signal,
+          )
+        ) {
+          if (
+            connectionGenerationIsCurrent(generation) &&
+            authenticationSocket === socket
+          ) {
+            passkeyInteractionPending = true;
+          }
+        }
+      } catch (_error) {
+        passkeyInteractionPending = false;
+        if (
+          !connectionGenerationIsCurrent(generation) ||
+          authenticationSocket !== socket ||
+          ceremonyController?.signal.aborted
+        ) {
+          return;
+        }
+        waitingForProxyAuth = false;
+        setPasskeyLocked(true);
+        setPasskeyRetryUi(authenticatingExistingPasskey);
+        loginOverlay.classList.remove("hidden");
+        loginMessage.textContent = authenticatingExistingPasskey
+          ? "A passkey is required to reveal the terminal. Tap Use passkey to try again."
+          : "Passkey setup was not completed. Enter the access token to try again.";
+        try {
+          authenticationSocket.close(4000, "passkey retry");
+        } catch (_closeError) {
+          // Ignore a socket already closed by the failed authentication.
+        }
+      }
+    })();
+    const trackedCeremony = ceremony.finally(() => {
+      if (passkeyCeremonyController === ceremonyController) {
+        passkeyCeremonyController = null;
+      }
+      if (passkeyCeremonyPromise === trackedCeremony) {
+        passkeyCeremonyPromise = null;
+      }
+    });
+    passkeyCeremonyPromise = trackedCeremony;
+  }
+
+  async function handleServerMessage(payload, generation, messageSocket) {
     if (payload.type === "terminal-output") {
       if (pendingTerminalOutput) {
         terminalAuthoritative = false;
@@ -7668,9 +7894,17 @@
       if (!pendingTerminalSeed || Number(pendingTerminalSeed.epoch) !== Number(payload.epoch)) {
         throw new Error("Terminal seed ended without matching data");
       }
-      await applyTerminalSeed(pendingTerminalSeed);
+      const seed = pendingTerminalSeed;
+      if (!(await applyTerminalSeed(seed, generation))) return;
+      if (
+        !connectionGenerationIsCurrent(generation) ||
+        messageSocket !== socket ||
+        messageSocket?.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
       pendingTerminalSeed = null;
-      sendMessage({ type: "seed-ack", epoch: payload.epoch });
+      messageSocket.send(JSON.stringify({ type: "seed-ack", epoch: payload.epoch }));
       return;
     }
     if (payload.type === "post-flush") {
@@ -7729,67 +7963,8 @@
       window.MobileTerminalPasskeys &&
       (payload.type === "webauthn-auth-options" || payload.type === "webauthn-register-options")
     ) {
-      waitingForProxyAuth = true;
-      pendingProfileId = payload.profile || pendingProfileId || activeProfileId;
-      const authenticationRealm = payload.realm || activeProfile()?.authRealm || loginRealm;
-      if (serverConfig.profileMode && authenticationRealm) {
-        await applyAuthoritativeAuthenticationScope(authenticationRealm);
-      } else {
-        loginRealm = authenticationRealm;
-      }
-      const authenticatingExistingPasskey = payload.type === "webauthn-auth-options";
-      if (authenticatingExistingPasskey) {
-        passkeyRequiredScope = passkeyRequiredScope || authenticationScope(loginRealm);
-      }
-      passkeyRetryPending = true;
-      const authenticationSocket = socket;
-      cancelPasskeyCeremony();
-      const ceremonyController =
-        typeof AbortController === "function" ? new AbortController() : null;
-      passkeyCeremonyController = ceremonyController;
-      const sendAuthenticationMessage = (message) => {
-        if (
-          authenticationSocket !== socket ||
-          authenticationSocket?.readyState !== WebSocket.OPEN
-        ) {
-          return;
-        }
-        authenticationSocket.send(JSON.stringify(message));
-      };
-      try {
-        if (
-          await window.MobileTerminalPasskeys.handleMessage(
-            payload,
-            sendAuthenticationMessage,
-            ceremonyController?.signal,
-          )
-        ) {
-          passkeyInteractionPending = true;
-          return;
-        }
-      } catch (_error) {
-        passkeyInteractionPending = false;
-        if (authenticationSocket !== socket) {
-          return;
-        }
-        waitingForProxyAuth = false;
-        setPasskeyLocked(true);
-        setPasskeyRetryUi(authenticatingExistingPasskey);
-        loginOverlay.classList.remove("hidden");
-        loginMessage.textContent = authenticatingExistingPasskey
-          ? "A passkey is required to reveal the terminal. Tap Use passkey to try again."
-          : "Passkey setup was not completed. Enter the access token to try again.";
-        try {
-          authenticationSocket?.close(4000, "passkey retry");
-        } catch (_closeError) {
-          // Ignore a socket already closed by the failed authentication.
-        }
-        return;
-      } finally {
-        if (passkeyCeremonyController === ceremonyController) {
-          passkeyCeremonyController = null;
-        }
-      }
+      startPasskeyCeremony(payload, messageSocket, generation);
+      return;
     }
     if (String(payload.type || "").startsWith("fs-")) {
       handleFileServerMessage(payload);
@@ -10150,12 +10325,18 @@
   });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
+      clearActiveShortcutRepeatTimers();
+      cancelPasskeyCeremony();
       recordBackgrounded();
     } else if (document.visibilityState === "visible") {
       resumeApplication();
     }
   });
-  window.addEventListener("pagehide", recordBackgrounded);
+  window.addEventListener("pagehide", (event) => {
+    clearActiveShortcutRepeatTimers();
+    cancelPasskeyCeremony();
+    recordBackgrounded(event);
+  });
   document.addEventListener("keydown", () => recordUserInteraction(), { capture: true });
   document.addEventListener("paste", () => recordUserInteraction(), { capture: true });
   window.addEventListener("online", () => resumeApplication());
@@ -10235,6 +10416,30 @@
   // secure context (HTTPS/localhost); over plain HTTP `navigator.serviceWorker`
   // is undefined, so this is a harmless no-op until the app is served via HTTPS.
   if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (serviceWorkerReloaded || serviceWorkerReloadDeferred) return;
+      const reload = () => {
+        if (serviceWorkerReloaded) return;
+        serviceWorkerReloaded = true;
+        window.location.reload();
+      };
+      if (
+        document.visibilityState === "hidden" ||
+        performance.now() - clientStartedAt <= SERVICE_WORKER_EARLY_RELOAD_MS
+      ) {
+        reload();
+        return;
+      }
+      serviceWorkerReloadDeferred = true;
+      const reloadWhenInactive = (event) => {
+        if (event.type !== "pagehide" && document.visibilityState !== "hidden") return;
+        document.removeEventListener("visibilitychange", reloadWhenInactive);
+        window.removeEventListener("pagehide", reloadWhenInactive);
+        reload();
+      };
+      document.addEventListener("visibilitychange", reloadWhenInactive);
+      window.addEventListener("pagehide", reloadWhenInactive);
+    });
     window.addEventListener("load", () => {
       navigator.serviceWorker.register("/sw.js").catch(() => {});
     });

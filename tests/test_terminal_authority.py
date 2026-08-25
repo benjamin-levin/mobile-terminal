@@ -4185,14 +4185,14 @@ class ClientProtocolSourceTest(unittest.TestCase):
 
     def test_socket_frames_and_seed_acks_share_one_ordered_chain(self):
         self.assertIn("socketMessageChain = socketMessageChain", self.source)
-        self.assertIn("await handleTerminalBinary(event.data);", self.source)
+        self.assertIn("await handleTerminalBinary(event.data, thisConnectionGeneration);", self.source)
         self.assertIn('type: "seed-start-ack"', self.source)
         self.assertIn('type: "seed-ack"', self.source)
         self.assertIn('type: "post-flush-ack"', self.source)
         self.assertIn("await writeTerminal(terminalModeSequence(meta));", self.source)
         self.assertLess(
             self.source.index("await writeTerminal(terminalModeSequence(meta));"),
-            self.source.index('sendMessage({ type: "seed-ack", epoch: payload.epoch });'),
+            self.source.index('messageSocket.send(JSON.stringify({ type: "seed-ack", epoch: payload.epoch }));'),
         )
 
     def test_client_resize_delivery_replays_pending_desired_geometry(self):
@@ -4267,8 +4267,8 @@ class ClientProtocolSourceTest(unittest.TestCase):
         ):
             self.assertIn(sequence, baseline)
 
-        seed_start = self.source.index("  async function applyTerminalSeed(payload)")
-        seed_end = self.source.index("  async function handleTerminalBinary(data)", seed_start)
+        seed_start = self.source.index("  async function applyTerminalSeed(payload, generation = connectionGeneration)")
+        seed_end = self.source.index("  async function handleTerminalBinary(data, generation = connectionGeneration)", seed_start)
         seed = self.source[seed_start:seed_end]
         reset = "await writeTerminal(reset);"
         tabs = "await writeTerminal(terminalTabStopsSequence(meta));"
@@ -4280,7 +4280,7 @@ class ClientProtocolSourceTest(unittest.TestCase):
         self.assertLess(seed.index(rows), seed.index(modes))
         self.assertLess(
             self.source.index(modes),
-            self.source.index('sendMessage({ type: "seed-ack", epoch: payload.epoch });'),
+            self.source.index('messageSocket.send(JSON.stringify({ type: "seed-ack", epoch: payload.epoch }));'),
         )
 
     def test_normal_history_grows_by_reseed_without_copy_mode_fallback(self):

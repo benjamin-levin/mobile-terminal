@@ -4,13 +4,12 @@
  * never registers, so it's a no-op until the app is fronted by HTTPS (e.g.
  * `tailscale serve`), at which point it activates automatically.
  *
- * Strategy: stale-while-revalidate for same-origin GETs. The app shell (HTML,
- * xterm, app.js, CSS, icons) is served from the local Cache instantly with zero
- * network round-trips, then refreshed in the background — so a client far from
- * the server (e.g. Japan -> US) boots the UI immediately and only the WebSocket
- * pays the distance. At most one load is stale after a deploy; the next is fresh.
+ * Strategy: network-first for navigations so a deployed app shell is visible on
+ * the next open, with a short timeout and cached fallback for slow/offline links.
+ * Static assets remain stale-while-revalidate for instant repeat loads.
  */
-const CACHE = "mobile-terminal-v19";
+const CACHE = "mobile-terminal-v20";
+const NAVIGATION_TIMEOUT_MS = 2500;
 // The app shell (xterm, app.js, CSS) is inlined into the HTML, so caching "/"
 // caches everything needed to boot; icons/manifest are cached on demand.
 const PRECACHE = ["/"];
@@ -34,6 +33,40 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+function cacheNetworkResponse(cache, request, response) {
+  if (!response || response.status !== 200 || response.type !== "basic") {
+    return Promise.resolve(response);
+  }
+  return cache.put(request, response.clone()).then(() => response);
+}
+
+async function navigationResponse(request) {
+  const cache = await caches.open(CACHE);
+  const cached = (await cache.match(request)) || (await cache.match("/"));
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  let timeout = null;
+  const timedOut = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      controller?.abort();
+      reject(new Error("Navigation request timed out"));
+    }, NAVIGATION_TIMEOUT_MS);
+  });
+  try {
+    const response = await Promise.race([
+      fetch(request, controller ? { signal: controller.signal } : undefined),
+      timedOut,
+    ]);
+    return await cacheNetworkResponse(cache, request, response);
+  } catch (error) {
+    if (cached) {
+      return cached;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 self.addEventListener("fetch", (event) => {
   const req = event.request;
   if (req.method !== "GET") {
@@ -43,20 +76,16 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin || BYPASS.has(url.pathname)) {
     return;
   }
+  if (req.mode === "navigate") {
+    event.respondWith(navigationResponse(req));
+    return;
+  }
+  const cachePromise = caches.open(CACHE);
+  const revalidation = cachePromise.then((cache) =>
+    fetch(req).then((response) => cacheNetworkResponse(cache, req, response)),
+  );
+  event.waitUntil(revalidation.catch(() => {}));
   event.respondWith(
-    caches.open(CACHE).then((cache) =>
-      cache.match(req).then((cached) => {
-        const network = fetch(req)
-          .then((resp) => {
-            if (resp && resp.status === 200 && resp.type === "basic") {
-              cache.put(req, resp.clone());
-            }
-            return resp;
-          })
-          .catch(() => cached);
-        // Serve cache immediately when present; fall back to network on a miss.
-        return cached || network;
-      }),
-    ),
+    cachePromise.then((cache) => cache.match(req)).then((cached) => cached || revalidation),
   );
 });

@@ -11,6 +11,7 @@
   const REGISTER_MESSAGE = "webauthn-register";
   const AUTH_OPTIONS_MESSAGE = "webauthn-auth-options";
   const AUTH_MESSAGE = "webauthn-auth";
+  const CEREMONY_TIMEOUT_MS = 90000;
 
   function base64urlOf(value) {
     const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
@@ -110,14 +111,39 @@
     );
   }
 
+  async function runCredentialCeremony(operation, signal) {
+    const Controller = root.AbortController;
+    if (typeof Controller !== "function") {
+      return operation(signal);
+    }
+    const controller = new Controller();
+    const abort = () => controller.abort(signal?.reason);
+    if (signal?.aborted) {
+      abort();
+    } else {
+      signal?.addEventListener("abort", abort, { once: true });
+    }
+    const timeout = root.setTimeout(() => controller.abort(), CEREMONY_TIMEOUT_MS);
+    try {
+      return await operation(controller.signal);
+    } finally {
+      root.clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+    }
+  }
+
   async function register(options, signal) {
     if (!available()) {
       throw new Error("Passkeys are unavailable in this browser or origin.");
     }
-    const credential = await root.navigator.credentials.create({
-      publicKey: decodeCreationOptions(options),
-      ...(signal ? { signal } : {}),
-    });
+    const credential = await runCredentialCeremony(
+      (ceremonySignal) =>
+        root.navigator.credentials.create({
+          publicKey: decodeCreationOptions(options),
+          ...(ceremonySignal ? { signal: ceremonySignal } : {}),
+        }),
+      signal,
+    );
     if (!credential) {
       throw new Error("Passkey registration was cancelled.");
     }
@@ -128,10 +154,14 @@
     if (!available()) {
       throw new Error("Passkeys are unavailable in this browser or origin.");
     }
-    const credential = await root.navigator.credentials.get({
-      publicKey: decodeRequestOptions(options),
-      ...(signal ? { signal } : {}),
-    });
+    const credential = await runCredentialCeremony(
+      (ceremonySignal) =>
+        root.navigator.credentials.get({
+          publicKey: decodeRequestOptions(options),
+          ...(ceremonySignal ? { signal: ceremonySignal } : {}),
+        }),
+      signal,
+    );
     if (!credential) {
       throw new Error("Passkey authentication was cancelled.");
     }
@@ -168,6 +198,7 @@
     REGISTER_MESSAGE,
     AUTH_OPTIONS_MESSAGE,
     AUTH_MESSAGE,
+    CEREMONY_TIMEOUT_MS,
     available,
     register,
     authenticate,
