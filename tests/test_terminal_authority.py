@@ -4195,6 +4195,55 @@ class ClientProtocolSourceTest(unittest.TestCase):
             self.source.index('sendMessage({ type: "seed-ack", epoch: payload.epoch });'),
         )
 
+    def test_client_resize_delivery_replays_pending_desired_geometry(self):
+        for state in (
+            "let desiredTerminalCols = 0;",
+            "let desiredTerminalRows = 0;",
+            "let deliveredTerminalCols = 0;",
+            "let deliveredTerminalRows = 0;",
+            "let terminalResizeDirty = false;",
+            "let terminalResizePending = false;",
+        ):
+            self.assertIn(state, self.source)
+
+        flush_start = self.source.index("  function flushTerminalResize()")
+        flush_end = self.source.index("  function writeTerminal(data)", flush_start)
+        flush = self.source[flush_start:flush_end]
+        authority_guard = "!terminalAuthoritative || !socket || socket.readyState !== WebSocket.OPEN"
+        send = 'sendMessage({ type: "resize", cols: desiredTerminalCols, rows: desiredTerminalRows })'
+        delivered = "deliveredTerminalCols = desiredTerminalCols;"
+        self.assertIn(authority_guard, flush)
+        self.assertLess(flush.index(authority_guard), flush.index(send))
+        self.assertLess(flush.index(send), flush.index(delivered))
+        self.assertIn("!differsFromDelivered", flush)
+
+        fit = self.source[
+            self.source.index("  function fitTerminal(") :
+            self.source.index("  function cancelTouchInertia()")
+        ]
+        self.assertLess(
+            fit.index("setDesiredTerminalSize(term.cols, term.rows);"),
+            fit.index("flushTerminalResize();"),
+        )
+        self.assertEqual(self.source.count('sendMessage({ type: "resize"'), 1)
+
+        seed_open = self.source[
+            self.source.index('    if (payload.type === "seed-open")') :
+            self.source.index('    if (payload.type === "selection-check")')
+        ]
+        self.assertLess(seed_open.index("terminalAuthoritative = true;"), seed_open.index("flushTerminalResize();"))
+        seed_start = self.source[
+            self.source.index('    if (payload.type === "seed-start")') :
+            self.source.index('    if (payload.type === "seed-data")')
+        ]
+        self.assertNotIn("resetDeliveredTerminalSize();", seed_start)
+        ready = self.source[
+            self.source.index('    if (payload.type === "ready")') :
+            self.source.index('    if (payload.type === "tabs")')
+        ]
+        self.assertIn("resetDeliveredTerminalSize();", ready)
+        self.assertIn("flushTerminalResize();", ready)
+
     def test_seed_establishes_neutral_geometry_and_tabs_before_replaying_rows(self):
         baseline_start = self.source.index("  function terminalReplayBaselineSequence()")
         baseline_end = self.source.index("  function terminalTabStopsSequence(meta)", baseline_start)

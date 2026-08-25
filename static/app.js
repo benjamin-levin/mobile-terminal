@@ -35,6 +35,7 @@
   const DEFAULT_AUTHENTICATION_IDLE_MINUTES = 15;
   const AUTHENTICATION_MODES = new Set(["off", "idle", "every-open"]);
   const KEYBOARD_THRESHOLD = 80;
+  const VIEWPORT_SETTLE_DELAYS = [80, 220, 420, 700, 1000, 1400];
   const UI_SCALE_FIT_WIDTH = 430;
   const UI_SCALE_FIT_HEIGHT = 700;
   const EDITOR_TAB_PREFIX = "editor:";
@@ -631,12 +632,17 @@
   let fitTimer = null;
   let terminalFitScheduled = false;
   let pendingFitPreserveCols = false;
-  let lastTerminalCols = 0;
-  let lastTerminalRows = 0;
+  let desiredTerminalCols = 0;
+  let desiredTerminalRows = 0;
+  let deliveredTerminalCols = 0;
+  let deliveredTerminalRows = 0;
+  let terminalResizeDirty = false;
+  let terminalResizePending = false;
   let lastTerminalLayoutWidth = 0;
   let lastComposerHeight = 0;
   let lastLayoutViewportWidth = 0;
-  let viewportSettleTimers = [];
+  let viewportSettleGeneration = 0;
+  let viewportSettleTimer = null;
   let lastStableViewportWidth = 0;
   let lastStableViewportHeight = 0;
   let currentTabs = [];
@@ -2166,12 +2172,15 @@
   }
 
   function terminalSelectionViewportRect() {
-    const viewport = window.visualViewport;
-    const left = viewport ? viewport.offsetLeft : 0;
-    const top = viewport ? viewport.offsetTop : 0;
-    const width = viewport ? viewport.width : window.innerWidth;
-    const height = viewport ? viewport.height : window.innerHeight;
-    return { left, top, right: left + width, bottom: top + height };
+    const geometry = currentViewportGeometry();
+    const left = geometry.offsetLeft;
+    const top = geometry.offsetTop;
+    return {
+      left,
+      top,
+      right: left + geometry.viewportWidth,
+      bottom: top + geometry.viewportHeight,
+    };
   }
 
   function terminalSelectionOverlayBounds(screen) {
@@ -4540,6 +4549,58 @@
     return true;
   }
 
+  function setDesiredTerminalSize(cols, rows) {
+    const nextCols = Math.floor(Number(cols));
+    const nextRows = Math.floor(Number(rows));
+    if (!Number.isFinite(nextCols) || !Number.isFinite(nextRows) || nextCols <= 0 || nextRows <= 0) {
+      return false;
+    }
+    if (nextCols === desiredTerminalCols && nextRows === desiredTerminalRows) {
+      return false;
+    }
+    desiredTerminalCols = nextCols;
+    desiredTerminalRows = nextRows;
+    terminalResizeDirty = true;
+    terminalResizePending = true;
+    return true;
+  }
+
+  function resetDeliveredTerminalSize() {
+    deliveredTerminalCols = 0;
+    deliveredTerminalRows = 0;
+    terminalResizePending = desiredTerminalCols > 0 && desiredTerminalRows > 0;
+  }
+
+  function flushTerminalResize() {
+    if (desiredTerminalCols <= 0 || desiredTerminalRows <= 0) {
+      return false;
+    }
+    const differsFromDelivered =
+      desiredTerminalCols !== deliveredTerminalCols ||
+      desiredTerminalRows !== deliveredTerminalRows;
+    if (!terminalResizeDirty && !terminalResizePending && !differsFromDelivered) {
+      return false;
+    }
+    if (!terminalAuthoritative || !socket || socket.readyState !== WebSocket.OPEN) {
+      terminalResizePending = true;
+      return false;
+    }
+    if (!differsFromDelivered) {
+      terminalResizeDirty = false;
+      terminalResizePending = false;
+      return false;
+    }
+    if (!sendMessage({ type: "resize", cols: desiredTerminalCols, rows: desiredTerminalRows })) {
+      terminalResizePending = true;
+      return false;
+    }
+    deliveredTerminalCols = desiredTerminalCols;
+    deliveredTerminalRows = desiredTerminalRows;
+    terminalResizeDirty = false;
+    terminalResizePending = false;
+    return true;
+  }
+
   function writeTerminal(data) {
     return new Promise((resolve) => term.write(data, resolve));
   }
@@ -4762,7 +4823,7 @@
         if (proposed && Number.isFinite(proposed.rows) && proposed.rows > 0) {
           const proposedCols = Number.isFinite(proposed.cols) ? Math.floor(proposed.cols) : term.cols;
           const guardedCols = Math.max(20, proposedCols - TERMINAL_COL_GUARD);
-          const nextCols = shouldPreserveCols && lastTerminalCols > 0 ? lastTerminalCols : guardedCols;
+          const nextCols = shouldPreserveCols && desiredTerminalCols > 0 ? desiredTerminalCols : guardedCols;
           term.resize(nextCols, proposed.rows);
         } else {
           fitAddon.fit();
@@ -4772,13 +4833,8 @@
       }
       clampTerminalColumnsToVisibleWidth();
       lastTerminalLayoutWidth = terminalWidth;
-      if (term.cols !== lastTerminalCols || term.rows !== lastTerminalRows) {
-        lastTerminalCols = term.cols;
-        lastTerminalRows = term.rows;
-        if (terminalAuthoritative) {
-          sendMessage({ type: "resize", cols: term.cols, rows: term.rows });
-        }
-      }
+      setDesiredTerminalSize(term.cols, term.rows);
+      flushTerminalResize();
       if (followOutput) {
         term.scrollToBottom();
       }
@@ -5714,13 +5770,29 @@
     return orientationChanged || widthDelta > 0.18 || heightDelta > 0.18;
   }
 
-  function scheduleViewportSettlePasses() {
-    viewportSettleTimers.forEach((timerId) => window.clearTimeout(timerId));
-    viewportSettleTimers = [80, 220, 420].map((delay) =>
-      window.setTimeout(() => {
-        updateViewportMetrics();
-      }, delay),
-    );
+  function scheduleViewportSettlePasses({ immediate = true } = {}) {
+    const generation = ++viewportSettleGeneration;
+    window.clearTimeout(viewportSettleTimer);
+    if (immediate) {
+      updateViewportMetrics();
+    }
+    let passIndex = 0;
+    const runNextPass = () => {
+      if (generation !== viewportSettleGeneration) {
+        return;
+      }
+      updateViewportMetrics();
+      passIndex += 1;
+      if (passIndex >= VIEWPORT_SETTLE_DELAYS.length) {
+        viewportSettleTimer = null;
+        return;
+      }
+      viewportSettleTimer = window.setTimeout(
+        runNextPass,
+        VIEWPORT_SETTLE_DELAYS[passIndex] - VIEWPORT_SETTLE_DELAYS[passIndex - 1],
+      );
+    };
+    viewportSettleTimer = window.setTimeout(runNextPass, VIEWPORT_SETTLE_DELAYS[0]);
   }
 
   function applyEffectiveUiScale(viewportWidth, viewportHeight, keyboardInset = 0, layoutHeight = window.innerHeight) {
@@ -5747,21 +5819,8 @@
       document.body.dataset.composerActive === "true"
         ? composerPanel.getBoundingClientRect()
         : null;
-    const viewport = window.visualViewport;
-    const viewportClaimsKeyboard =
-      viewport && window.innerHeight - (viewport.height + viewport.offsetTop) > KEYBOARD_THRESHOLD;
-    const layoutSaysKeyboardClosed = document.body.dataset.keyboardOpen !== "true";
-    // Trust the layout-viewport bottom whenever we don't believe the keyboard
-    // is genuinely up: stale visualViewport, no focused input, or we just
-    // hard-reset --keyboard-inset to 0 (e.g. after a tab switch).
-    const trustViewportBottom =
-      viewport &&
-      viewportClaimsKeyboard &&
-      focusedElementAcceptsKeyboard() &&
-      !layoutSaysKeyboardClosed;
-    const viewportBottom = trustViewportBottom
-      ? viewport.offsetTop + viewport.height
-      : window.innerHeight;
+    const geometry = currentViewportGeometry();
+    const viewportBottom = geometry.offsetTop + geometry.viewportHeight;
     const top = composerRect ? Math.min(panelRect.top, composerRect.top) : panelRect.top;
     const shortcutHeight = Math.ceil(shortcutRect.height);
     if (shortcutHeight > 0) {
@@ -5791,18 +5850,49 @@
     return false;
   }
 
-  // Pin the currently-open settings overlay directly to the visual viewport so
-  // it always sits above the on-screen keyboard. This is intentionally decoupled
-  // from --app-height/updateViewportMetrics (which also drive terminal layout and
-  // apply stale-viewport resets) — inline geometry on the open overlay is the
-  // most reliable way to keep the sheet from drifting when the keyboard opens.
-  function syncOverlayToViewport() {
-    const viewport = window.visualViewport;
+  function normalizeViewportGeometry(viewport, layoutWidth, layoutHeight, keyboardCapableFocus) {
+    let viewportWidth = viewport ? viewport.width : layoutWidth;
+    let viewportHeight = viewport ? viewport.height : layoutHeight;
+    let offsetLeft = viewport ? viewport.offsetLeft : 0;
+    let offsetTop = viewport ? viewport.offsetTop : 0;
+    const rawKeyboardInset = Math.max(0, layoutHeight - (viewportHeight + offsetTop));
+    const keyboardInset =
+      keyboardCapableFocus && rawKeyboardInset > KEYBOARD_THRESHOLD ? rawKeyboardInset : 0;
+    if (keyboardInset === 0) {
+      viewportWidth = layoutWidth;
+      viewportHeight = layoutHeight;
+      offsetLeft = 0;
+      offsetTop = 0;
+    }
+    return {
+      viewportWidth,
+      viewportHeight,
+      offsetLeft,
+      offsetTop,
+      keyboardInset,
+      layoutHeight,
+      hasVisualViewport: Boolean(viewport),
+    };
+  }
+
+  function currentViewportGeometry() {
+    return normalizeViewportGeometry(
+      window.visualViewport,
+      window.innerWidth,
+      window.innerHeight,
+      focusedElementAcceptsKeyboard(),
+    );
+  }
+
+  // Pin the currently-open settings overlay directly to the effective viewport
+  // so it stays above the keyboard without inheriting stale visualViewport
+  // offsets after focus leaves a keyboard-capable field.
+  function syncOverlayToViewport(geometry = currentViewportGeometry()) {
     const overlays = document.querySelectorAll(".overlay");
     for (let i = 0; i < overlays.length; i += 1) {
-      if (viewport) {
-        overlays[i].style.top = `${Math.round(viewport.offsetTop)}px`;
-        overlays[i].style.height = `${Math.round(viewport.height)}px`;
+      if (geometry.hasVisualViewport) {
+        overlays[i].style.top = `${Math.round(geometry.offsetTop)}px`;
+        overlays[i].style.height = `${Math.round(geometry.viewportHeight)}px`;
       } else {
         overlays[i].style.top = "";
         overlays[i].style.height = "";
@@ -5810,31 +5900,43 @@
     }
   }
 
+  function applyViewportGeometry(geometry) {
+    detectViewportShock(
+      geometry.viewportWidth,
+      geometry.viewportHeight,
+      geometry.keyboardInset,
+    );
+    document.documentElement.style.setProperty("--app-top", `${Math.round(geometry.offsetTop)}px`);
+    document.documentElement.style.setProperty("--app-height", `${Math.round(geometry.viewportHeight)}px`);
+    document.documentElement.style.setProperty("--keyboard-inset", `${Math.round(geometry.keyboardInset)}px`);
+    document.body.dataset.keyboardOpen = geometry.keyboardInset > 0 ? "true" : "false";
+    applyEffectiveUiScale(
+      geometry.viewportWidth,
+      geometry.viewportHeight,
+      geometry.keyboardInset,
+      geometry.layoutHeight,
+    );
+  }
+
+  function assertKeyboardClosedGeometry() {
+    const geometry = normalizeViewportGeometry(
+      window.visualViewport,
+      window.innerWidth,
+      window.innerHeight,
+      false,
+    );
+    syncOverlayToViewport(geometry);
+    applyViewportGeometry(geometry);
+  }
+
   function updateViewportMetrics() {
-    syncOverlayToViewport();
-    const viewport = window.visualViewport;
-    const viewportWidth = viewport ? viewport.width : window.innerWidth;
-    let viewportHeight = viewport ? viewport.height : window.innerHeight;
-    const offsetTop = viewport ? viewport.offsetTop : 0;
-    const layoutHeight = window.innerHeight;
-    let rawKeyboardInset = Math.max(0, layoutHeight - (viewportHeight + offsetTop));
-    // visualViewport sometimes stays "shrunk" after a tab switch even though
-    // the keyboard isn't actually open and no event will fire to refresh it.
-    // If nothing focusable currently has focus, the keyboard cannot be open —
-    // override the stale viewport value with the layout viewport height.
-    if (rawKeyboardInset > KEYBOARD_THRESHOLD && !focusedElementAcceptsKeyboard()) {
-      viewportHeight = layoutHeight;
-      rawKeyboardInset = 0;
-    }
-    const keyboardInset = rawKeyboardInset > KEYBOARD_THRESHOLD ? rawKeyboardInset : 0;
-    detectViewportShock(viewportWidth, viewportHeight, keyboardInset);
-    document.documentElement.style.setProperty("--app-top", `${Math.round(offsetTop)}px`);
-    document.documentElement.style.setProperty("--app-height", `${Math.round(viewportHeight)}px`);
-    document.documentElement.style.setProperty("--keyboard-inset", `${Math.round(keyboardInset)}px`);
-    document.body.dataset.keyboardOpen = keyboardInset > 0 ? "true" : "false";
-    applyEffectiveUiScale(viewportWidth, viewportHeight, keyboardInset, layoutHeight);
-    const preserveTerminalCols = lastLayoutViewportWidth > 0 && Math.abs(viewportWidth - lastLayoutViewportWidth) < 1;
-    lastLayoutViewportWidth = viewportWidth;
+    const geometry = currentViewportGeometry();
+    syncOverlayToViewport(geometry);
+    applyViewportGeometry(geometry);
+    const preserveTerminalCols =
+      lastLayoutViewportWidth > 0 &&
+      Math.abs(geometry.viewportWidth - lastLayoutViewportWidth) < 1;
+    lastLayoutViewportWidth = geometry.viewportWidth;
     scheduleLayoutRefresh({ preserveTerminalCols });
     scheduleTerminalSelectionUISync();
   }
@@ -7344,6 +7446,7 @@
     pendingTerminalOutput = null;
     pendingTerminalSeed = null;
     terminalAuthoritative = false;
+    resetDeliveredTerminalSize();
     for (const pending of pendingSelectionRequests.values()) {
       window.clearTimeout(pending.timer);
       pending.resolve({ error: "Terminal changed; select again." });
@@ -7401,6 +7504,8 @@
       if (socket !== thisSocket) {
         return;
       }
+      terminalAuthoritative = false;
+      resetDeliveredTerminalSize();
       updateProfileConnectionState();
       window.clearTimeout(resumeProbeTimer);
       resumeProbeTimer = null;
@@ -7516,13 +7621,7 @@
         followOutput = false;
       }
       pendingSeedScrollTarget = null;
-      if (
-        lastTerminalCols > 0 &&
-        lastTerminalRows > 0 &&
-        (term.cols !== lastTerminalCols || term.rows !== lastTerminalRows)
-      ) {
-        sendMessage({ type: "resize", cols: lastTerminalCols, rows: lastTerminalRows });
-      }
+      flushTerminalResize();
       return;
     }
     if (payload.type === "selection-check") {
@@ -7665,6 +7764,8 @@
     }
     if (payload.type === "ready") {
       terminalAuthoritative = false;
+      resetDeliveredTerminalSize();
+      flushTerminalResize();
       resetTerminalInteractionState();
       const readyIsHidden = document.visibilityState === "hidden";
       applyTerminalReadyVisibility(readyIsHidden);
@@ -7756,10 +7857,7 @@
       // this point (tab pills aren't keyboard inputs), but visualViewport
       // sometimes stays stale on iOS without firing a resize event.
       if (mobileComposerMode) {
-        document.documentElement.style.setProperty("--app-top", "0px");
-        document.documentElement.style.setProperty("--app-height", `${window.innerHeight}px`);
-        document.documentElement.style.setProperty("--keyboard-inset", "0px");
-        document.body.dataset.keyboardOpen = "false";
+        assertKeyboardClosedGeometry();
       }
       // focusTerminal re-shows the composer panel, so layout must be measured
       // *after* it to account for the composer's height in --shortcut-reserve.
@@ -8296,10 +8394,7 @@
       // drop the keyboard even if blur() alone was ignored. The next
       // openComposer() during focusTerminal() will re-show it.
       composerPanel.classList.add("hidden");
-      document.documentElement.style.setProperty("--app-top", "0px");
-      document.documentElement.style.setProperty("--app-height", `${window.innerHeight}px`);
-      document.documentElement.style.setProperty("--keyboard-inset", "0px");
-      document.body.dataset.keyboardOpen = "false";
+      assertKeyboardClosedGeometry();
       // Run measure + fit synchronously so the very first paint after the
       // tap renders the new layout. The default scheduleLayoutRefresh path
       // is debounced 40 ms, which is long enough to flash the gap.
@@ -8568,14 +8663,13 @@
 
   function applyUiScale(nextScale, persist = true) {
     uiScale = Math.min(1.4, Math.max(0.5, nextScale));
-    const viewport = window.visualViewport;
-    const viewportWidth = viewport ? viewport.width : window.innerWidth;
-    const viewportHeight = viewport ? viewport.height : window.innerHeight;
-    const offsetTop = viewport ? viewport.offsetTop : 0;
-    const layoutHeight = window.innerHeight;
-    const rawKeyboardInset = Math.max(0, layoutHeight - (viewportHeight + offsetTop));
-    const keyboardInset = rawKeyboardInset > KEYBOARD_THRESHOLD ? rawKeyboardInset : 0;
-    applyEffectiveUiScale(viewportWidth, viewportHeight, keyboardInset, layoutHeight);
+    const geometry = currentViewportGeometry();
+    applyEffectiveUiScale(
+      geometry.viewportWidth,
+      geometry.viewportHeight,
+      geometry.keyboardInset,
+      geometry.layoutHeight,
+    );
     if (!displayOverlay.classList.contains("hidden")) {
       syncDisplayControls(draftUiScale, draftTerminalFontSize);
     }
@@ -9713,19 +9807,15 @@
     composerPanel.classList.remove("hidden");
     setComposerActive(true);
     autoSizeComposer();
-    scheduleLayoutRefresh({ preserveTerminalCols: true });
+    scheduleViewportSettlePasses();
   });
   composerInput.addEventListener("blur", () => {
     setComposerActive(false);
-    // After blur, iOS sometimes neglects to fire a visualViewport resize even
-    // though the keyboard actually closed. Re-measure on a couple of delays
-    // so --app-height and --shortcut-reserve recover.
-    [60, 220, 520].forEach((delay) =>
-      window.setTimeout(() => {
-        updateViewportMetrics();
-        scheduleLayoutRefresh({ preserveTerminalCols: true });
-      }, delay),
-    );
+    // iOS can leave visualViewport shrunk without another event after blur.
+    // Close the geometry synchronously, then let the shared settle generation
+    // absorb any late keyboard-animation updates.
+    assertKeyboardClosedGeometry();
+    scheduleViewportSettlePasses({ immediate: false });
   });
   composerInput.addEventListener("input", () => {
     lastComposerInputAt = Date.now();
@@ -9949,11 +10039,8 @@
   layoutObserver.observe(composerPanel);
   layoutObserver.observe(terminalElement);
 
-  window.visualViewport?.addEventListener("resize", () => {
-    updateViewportMetrics();
-    scheduleViewportSettlePasses();
-  });
-  window.visualViewport?.addEventListener("scroll", updateViewportMetrics);
+  window.visualViewport?.addEventListener("resize", scheduleViewportSettlePasses);
+  window.visualViewport?.addEventListener("scroll", scheduleViewportSettlePasses);
   // When a field inside a settings sheet gets focus, refresh viewport metrics
   // (so the overlay re-anchors above the keyboard) and scroll the field into
   // view within the scrollable sheet once the keyboard animation settles.
@@ -9976,17 +10063,11 @@
       }, delay),
     );
   });
-  window.addEventListener("resize", () => {
-    updateViewportMetrics();
-    scheduleViewportSettlePasses();
-  });
-  window.addEventListener("orientationchange", () => {
-    updateViewportMetrics();
-    scheduleViewportSettlePasses();
-  });
+  window.addEventListener("resize", scheduleViewportSettlePasses);
+  window.addEventListener("orientationchange", scheduleViewportSettlePasses);
   window.addEventListener("focus", () => {
     reportForcedActivity(false);
-    updateViewportMetrics();
+    scheduleViewportSettlePasses();
     resumeApplication();
   });
   document.addEventListener("visibilitychange", () => {
@@ -10049,9 +10130,9 @@
       closeBtopTargetMenu();
     }
   });
-  document.addEventListener("focusin", updateViewportMetrics);
+  document.addEventListener("focusin", scheduleViewportSettlePasses);
   document.addEventListener("focusout", () => {
-    window.setTimeout(updateViewportMetrics, 120);
+    scheduleViewportSettlePasses({ immediate: false });
   });
 
   renderShortcutBar();

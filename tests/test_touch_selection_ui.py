@@ -87,6 +87,57 @@ class TouchSelectionUITest(unittest.TestCase):
         )
         self.run_node_source(script)
 
+    def test_terminal_resize_delivery_waits_replays_and_deduplicates(self):
+        script = "\n".join(
+            [
+                'const assert = require("node:assert/strict");',
+                "const WebSocket = { OPEN: 1 };",
+                "const sent = [];",
+                "let socket = { readyState: 0 };",
+                "let terminalAuthoritative = false;",
+                "let desiredTerminalCols = 0;",
+                "let desiredTerminalRows = 0;",
+                "let deliveredTerminalCols = 0;",
+                "let deliveredTerminalRows = 0;",
+                "let terminalResizeDirty = false;",
+                "let terminalResizePending = false;",
+                "function sendMessage(payload) {",
+                "  if (!socket || socket.readyState !== WebSocket.OPEN) return false;",
+                "  sent.push(payload);",
+                "  return true;",
+                "}",
+                extract_function("setDesiredTerminalSize"),
+                extract_function("resetDeliveredTerminalSize"),
+                extract_function("flushTerminalResize"),
+                "assert.equal(setDesiredTerminalSize(80, 24), true);",
+                "assert.equal(flushTerminalResize(), false);",
+                "assert.deepEqual([terminalResizeDirty, terminalResizePending], [true, true]);",
+                "assert.deepEqual([deliveredTerminalCols, deliveredTerminalRows], [0, 0]);",
+                "socket.readyState = WebSocket.OPEN;",
+                "assert.equal(flushTerminalResize(), false);",
+                "assert.equal(sent.length, 0);",
+                "terminalAuthoritative = true;",
+                "assert.equal(flushTerminalResize(), true);",
+                'assert.deepEqual(sent, [{ type: "resize", cols: 80, rows: 24 }]);',
+                "assert.deepEqual([deliveredTerminalCols, deliveredTerminalRows], [80, 24]);",
+                "assert.equal(flushTerminalResize(), false);",
+                "assert.equal(sent.length, 1);",
+                "resetDeliveredTerminalSize();",
+                "assert.equal(flushTerminalResize(), true);",
+                "assert.equal(sent.length, 2);",
+                "socket.readyState = 0;",
+                "assert.equal(setDesiredTerminalSize(100, 30), true);",
+                "assert.equal(flushTerminalResize(), false);",
+                "assert.deepEqual([deliveredTerminalCols, deliveredTerminalRows], [80, 24]);",
+                "socket.readyState = WebSocket.OPEN;",
+                "assert.equal(flushTerminalResize(), true);",
+                'assert.deepEqual(sent[2], { type: "resize", cols: 100, rows: 30 });',
+                "assert.equal(flushTerminalResize(), false);",
+                "assert.equal(sent.length, 3);",
+            ]
+        )
+        self.run_node_source(script)
+
     def test_activity_sources_exclude_pointer_moves_and_generated_terminal_replies(self):
         pointer_section = app_section(
             'document.addEventListener("pointerdown", reportForcedActivity',
@@ -729,10 +780,10 @@ assert.deepEqual(termSel, { active: true });
             "term.onSelectionChange(() => {",
             "term.onScroll(() => {",
             "const layoutObserver = new ResizeObserver(() => {",
-            'window.visualViewport?.addEventListener("resize", () => {',
-            'window.visualViewport?.addEventListener("scroll", updateViewportMetrics);',
-            'window.addEventListener("resize", () => {',
-            'window.addEventListener("orientationchange", () => {',
+            'window.visualViewport?.addEventListener("resize", scheduleViewportSettlePasses);',
+            'window.visualViewport?.addEventListener("scroll", scheduleViewportSettlePasses);',
+            'window.addEventListener("resize", scheduleViewportSettlePasses);',
+            'window.addEventListener("orientationchange", scheduleViewportSettlePasses);',
         ):
             self.assertIn(marker, APP_JS)
         self.assertGreaterEqual(APP_JS.count("scheduleTerminalSelectionUISync("), 12)
@@ -740,6 +791,81 @@ assert.deepEqual(termSel, { active: true });
         self.assertIn("scheduleTerminalSelectionUISync();", fit)
         viewport = extract_function("updateViewportMetrics")
         self.assertIn("scheduleTerminalSelectionUISync();", viewport)
+
+    def test_keyboard_closed_geometry_normalizes_the_full_layout_viewport(self):
+        self.run_node(
+            ["normalizeViewportGeometry"],
+            r"""
+const KEYBOARD_THRESHOLD = 80;
+const stale = { width: 390, height: 510, offsetLeft: 7, offsetTop: 46 };
+assert.deepEqual(
+  normalizeViewportGeometry(stale, 430, 800, false),
+  {
+    viewportWidth: 430,
+    viewportHeight: 800,
+    offsetLeft: 0,
+    offsetTop: 0,
+    keyboardInset: 0,
+    layoutHeight: 800,
+    hasVisualViewport: true,
+  },
+);
+assert.deepEqual(
+  normalizeViewportGeometry({ width: 400, height: 730, offsetLeft: 0, offsetTop: 10 }, 430, 800, true),
+  {
+    viewportWidth: 430,
+    viewportHeight: 800,
+    offsetLeft: 0,
+    offsetTop: 0,
+    keyboardInset: 0,
+    layoutHeight: 800,
+    hasVisualViewport: true,
+  },
+);
+assert.deepEqual(
+  normalizeViewportGeometry(stale, 430, 800, true),
+  {
+    viewportWidth: 390,
+    viewportHeight: 510,
+    offsetLeft: 7,
+    offsetTop: 46,
+    keyboardInset: 244,
+    layoutHeight: 800,
+    hasVisualViewport: true,
+  },
+);
+""",
+        )
+        current = extract_function("currentViewportGeometry")
+        self.assertIn("focusedElementAcceptsKeyboard()", current)
+        blur = app_section(
+            '  composerInput.addEventListener("blur", () => {',
+            '  composerInput.addEventListener("input", () => {',
+        )
+        self.assertLess(
+            blur.index("assertKeyboardClosedGeometry();"),
+            blur.index("scheduleViewportSettlePasses({ immediate: false });"),
+        )
+
+    def test_viewport_changes_share_one_generation_settle_scheduler(self):
+        scheduler = extract_function("scheduleViewportSettlePasses")
+        self.assertIn("const generation = ++viewportSettleGeneration;", scheduler)
+        self.assertIn("generation !== viewportSettleGeneration", scheduler)
+        self.assertIn("window.clearTimeout(viewportSettleTimer);", scheduler)
+        self.assertIn("VIEWPORT_SETTLE_DELAYS[passIndex]", scheduler)
+        self.assertIn("const VIEWPORT_SETTLE_DELAYS = [80, 220, 420, 700, 1000, 1400];", APP_JS)
+        for wiring in (
+            'window.visualViewport?.addEventListener("scroll", scheduleViewportSettlePasses);',
+            'document.addEventListener("focusin", scheduleViewportSettlePasses);',
+            'document.addEventListener("focusout", () => {',
+        ):
+            self.assertIn(wiring, APP_JS)
+        composer = app_section(
+            '  composerInput.addEventListener("focus", () => {',
+            '  composerInput.addEventListener("input", () => {',
+        )
+        self.assertEqual(composer.count("scheduleViewportSettlePasses"), 2)
+        self.assertIn("scheduleViewportSettlePasses({ immediate: false });", composer)
 
     def test_toolbar_css_and_pointer_keyboard_guards_remain_intact(self):
         for name in ("top", "right", "bottom", "left"):
