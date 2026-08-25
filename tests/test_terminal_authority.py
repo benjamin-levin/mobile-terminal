@@ -4183,9 +4183,11 @@ class ClientProtocolSourceTest(unittest.TestCase):
     def setUpClass(cls):
         cls.source = (Path(__file__).parents[1] / "static" / "app.js").read_text()
 
-    def test_socket_frames_and_seed_acks_share_one_ordered_chain(self):
-        self.assertIn("socketMessageChain = socketMessageChain", self.source)
-        self.assertIn("await handleTerminalBinary(event.data, thisConnectionGeneration);", self.source)
+    def test_socket_frames_and_seed_acks_share_one_bounded_ordered_queue(self):
+        self.assertNotIn("socketMessageChain", self.source)
+        self.assertIn("const messageQueue = createSocketMessageQueue();", self.source)
+        self.assertIn("await handleTerminalBinary(batch, generation)", self.source)
+        self.assertIn("takeQueuedTerminalOutputBatch(queueState)", self.source)
         self.assertIn('type: "seed-start-ack"', self.source)
         self.assertIn('type: "seed-ack"', self.source)
         self.assertIn('type: "post-flush-ack"', self.source)
@@ -4268,7 +4270,7 @@ class ClientProtocolSourceTest(unittest.TestCase):
             self.assertIn(sequence, baseline)
 
         seed_start = self.source.index("  async function applyTerminalSeed(payload, generation = connectionGeneration)")
-        seed_end = self.source.index("  async function handleTerminalBinary(data, generation = connectionGeneration)", seed_start)
+        seed_end = self.source.index("  async function handleTerminalBinary(batch, generation = connectionGeneration)", seed_start)
         seed = self.source[seed_start:seed_end]
         reset = "await writeTerminal(reset);"
         tabs = "await writeTerminal(terminalTabStopsSequence(meta));"

@@ -669,8 +669,6 @@
   installSemanticPromptHandlers();
 
   let socket = null;
-  let socketMessageChain = Promise.resolve();
-  let pendingTerminalOutput = null;
   let pendingTerminalSeed = null;
   let terminalEpoch = 0;
   let terminalPaneId = "";
@@ -4736,8 +4734,115 @@
     return sequence;
   }
 
+  const TERMINAL_BACKLOG_MAX_BYTES = 3 * 1024 * 1024;
+  const TERMINAL_BACKLOG_MAX_AGE_MS = 1500;
+  const TERMINAL_RENDER_BATCH_MAX_BYTES = 256 * 1024;
+  const TERMINAL_RENDER_SLICE_MS = 12;
+
   function connectionGenerationIsCurrent(generation) {
     return generation === connectionGeneration;
+  }
+
+  function createSocketMessageQueue() {
+    return {
+      items: [],
+      terminalBytes: 0,
+      terminalOldestAt: null,
+      pendingTerminalOutput: null,
+      draining: false,
+      reseedPending: false,
+      closed: false,
+    };
+  }
+
+  function terminalOutputByteLength(data) {
+    if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      return data.byteLength;
+    }
+    if (data instanceof Blob) {
+      return data.size;
+    }
+    return -1;
+  }
+
+  function terminalOutputsCanCoalesce(previous, next) {
+    return (
+      previous?.kind === "live" &&
+      next?.kind === "live" &&
+      String(previous.paneId || "") === String(next.paneId || "") &&
+      Number(previous.epoch) === Number(next.epoch) &&
+      Number(next.start) === Number(previous.end)
+    );
+  }
+
+  function refreshTerminalBacklogOldest(queueState) {
+    const oldest = queueState.items.find((item) => item.type === "terminal-output");
+    queueState.terminalOldestAt = oldest ? oldest.queuedAt : null;
+  }
+
+  function dropQueuedTerminalOutput(queueState) {
+    queueState.items = queueState.items.filter((item) => item.type !== "terminal-output");
+    queueState.terminalBytes = 0;
+    queueState.terminalOldestAt = null;
+  }
+
+  function terminalBacklogExceeded(queueState, now = performance.now()) {
+    return (
+      queueState.terminalBytes > TERMINAL_BACKLOG_MAX_BYTES ||
+      (queueState.terminalOldestAt !== null &&
+        now - queueState.terminalOldestAt > TERMINAL_BACKLOG_MAX_AGE_MS)
+    );
+  }
+
+  function requestTerminalBacklogReseed(queueState, generation, messageSocket) {
+    if (
+      queueState.reseedPending ||
+      queueState.closed ||
+      !connectionGenerationIsCurrent(generation) ||
+      messageSocket !== socket ||
+      messageSocket.readyState !== WebSocket.OPEN
+    ) {
+      return false;
+    }
+    dropQueuedTerminalOutput(queueState);
+    terminalAuthoritative = false;
+    historyReseedPending = true;
+    queueState.reseedPending = true;
+    messageSocket.send(
+      JSON.stringify({
+        type: "history-reseed",
+        historyLines: Math.max(2000, terminalSeedHistory),
+        scrollTarget: 0,
+      }),
+    );
+    console.debug("Terminal render backlog dropped; requesting authoritative reseed");
+    return true;
+  }
+
+  function takeQueuedTerminalOutputBatch(queueState) {
+    const first = queueState.items.shift();
+    const batch = [first];
+    let batchBytes = first.byteLength;
+    while (queueState.items.length > 0) {
+      const next = queueState.items[0];
+      const previous = batch[batch.length - 1];
+      if (
+        next.type !== "terminal-output" ||
+        !terminalOutputsCanCoalesce(previous.metadata, next.metadata) ||
+        batchBytes + next.byteLength > TERMINAL_RENDER_BATCH_MAX_BYTES
+      ) {
+        break;
+      }
+      batch.push(queueState.items.shift());
+      batchBytes += next.byteLength;
+    }
+    queueState.terminalBytes = Math.max(0, queueState.terminalBytes - batchBytes);
+    refreshTerminalBacklogOldest(queueState);
+    return batch;
+  }
+
+  function yieldTerminalRender() {
+    return new Promise((resolve) => window.setTimeout(resolve, 0));
   }
 
   async function applyTerminalSeed(payload, generation = connectionGeneration) {
@@ -4773,36 +4878,51 @@
     return true;
   }
 
-  async function handleTerminalBinary(data, generation = connectionGeneration) {
+  async function handleTerminalBinary(batch, generation = connectionGeneration) {
     if (!connectionGenerationIsCurrent(generation)) return false;
-    const metadata = pendingTerminalOutput;
-    pendingTerminalOutput = null;
-    if (!metadata) {
-      throw new Error("Terminal output arrived without metadata");
-    }
-    let chunk = data;
-    if (chunk instanceof Blob) {
-      chunk = await chunk.arrayBuffer();
+    const chunks = [];
+    let totalBytes = 0;
+    let expectedRevision = terminalRevision;
+    let lastMetadata = null;
+    for (const item of batch) {
       if (!connectionGenerationIsCurrent(generation)) return false;
+      const metadata = item.metadata;
+      let chunk = item.data;
+      if (chunk instanceof Blob) {
+        chunk = await chunk.arrayBuffer();
+        if (!connectionGenerationIsCurrent(generation)) return false;
+      }
+      if (!connectionGenerationIsCurrent(generation)) return false;
+      const bytes = ArrayBuffer.isView(chunk)
+        ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+        : new Uint8Array(chunk);
+      if (
+        String(metadata.paneId || "") !== terminalPaneId ||
+        Number(metadata.epoch) !== terminalEpoch ||
+        Number(metadata.start) !== expectedRevision ||
+        Number(metadata.end) !== expectedRevision + bytes.byteLength
+      ) {
+        terminalAuthoritative = false;
+        throw new Error("Terminal output ordering changed");
+      }
+      chunks.push(bytes);
+      totalBytes += bytes.byteLength;
+      expectedRevision = Number(metadata.end);
+      lastMetadata = metadata;
     }
-    if (!connectionGenerationIsCurrent(generation)) return false;
-    const bytes = new Uint8Array(chunk);
-    if (
-      String(metadata.paneId || "") !== terminalPaneId ||
-      Number(metadata.epoch) !== terminalEpoch ||
-      Number(metadata.start) !== terminalRevision ||
-      Number(metadata.end) !== terminalRevision + bytes.byteLength
-    ) {
-      terminalAuthoritative = false;
-      throw new Error("Terminal output ordering changed");
-    }
-    if (!terminalAuthoritative && metadata.kind === "live") {
-      terminalRevision = Number(metadata.end);
+    if (!terminalAuthoritative && lastMetadata.kind === "live") {
+      terminalRevision = Number(lastMetadata.end);
       return true;
     }
-    await writeTerminal(decoder.decode(bytes, { stream: true }));
+    const combined = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const bytes of chunks) {
+      combined.set(bytes, offset);
+      offset += bytes.byteLength;
+    }
+    await writeTerminal(decoder.decode(combined, { stream: true }));
     if (!connectionGenerationIsCurrent(generation)) return false;
-    terminalRevision = Number(metadata.end);
+    terminalRevision = Number(lastMetadata.end);
     if (followOutput || performance.now() < bottomPinUntil) {
       term.scrollToBottom();
     }
@@ -4813,6 +4933,39 @@
       scheduleLayoutRefresh();
     }
     return true;
+  }
+
+  async function drainSocketMessageQueue(queueState, generation, messageSocket) {
+    let renderSliceStartedAt = performance.now();
+    while (queueState.items.length > 0) {
+      if (
+        queueState.closed ||
+        !connectionGenerationIsCurrent(generation) ||
+        messageSocket !== socket
+      ) {
+        return;
+      }
+      if (terminalBacklogExceeded(queueState)) {
+        requestTerminalBacklogReseed(queueState, generation, messageSocket);
+        if (queueState.items.length === 0) return;
+      }
+      const item = queueState.items[0];
+      if (item.type === "message") {
+        queueState.items.shift();
+        await handleServerMessage(item.payload, generation, messageSocket, queueState);
+        if (!connectionGenerationIsCurrent(generation)) return;
+        renderSliceStartedAt = performance.now();
+        continue;
+      }
+      const batch = takeQueuedTerminalOutputBatch(queueState);
+      if (!(await handleTerminalBinary(batch, generation))) return;
+      if (!connectionGenerationIsCurrent(generation)) return;
+      if (performance.now() - renderSliceStartedAt >= TERMINAL_RENDER_SLICE_MS) {
+        await yieldTerminalRender();
+        if (!connectionGenerationIsCurrent(generation)) return;
+        renderSliceStartedAt = performance.now();
+      }
+    }
   }
 
   function scheduleLayoutRefresh({ preserveTerminalCols = false } = {}) {
@@ -7632,8 +7785,7 @@
     const thisSocket = socket;
     const thisConnectionGeneration = connectionGeneration;
     socket.binaryType = "arraybuffer";
-    socketMessageChain = Promise.resolve();
-    pendingTerminalOutput = null;
+    const messageQueue = createSocketMessageQueue();
     pendingTerminalSeed = null;
     terminalAuthoritative = false;
     resetDeliveredTerminalSize();
@@ -7656,7 +7808,35 @@
       updateProfileConnectionState();
     });
 
-    const processSocketMessage = async (event) => {
+    const handleSocketMessageError = (error) => {
+      console.error(error);
+      if (
+        socket === thisSocket &&
+        connectionGenerationIsCurrent(thisConnectionGeneration)
+      ) {
+        terminalAuthoritative = false;
+        reconnectSocket();
+      }
+    };
+    const scheduleSocketMessageDrain = () => {
+      if (messageQueue.draining || messageQueue.closed || messageQueue.items.length === 0) {
+        return;
+      }
+      messageQueue.draining = true;
+      drainSocketMessageQueue(messageQueue, thisConnectionGeneration, thisSocket)
+        .catch(handleSocketMessageError)
+        .finally(() => {
+          messageQueue.draining = false;
+          if (
+            socket === thisSocket &&
+            connectionGenerationIsCurrent(thisConnectionGeneration) &&
+            messageQueue.items.length > 0
+          ) {
+            scheduleSocketMessageDrain();
+          }
+        });
+    };
+    const onSocketMessage = (event) => {
       if (
         socket !== thisSocket ||
         !connectionGenerationIsCurrent(thisConnectionGeneration)
@@ -7666,26 +7846,58 @@
       lastServerMessageAt = performance.now();
       window.clearTimeout(resumeProbeTimer);
       resumeProbeTimer = null;
-      if (typeof event.data === "string") {
-        const payload = JSON.parse(event.data);
-        await handleServerMessage(payload, thisConnectionGeneration, thisSocket);
-        return;
-      }
-      await handleTerminalBinary(event.data, thisConnectionGeneration);
-    };
-    const onSocketMessage = (event) => {
-      socketMessageChain = socketMessageChain
-        .then(() => processSocketMessage(event))
-        .catch((error) => {
-          console.error(error);
-          if (
-            socket === thisSocket &&
-            connectionGenerationIsCurrent(thisConnectionGeneration)
-          ) {
-            terminalAuthoritative = false;
-            reconnectSocket();
+      try {
+        if (typeof event.data === "string") {
+          const payload = JSON.parse(event.data);
+          if (payload.type === "terminal-output") {
+            if (messageQueue.pendingTerminalOutput) {
+              throw new Error("Terminal output metadata overlapped");
+            }
+            messageQueue.pendingTerminalOutput = {
+              metadata: payload,
+              queuedAt: performance.now(),
+            };
+            return;
           }
-        });
+          if (messageQueue.pendingTerminalOutput) {
+            throw new Error("Terminal output metadata was not followed by binary data");
+          }
+          messageQueue.items.push({ type: "message", payload });
+        } else {
+          const pending = messageQueue.pendingTerminalOutput;
+          messageQueue.pendingTerminalOutput = null;
+          if (!pending) {
+            throw new Error("Terminal output arrived without metadata");
+          }
+          const byteLength = terminalOutputByteLength(event.data);
+          if (byteLength < 0) {
+            throw new Error("Unsupported terminal output frame");
+          }
+          if (!messageQueue.reseedPending) {
+            messageQueue.items.push({
+              type: "terminal-output",
+              metadata: pending.metadata,
+              data: event.data,
+              byteLength,
+              queuedAt: pending.queuedAt,
+            });
+            messageQueue.terminalBytes += byteLength;
+            if (messageQueue.terminalOldestAt === null) {
+              messageQueue.terminalOldestAt = pending.queuedAt;
+            }
+            if (terminalBacklogExceeded(messageQueue)) {
+              requestTerminalBacklogReseed(
+                messageQueue,
+                thisConnectionGeneration,
+                thisSocket,
+              );
+            }
+          }
+        }
+        scheduleSocketMessageDrain();
+      } catch (error) {
+        handleSocketMessageError(error);
+      }
     };
     socket.addEventListener("message", onSocketMessage);
     // Replay anything the bootstrap socket buffered before app.js attached.
@@ -7697,6 +7909,11 @@
     }
 
     socket.addEventListener("close", (event) => {
+      messageQueue.closed = true;
+      messageQueue.items = [];
+      messageQueue.pendingTerminalOutput = null;
+      messageQueue.terminalBytes = 0;
+      messageQueue.terminalOldestAt = null;
       if (socket !== thisSocket) {
         return;
       }
@@ -7864,26 +8081,21 @@
     passkeyCeremonyPromise = trackedCeremony;
   }
 
-  async function handleServerMessage(payload, generation, messageSocket) {
-    if (payload.type === "terminal-output") {
-      if (pendingTerminalOutput) {
-        terminalAuthoritative = false;
-        throw new Error("Terminal output metadata overlapped");
-      }
-      pendingTerminalOutput = payload;
-      return;
-    }
+  async function handleServerMessage(payload, generation, messageSocket, queueState) {
     if (payload.type === "seed-start") {
       terminalAuthoritative = false;
+      queueState.reseedPending = false;
       pendingTerminalSeed = null;
       pendingSeedScrollTarget = null;
       clearTerminalSelectionUI();
-      sendMessage({
-        type: "seed-start-ack",
-        epoch: payload.epoch,
-        cols: term.cols,
-        rows: term.rows,
-      });
+      messageSocket.send(
+        JSON.stringify({
+          type: "seed-start-ack",
+          epoch: payload.epoch,
+          cols: term.cols,
+          rows: term.rows,
+        }),
+      );
       return;
     }
     if (payload.type === "seed-data") {
@@ -7908,10 +8120,16 @@
       return;
     }
     if (payload.type === "post-flush") {
-      sendMessage({ type: "post-flush-ack", epoch: payload.epoch, cycle: payload.cycle });
+      messageSocket.send(
+        JSON.stringify({ type: "post-flush-ack", epoch: payload.epoch, cycle: payload.cycle }),
+      );
       return;
     }
     if (payload.type === "seed-open") {
+      if (queueState.reseedPending) {
+        terminalAuthoritative = false;
+        return;
+      }
       if (
         Number(payload.epoch) !== terminalEpoch ||
         String(payload.paneId || "") !== terminalPaneId ||
