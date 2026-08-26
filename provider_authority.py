@@ -2989,6 +2989,8 @@ class ProviderSelectionResult:
     owned: bool
     text: str | None = None
     authority: str | None = None
+    decision: str | None = None
+    reason: str | None = None
 
 
 _TRANSCRIPT_INDEXES: OrderedDict[tuple[str, Path, int], TranscriptIndex] = OrderedDict()
@@ -3284,7 +3286,11 @@ def _provider_selection_locked(
 ) -> ProviderSelectionResult:
     mode = provider_authority_mode()
     if mode == "off":
-        return ProviderSelectionResult(False)
+        return ProviderSelectionResult(
+            False,
+            decision="unowned",
+            reason="authority-disabled",
+        )
 
     def decision(
         name: str,
@@ -3294,7 +3300,7 @@ def _provider_selection_locked(
         authority: str | None = None,
     ) -> ProviderSelectionResult:
         _record_provider_diagnostic(mode, name, reason)
-        return ProviderSelectionResult(owned, text, authority)
+        return ProviderSelectionResult(owned, text, authority, name, reason)
 
     provider_home = Path(home) if home is not None else Path.home()
     cache: Mapping[str, Any] | None = None
@@ -3373,10 +3379,19 @@ def _provider_selection_locked(
     except ProviderAuthorityError as exc:
         if mode == "shadow":
             _record_provider_diagnostic(mode, "fallback", exc.reason)
-            return ProviderSelectionResult(False)
+            return ProviderSelectionResult(
+                False,
+                decision="fallback",
+                reason=exc.reason,
+            )
         if mode == "prefer":
             _record_provider_diagnostic(mode, "fallback", exc.reason)
-            return ProviderSelectionResult(False, authority="terminal-raw")
+            return ProviderSelectionResult(
+                False,
+                authority="terminal-raw",
+                decision="fallback",
+                reason=exc.reason,
+            )
         _record_provider_diagnostic(mode, "rejected", exc.reason)
         raise
     except Exception as exc:
@@ -3389,6 +3404,8 @@ def _provider_selection_locked(
                     if mode == "prefer" and provider_signal
                     else None
                 ),
+                decision="fallback",
+                reason="provider-internal-failure",
             )
         _record_provider_diagnostic(mode, "rejected", "provider-internal-failure")
         raise ProviderAuthorityError("provider-internal-failure") from exc

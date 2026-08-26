@@ -101,6 +101,7 @@ class TouchSelectionUITest(unittest.TestCase):
                 "let deliveredTerminalRows = 0;",
                 "let terminalResizeDirty = false;",
                 "let terminalResizePending = false;",
+                "function recordViewportForensics() {}",
                 "function sendMessage(payload) {",
                 "  if (!socket || socket.readyState !== WebSocket.OPEN) return false;",
                 "  sent.push(payload);",

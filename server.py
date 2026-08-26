@@ -38,7 +38,11 @@ from mobile_terminal_config import (
     normalize_authentication_realms,
     normalize_authentication_settings,
 )
-from provider_authority import provider_selection
+from provider_authority import (
+    ProviderAuthorityError,
+    provider_authority_mode,
+    provider_selection,
+)
 from webauthn_auth import (
     PendingDeviceEnrollment,
     PasskeyAuth,
@@ -451,6 +455,12 @@ CONNECT_HISTORY_LINES = 2000
 MAX_HISTORY_SEED_LINES = 20000
 MAX_SELECTION_REQUEST_BYTES = 64 * 1024
 MAX_CLIENT_SELECTION_ROWS_BYTES = 64 * 1024
+COPY_FORENSICS_ENABLED = os.environ.get("MOBILE_TERMINAL_COPY_FORENSICS") == "1"
+FORENSICS_ROOT = ROOT / "state" / "forensics"
+FORENSICS_FILE_MAX_BYTES = 50 * 1024 * 1024
+FORENSICS_FILE_RETENTION = 5
+MAX_VIEWPORT_FORENSICS_BYTES = 16 * 1024
+_FORENSICS_WRITE_LOCK = threading.Lock()
 CLIENT_SELECTION_STYLE_RE = re.compile(
     r"(?:plain|strong|emphasis|list-marker|code-inline|unsupported)"
     r"(?:;fg-indexed-(?:[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))?"
@@ -553,6 +563,196 @@ def _record_authoritative_selection_rejection(reason: str) -> None:
 
 
 atexit.register(_flush_authoritative_selection_diagnostics)
+
+
+def _utc_forensics_timestamp() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _append_forensics_record(kind: str, record: dict[str, Any]) -> bool:
+    if not COPY_FORENSICS_ENABLED or kind not in ("copy", "viewport"):
+        return False
+    encoded = (
+        json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+    day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    path = FORENSICS_ROOT / f"{kind}-{day}.jsonl"
+    try:
+        with _FORENSICS_WRITE_LOCK:
+            FORENSICS_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                current_size = path.stat().st_size
+            except FileNotFoundError:
+                current_size = 0
+            if current_size and current_size + len(encoded) > FORENSICS_FILE_MAX_BYTES:
+                rotated = FORENSICS_ROOT / (
+                    f"{kind}-{day}-{datetime.datetime.now(datetime.timezone.utc).strftime('%H%M%S')}"
+                    f"-{time.time_ns()}.jsonl"
+                )
+                path.replace(rotated)
+            with path.open("ab") as output:
+                output.write(encoded)
+            path.chmod(0o600)
+            candidates = sorted(
+                FORENSICS_ROOT.glob(f"{kind}-*.jsonl"),
+                key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name),
+                reverse=True,
+            )
+            for stale in candidates[FORENSICS_FILE_RETENTION:]:
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        return True
+    except OSError:
+        return False
+
+
+def _copy_binding_forensics(pane_id: str) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "provider": None,
+        "version": None,
+        "transcriptPath": None,
+        "cacheState": "absent",
+    }
+    if not re.fullmatch(r"%[1-9][0-9]*", pane_id):
+        metadata["cacheState"] = "invalid-pane"
+        return metadata
+    path = Path.home() / ".mobile-terminal" / "provider-bindings" / f"{pane_id[1:]}.json"
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return metadata
+    except OSError:
+        metadata["cacheState"] = "unavailable"
+        return metadata
+    if len(raw) > 64 * 1024:
+        metadata["cacheState"] = "oversized"
+        return metadata
+    try:
+        cache = json.loads(raw)
+    except json.JSONDecodeError:
+        metadata["cacheState"] = "invalid"
+        return metadata
+    if not isinstance(cache, dict):
+        metadata["cacheState"] = "invalid"
+        return metadata
+    provider = cache.get("provider")
+    version = cache.get("version")
+    transcript_path = cache.get("transcriptPath")
+    metadata.update(
+        {
+            "provider": provider if isinstance(provider, str) else None,
+            "version": version if isinstance(version, str) else None,
+            "transcriptPath": (
+                transcript_path if isinstance(transcript_path, str) else None
+            ),
+            "cacheState": "active" if cache.get("active") is True else "inactive",
+        }
+    )
+    return metadata
+
+
+def _store_copy_forensics(
+    bridge: "TmuxBridge",
+    payload: dict[str, Any],
+    result: "AuthoritativeSelectionResult",
+    trace: dict[str, Any],
+    started_at: float,
+) -> None:
+    if not COPY_FORENSICS_ENABLED:
+        return
+    decision = str(trace.get("decision") or "")
+    if decision not in ("matched", "fallback", "rejected", "unowned"):
+        if result.error:
+            decision = "rejected"
+        elif result.authority == "provider-exact":
+            decision = "matched"
+        elif result.authority == "terminal-raw":
+            decision = "fallback"
+        else:
+            decision = "unowned"
+    authority = (
+        result.authority
+        if result.authority in ("provider-exact", "terminal-raw")
+        else "none"
+    )
+    try:
+        epoch = int(payload.get("epoch", -1))
+    except (TypeError, ValueError):
+        epoch = -1
+    try:
+        cols = int(payload.get("cols", -1))
+    except (TypeError, ValueError):
+        cols = -1
+    try:
+        rows = int(payload.get("rows", -1))
+    except (TypeError, ValueError):
+        rows = -1
+    binding = _copy_binding_forensics(str(payload.get("paneId", bridge.pane_id)))
+    stored = _append_forensics_record(
+        "copy",
+        {
+            "ts": _utc_forensics_timestamp(),
+            "providerMode": provider_authority_mode(),
+            "decision": decision,
+            "reason": str(trace.get("reason") or "unspecified"),
+            "authority": authority,
+            "selectedText": trace.get("selectedText"),
+            "resultText": result.text if result.error is None else None,
+            "bufferType": str(payload.get("bufferType", "")),
+            "clientRowsPresent": isinstance(payload.get("clientRows"), list),
+            "paneId": str(payload.get("paneId", bridge.pane_id)),
+            "session": str(payload.get("session", bridge.session_name)),
+            "epoch": epoch,
+            "cols": cols,
+            "rows": rows,
+            "binding": binding,
+            "rowQuarantineReasons": trace.get("rowQuarantineReasons", []),
+            "candidateCount": trace.get("candidateCount"),
+            "placementCount": trace.get("placementCount"),
+            "elapsedMs": round((time.perf_counter() - started_at) * 1000, 3),
+        },
+    )
+    if stored:
+        try:
+            print(
+                "copy forensics stored "
+                f"decision={decision} reason={str(trace.get('reason') or 'unspecified')} "
+                f"authority={authority} buffer={str(payload.get('bufferType', ''))} "
+                f"clientRows={isinstance(payload.get('clientRows'), list)}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+
+def _store_viewport_forensics(
+    connection: ServerConnection,
+    bridge: "TmuxBridge",
+    state: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> None:
+    if not COPY_FORENSICS_ENABLED:
+        return
+    user_agent = connection.request.headers.get("User-Agent", "")
+    stored = _append_forensics_record(
+        "viewport",
+        {
+            "ts": _utc_forensics_timestamp(),
+            "session": str(state.get("session", bridge.session_name)),
+            "userAgent": str(user_agent)[:160],
+            "paneId": bridge.pane_id,
+            "epoch": bridge.epoch_state["epoch"],
+            "events": events,
+        },
+    )
+    if stored:
+        try:
+            print(f"viewport forensics stored events={len(events)}", flush=True)
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True)
@@ -3617,18 +3817,34 @@ class TmuxBridge:
                 self.selection_hold_request_id = None
                 self.phase = "forward"
 
-    async def authoritative_selection_result(
+    async def _authoritative_selection_result(
         self,
         payload: dict[str, Any],
         *,
         defer_hold_release: bool = False,
+        forensics_trace: dict[str, Any] | None = None,
     ) -> AuthoritativeSelectionResult:
         request_id = str(payload.get("requestId", ""))
         stale_message = "Terminal changed; select again."
 
         def reject(reason: str) -> AuthoritativeSelectionResult:
+            if forensics_trace is not None:
+                forensics_trace["decision"] = "rejected"
+                forensics_trace.setdefault("reason", reason)
             _record_authoritative_selection_rejection(reason)
             return AuthoritativeSelectionResult(error=stale_message)
+
+        def observe_provider_result(provider: Any) -> None:
+            if forensics_trace is None:
+                return
+            decision = getattr(provider, "decision", None)
+            reason = getattr(provider, "reason", None)
+            if decision in ("matched", "fallback", "rejected", "unowned"):
+                forensics_trace["decision"] = decision
+            if isinstance(reason, str) and reason:
+                forensics_trace["reason"] = reason
+                if "quarantine" in reason or reason.startswith("unsafe-captured"):
+                    forensics_trace["rowQuarantineReasons"] = [reason]
 
         try:
             epoch = int(payload.get("epoch", -1))
@@ -3680,6 +3896,12 @@ class TmuxBridge:
                 )
             except ValueError:
                 return reject("client-rows-invalid")
+            if forensics_trace is not None:
+                forensics_trace["selectedText"] = _extract_client_selection_rows(
+                    client_selection_rows,
+                    start_x,
+                    end_x,
+                )
         elif (
             base_y < self.seed_history
             or base_y > MAX_HISTORY_SEED_LINES
@@ -3804,6 +4026,7 @@ class TmuxBridge:
                             relative_end_row,
                             client_rows=client_selection_rows,
                         )
+                        observe_provider_result(provider)
                         if provider.owned:
                             return AuthoritativeSelectionResult(
                                 text=provider.text or "",
@@ -3952,6 +4175,17 @@ class TmuxBridge:
                         or (alternate_request and self.offset != stable_offset)
                     ):
                         return reject("stability-recheck")
+                    if forensics_trace is not None:
+                        try:
+                            forensics_trace["selectedText"] = extract_authoritative_selection(
+                                snapshot,
+                                start_x,
+                                resolved_start_row,
+                                end_x,
+                                resolved_end_row,
+                            )
+                        except (RuntimeError, ValueError):
+                            forensics_trace["selectedText"] = None
                     matched, exact_text = exact_provenance_selection(
                         snapshot,
                         self.session_name,
@@ -3974,6 +4208,7 @@ class TmuxBridge:
                             end_x,
                             resolved_end_row,
                         )
+                        observe_provider_result(provider)
 
                     exception_reason = "snapshot-capture"
                     verification_snapshot = await capture_selection_snapshot(
@@ -4043,6 +4278,9 @@ class TmuxBridge:
                             return reject("selected-rows-changed")
 
                     if matched:
+                        if forensics_trace is not None:
+                            forensics_trace["decision"] = "matched"
+                            forensics_trace["reason"] = "command-provenance"
                         return AuthoritativeSelectionResult(text=exact_text or "")
                     assert provider is not None
                     if provider.owned:
@@ -4066,6 +4304,13 @@ class TmuxBridge:
                         text=selected_text,
                         authority=authority,
                     )
+                except ProviderAuthorityError as exc:
+                    if forensics_trace is not None:
+                        forensics_trace["decision"] = "rejected"
+                        forensics_trace["reason"] = exc.reason
+                        if "quarantine" in exc.reason or exc.reason.startswith("unsafe-captured"):
+                            forensics_trace["rowQuarantineReasons"] = [exc.reason]
+                    return reject(exception_reason)
                 except (RuntimeError, ValueError, asyncio.TimeoutError):
                     return reject(exception_reason)
                 finally:
@@ -4075,6 +4320,27 @@ class TmuxBridge:
                             await self._flush_selection_hold(request_id)
                         except Exception:
                             pass
+
+    async def authoritative_selection_result(
+        self,
+        payload: dict[str, Any],
+        *,
+        defer_hold_release: bool = False,
+    ) -> AuthoritativeSelectionResult:
+        if not COPY_FORENSICS_ENABLED:
+            return await self._authoritative_selection_result(
+                payload,
+                defer_hold_release=defer_hold_release,
+            )
+        started_at = time.perf_counter()
+        trace: dict[str, Any] = {"selectedText": None}
+        result = await self._authoritative_selection_result(
+            payload,
+            defer_hold_release=defer_hold_release,
+            forensics_trace=trace,
+        )
+        _store_copy_forensics(self, payload, result, trace, started_at)
+        return result
 
     async def authoritative_selection(
         self,
@@ -4678,6 +4944,7 @@ class AppServer:
                 "deviceKeyAuth": True,
                 "passkeyAuth": True,
                 "rpId": self.rp_id(connection),
+                **({"copyForensics": True} if COPY_FORENSICS_ENABLED else {}),
             }
             body = json.dumps(payload).encode("utf-8")
             return http_response(200, body, "application/json; charset=utf-8")
@@ -5551,6 +5818,24 @@ class AppServer:
             await self.send_composer_state(connection, session_name)
             return
 
+        if message_type == "viewport-diag":
+            if not COPY_FORENSICS_ENABLED:
+                return
+            events = payload.get("events")
+            wire_bytes = payload.get("_viewportDiagWireBytes")
+            if (
+                not isinstance(events, list)
+                or not events
+                or len(events) > 60
+                or not all(isinstance(event, dict) for event in events)
+                or isinstance(wire_bytes, bool)
+                or not isinstance(wire_bytes, int)
+                or wire_bytes > MAX_VIEWPORT_FORENSICS_BYTES
+            ):
+                return
+            _store_viewport_forensics(connection, bridge, state, events)
+            return
+
         if message_type == "selection-request":
             request_id = str(payload.get("requestId", ""))
             result = await bridge.authoritative_selection_result(
@@ -6294,6 +6579,8 @@ class AppServer:
                     payload["_selectionRequestWireBytes"] = (
                         _selection_request_wire_bytes(raw_message)
                     )
+                elif payload.get("type") == "viewport-diag":
+                    payload["_viewportDiagWireBytes"] = len(raw_message.encode("utf-8"))
                 if bridge.acknowledge(payload):
                     continue
                 await incoming.put(payload)
@@ -6342,6 +6629,7 @@ class AppServer:
                 "userLabel": self.users.get(user, {}).get("label") if self.multi_tenant else None,
                 "principal": forwarded_principal,
                 "paneLocalScroll": pane_scrolls_locally(state["session"]),
+                **({"copyForensics": True} if COPY_FORENSICS_ENABLED else {}),
             }
             if initial:
                 payload["openTabs"] = self.open_tabs_for(user)

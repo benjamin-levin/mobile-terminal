@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import unittest
 import uuid
@@ -3180,6 +3181,195 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error, "Terminal changed; select again.")
 
 
+class ForensicsPersistenceTest(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_forensics_writes_no_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "forensics"
+            with (
+                mock.patch("server.COPY_FORENSICS_ENABLED", False),
+                mock.patch("server.FORENSICS_ROOT", root),
+            ):
+                stored = server._append_forensics_record("copy", {"text": "complete"})
+
+            self.assertFalse(stored)
+            self.assertFalse(root.exists())
+
+    async def test_enabled_copy_forensics_stores_complete_matched_and_fallback_records(self):
+        pane = snapshot(
+            cols=12,
+            authored_lines=["provider"],
+            plain_physical_rows=["provider    "],
+            rows=1,
+        )
+        connection = RecordingConnection()
+        bridge = TmuxBridge(
+            connection,
+            "session",
+            "/bin/sh",
+            "/",
+            provenance_state=CommandProvenanceState(),
+        )
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        bridge.phase = "forward"
+        bridge.quiet = mock.AsyncMock()
+        payload = {
+            "requestId": "forensics",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": 0,
+            "revision": 0,
+            "cutoff": 0,
+            "layoutGeneration": 0,
+            "cols": 12,
+            "rows": 1,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {"start": {"x": 0, "y": 0}, "end": {"x": 8, "y": 0}},
+        }
+        binding = {
+            "provider": "claude",
+            "version": "test-version",
+            "transcriptPath": "/private/transcript.jsonl",
+            "cacheState": "active",
+        }
+        cases = (
+            (
+                mock.Mock(
+                    owned=True,
+                    text="full exact result\nwith break",
+                    authority="provider-exact",
+                    decision="matched",
+                    reason="canonical-match",
+                ),
+                "matched",
+                "provider-exact",
+                "full exact result\nwith break",
+            ),
+            (
+                mock.Mock(
+                    owned=False,
+                    text=None,
+                    authority="terminal-raw",
+                    decision="fallback",
+                    reason="no-canonical-candidate",
+                ),
+                "fallback",
+                "terminal-raw",
+                "provider",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "forensics"
+            with (
+                mock.patch("server.COPY_FORENSICS_ENABLED", True),
+                mock.patch("server.FORENSICS_ROOT", root),
+                mock.patch("server.provider_authority_mode", return_value="prefer"),
+                mock.patch("server._copy_binding_forensics", return_value=binding),
+                mock.patch("server.capture_pane_snapshot", return_value=pane),
+                mock.patch("builtins.print"),
+            ):
+                for index, (provider, _decision, _authority, _result) in enumerate(cases):
+                    payload["requestId"] = f"forensics-{index}"
+                    with mock.patch("server.provider_selection", return_value=provider):
+                        result = await bridge.authoritative_selection_result(payload)
+                    self.assertIsNone(result.error)
+
+            path = next(root.glob("copy-*.jsonl"))
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+
+        self.assertEqual(len(records), 2)
+        for record, (_provider, decision, authority, result_text) in zip(records, cases):
+            self.assertEqual(record["providerMode"], "prefer")
+            self.assertEqual(record["decision"], decision)
+            self.assertEqual(record["authority"], authority)
+            self.assertEqual(record["selectedText"], "provider")
+            self.assertEqual(record["resultText"], result_text)
+            self.assertEqual(record["binding"], binding)
+            self.assertEqual(record["session"], "session")
+            self.assertEqual(record["paneId"], "%1")
+            self.assertEqual(record["cols"], 12)
+            self.assertEqual(record["rows"], 1)
+            self.assertGreaterEqual(record["elapsedMs"], 0)
+
+    async def test_forensics_rotation_caps_files_and_retains_newest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "forensics"
+            with (
+                mock.patch("server.COPY_FORENSICS_ENABLED", True),
+                mock.patch("server.FORENSICS_ROOT", root),
+                mock.patch("server.FORENSICS_FILE_MAX_BYTES", 80),
+                mock.patch("server.FORENSICS_FILE_RETENTION", 3),
+                mock.patch("builtins.print"),
+            ):
+                for index in range(8):
+                    self.assertTrue(
+                        server._append_forensics_record(
+                            "copy",
+                            {"index": index, "text": "x" * 64},
+                        )
+                    )
+
+            paths = list(root.glob("copy-*.jsonl"))
+            indexes = {
+                json.loads(line)["index"]
+                for path in paths
+                for line in path.read_text().splitlines()
+            }
+
+        self.assertEqual(len(paths), 3)
+        self.assertEqual(indexes, {5, 6, 7})
+
+    async def test_viewport_diag_persists_connection_context_and_enforces_wire_bound(self):
+        app = object.__new__(AppServer)
+        connection = mock.Mock()
+        connection.request.headers = {"User-Agent": "Mobile Browser " + "x" * 300}
+        bridge = mock.Mock()
+        bridge.session_name = "session"
+        bridge.pane_id = "%7"
+        bridge.epoch_state = {"epoch": 4}
+        state = {"session": "session", "user": "user"}
+        event = {"t": 123, "type": "viewport-update", "innerH": 844}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "forensics"
+            with (
+                mock.patch("server.COPY_FORENSICS_ENABLED", True),
+                mock.patch("server.FORENSICS_ROOT", root),
+                mock.patch("builtins.print"),
+            ):
+                await app.handle_command(
+                    connection,
+                    bridge,
+                    state,
+                    {
+                        "type": "viewport-diag",
+                        "events": [event],
+                        "_viewportDiagWireBytes": 200,
+                    },
+                )
+                await app.handle_command(
+                    connection,
+                    bridge,
+                    state,
+                    {
+                        "type": "viewport-diag",
+                        "events": [{"t": 999}],
+                        "_viewportDiagWireBytes": server.MAX_VIEWPORT_FORENSICS_BYTES + 1,
+                    },
+                )
+
+            path = next(root.glob("viewport-*.jsonl"))
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["events"], [event])
+        self.assertEqual(records[0]["session"], "session")
+        self.assertEqual(records[0]["paneId"], "%7")
+        self.assertEqual(records[0]["epoch"], 4)
+        self.assertEqual(len(records[0]["userAgent"]), 160)
+
+
 class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
     def make_bridge(self, pane, *, offset=0, revision=None):
         connection = RecordingConnection()
@@ -4310,6 +4500,50 @@ class ClientProtocolSourceTest(unittest.TestCase):
         self.assertIn("fg-indexed-", client_rows)
         self.assertIn("bg-indexed-", client_rows)
         self.assertIn('token += ";inverse"', client_rows)
+
+    def test_viewport_forensics_are_gated_bounded_throttled_and_contextual(self):
+        recorder = self.source[
+            self.source.index("  function recordViewportForensics(") :
+            self.source.index("  function setDesiredTerminalSize(")
+        ]
+        self.assertIn("if (!copyForensicsEnabled)", recorder)
+        self.assertIn("VIEWPORT_FORENSICS_MAX_EVENTS", recorder)
+        self.assertIn("VIEWPORT_FORENSICS_MAX_BYTES", recorder)
+        self.assertIn("VIEWPORT_FORENSICS_THROTTLE_MS", recorder)
+        self.assertIn('type: "viewport-diag", events', recorder)
+        self.assertIn("new TextEncoder().encode(JSON.stringify(payload)).byteLength", recorder)
+
+        viewport = self.source[
+            self.source.index("  function scheduleViewportSettlePasses(") :
+            self.source.index("  function renderTabs()")
+        ]
+        for field in (
+            "vvH",
+            "vvTop",
+            "innerH",
+            "keyboardInset",
+            "keyboardOpenDataset",
+            "focusedAcceptsKeyboard",
+            "appliedAppTop",
+            "appliedAppHeight",
+        ):
+            self.assertIn(field, viewport)
+        self.assertIn('recordViewportForensics("viewport-settle-complete"', viewport)
+        self.assertIn("flushViewportForensics();", viewport)
+        self.assertIn("lastViewportKeyboardInset > 0 && geometry.keyboardInset === 0", viewport)
+
+        fit = self.source[
+            self.source.index("  function fitTerminal(") :
+            self.source.index("  function cancelTouchInertia()")
+        ]
+        self.assertIn('recordViewportForensics("fit-terminal"', fit)
+        self.assertIn("sent: resizeSent", fit)
+        self.assertIn("authoritative: terminalAuthoritative", fit)
+        self.assertIn('recordViewportForensics("resize-desired"', self.source)
+        self.assertIn('recordViewportForensics("resize-delivered"', self.source)
+        self.assertIn('recordViewportForensics("composer-focus")', self.source)
+        self.assertIn('recordViewportForensics("composer-blur")', self.source)
+        self.assertIn("copyForensicsEnabled = serverConfig.copyForensics === true;", self.source)
 
     def test_empty_authoritative_text_is_a_successful_copy_result(self):
         copy_start = self.source.index("  async function copyTerminalSelection()")

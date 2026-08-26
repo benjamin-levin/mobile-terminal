@@ -91,6 +91,8 @@ The server may hold later PTY output while resolving a selection. It sends `sele
 
 Diagnostics are bounded aggregate reason counters only. They may report counts and stable reason codes such as binding failure, unsupported renderer, ambiguous placement, snapshot mismatch, or invalid client-row geometry. They must not contain source text, selected text, client row text/styles, terminal rows, tokens, credentials, or provider authentication data.
 
+For temporary, explicit incident collection, setting `MOBILE_TERMINAL_COPY_FORENSICS=1` at service startup enables full-text copy records under `state/forensics/copy-YYYYMMDD.jsonl` and bounded client viewport/resize records under `state/forensics/viewport-YYYYMMDD.jsonl`. These owner-only files include selected and returned copy text and transcript-path binding metadata, so treat them as sensitive debugging data and disable the setting after collection. Each stream rotates near 50 MiB and retains the latest five files. Journal output remains sanitized and never includes copied text, terminal rows, transcript paths, tokens, or authentication material.
+
 Do not use `/proc/<pid>/environ` as the deployment verifier. It can be inaccessible under procfs hardening and can expose secrets if printed. Read only the configured authority mode from the owner-only env file and use provider binding validation for runtime authority.
 
 ## Required regression coverage

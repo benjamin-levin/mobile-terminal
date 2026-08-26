@@ -2210,6 +2210,7 @@ class RuntimeBindingCacheTest(unittest.TestCase):
             self.assertTrue(exact.owned)
             self.assertEqual(exact.text, "exact source")
             self.assertEqual(exact.authority, "provider-exact")
+            self.assertEqual((exact.decision, exact.reason), ("matched", "canonical-match"))
 
             with patch.dict(
                 os.environ,
@@ -2225,6 +2226,10 @@ class RuntimeBindingCacheTest(unittest.TestCase):
             self.assertFalse(fallback.owned)
             self.assertIsNone(fallback.text)
             self.assertEqual(fallback.authority, "terminal-raw")
+            self.assertEqual(
+                (fallback.decision, fallback.reason),
+                ("fallback", "no-plain-placement"),
+            )
 
     def test_alternate_client_rows_anchor_provider_geometry_and_style(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -37,6 +37,10 @@
   const AUTHENTICATION_MODES = new Set(["off", "idle", "every-open"]);
   const KEYBOARD_THRESHOLD = 80;
   const VIEWPORT_SETTLE_DELAYS = [80, 220, 420, 700, 1000, 1400];
+  const VIEWPORT_FORENSICS_MAX_EVENTS = 60;
+  const VIEWPORT_FORENSICS_MAX_BYTES = 16 * 1024;
+  const VIEWPORT_FORENSICS_THROTTLE_MS = 5000;
+  const VIEWPORT_FORENSICS_SETTLE_FLUSH_MS = 2000;
   const UI_SCALE_FIT_WIDTH = 430;
   const UI_SCALE_FIT_HEIGHT = 700;
   const EDITOR_TAB_PREFIX = "editor:";
@@ -703,6 +707,10 @@
   let lastLayoutViewportWidth = 0;
   let viewportSettleGeneration = 0;
   let viewportSettleTimer = null;
+  let copyForensicsEnabled = false;
+  const viewportForensicsEvents = [];
+  let viewportForensicsLastFlushAt = -Infinity;
+  let lastViewportKeyboardInset = 0;
   let lastStableViewportWidth = 0;
   let lastStableViewportHeight = 0;
   let currentTabs = [];
@@ -4487,6 +4495,7 @@
       }
       serverConfig = config;
       serverConfigAvailable = true;
+      copyForensicsEnabled = serverConfig.copyForensics === true;
     } catch (_error) {
       serverConfigAvailable = false;
       return false;
@@ -4645,6 +4654,44 @@
     return true;
   }
 
+  function recordViewportForensics(type, fields = {}) {
+    if (!copyForensicsEnabled) {
+      return;
+    }
+    viewportForensicsEvents.push({ t: Date.now(), type, ...fields });
+    if (viewportForensicsEvents.length > VIEWPORT_FORENSICS_MAX_EVENTS) {
+      viewportForensicsEvents.splice(
+        0,
+        viewportForensicsEvents.length - VIEWPORT_FORENSICS_MAX_EVENTS,
+      );
+    }
+  }
+
+  function flushViewportForensics() {
+    if (
+      !copyForensicsEnabled ||
+      viewportForensicsEvents.length === 0 ||
+      Date.now() - viewportForensicsLastFlushAt < VIEWPORT_FORENSICS_THROTTLE_MS
+    ) {
+      return false;
+    }
+    const events = viewportForensicsEvents.slice();
+    let payload = { type: "viewport-diag", events };
+    while (
+      events.length > 0 &&
+      new TextEncoder().encode(JSON.stringify(payload)).byteLength > VIEWPORT_FORENSICS_MAX_BYTES
+    ) {
+      events.shift();
+      payload = { type: "viewport-diag", events };
+    }
+    if (events.length === 0 || !sendMessage(payload)) {
+      return false;
+    }
+    viewportForensicsEvents.length = 0;
+    viewportForensicsLastFlushAt = Date.now();
+    return true;
+  }
+
   function setDesiredTerminalSize(cols, rows) {
     const nextCols = Math.floor(Number(cols));
     const nextRows = Math.floor(Number(rows));
@@ -4654,16 +4701,32 @@
     if (nextCols === desiredTerminalCols && nextRows === desiredTerminalRows) {
       return false;
     }
+    const previousCols = desiredTerminalCols;
+    const previousRows = desiredTerminalRows;
     desiredTerminalCols = nextCols;
     desiredTerminalRows = nextRows;
+    recordViewportForensics("resize-desired", {
+      fromCols: previousCols,
+      fromRows: previousRows,
+      cols: nextCols,
+      rows: nextRows,
+    });
     terminalResizeDirty = true;
     terminalResizePending = true;
     return true;
   }
 
   function resetDeliveredTerminalSize() {
+    const previousCols = deliveredTerminalCols;
+    const previousRows = deliveredTerminalRows;
     deliveredTerminalCols = 0;
     deliveredTerminalRows = 0;
+    recordViewportForensics("resize-delivered-reset", {
+      fromCols: previousCols,
+      fromRows: previousRows,
+      cols: 0,
+      rows: 0,
+    });
     terminalResizePending = desiredTerminalCols > 0 && desiredTerminalRows > 0;
   }
 
@@ -4692,6 +4755,10 @@
     }
     deliveredTerminalCols = desiredTerminalCols;
     deliveredTerminalRows = desiredTerminalRows;
+    recordViewportForensics("resize-delivered", {
+      cols: deliveredTerminalCols,
+      rows: deliveredTerminalRows,
+    });
     terminalResizeDirty = false;
     terminalResizePending = false;
     return true;
@@ -5100,7 +5167,13 @@
       clampTerminalColumnsToVisibleWidth();
       lastTerminalLayoutWidth = terminalWidth;
       setDesiredTerminalSize(term.cols, term.rows);
-      flushTerminalResize();
+      const resizeSent = flushTerminalResize();
+      recordViewportForensics("fit-terminal", {
+        cols: term.cols,
+        rows: term.rows,
+        sent: resizeSent,
+        authoritative: terminalAuthoritative,
+      });
       if (followOutput) {
         term.scrollToBottom();
       }
@@ -6050,7 +6123,22 @@
       updateViewportMetrics();
       passIndex += 1;
       if (passIndex >= VIEWPORT_SETTLE_DELAYS.length) {
-        viewportSettleTimer = null;
+        recordViewportForensics("viewport-settle-complete", { generation });
+        if (!copyForensicsEnabled) {
+          viewportSettleTimer = null;
+          return;
+        }
+        const throttleRemaining = Math.max(
+          0,
+          VIEWPORT_FORENSICS_THROTTLE_MS - (Date.now() - viewportForensicsLastFlushAt),
+        );
+        viewportSettleTimer = window.setTimeout(() => {
+          if (generation !== viewportSettleGeneration) {
+            return;
+          }
+          viewportSettleTimer = null;
+          flushViewportForensics();
+        }, Math.max(VIEWPORT_FORENSICS_SETTLE_FLUSH_MS, throttleRemaining));
         return;
       }
       viewportSettleTimer = window.setTimeout(
@@ -6182,6 +6270,21 @@
       geometry.keyboardInset,
       geometry.layoutHeight,
     );
+    recordViewportForensics("viewport-update", {
+      vvH: window.visualViewport ? window.visualViewport.height : null,
+      vvTop: window.visualViewport ? window.visualViewport.offsetTop : null,
+      innerH: window.innerHeight,
+      keyboardInset: geometry.keyboardInset,
+      keyboardOpenDataset: document.body.dataset.keyboardOpen,
+      focusedAcceptsKeyboard: focusedElementAcceptsKeyboard(),
+      appliedAppTop: Math.round(geometry.offsetTop),
+      appliedAppHeight: Math.round(geometry.viewportHeight),
+    });
+    const keyboardClosed = lastViewportKeyboardInset > 0 && geometry.keyboardInset === 0;
+    lastViewportKeyboardInset = geometry.keyboardInset;
+    if (keyboardClosed) {
+      flushViewportForensics();
+    }
   }
 
   function assertKeyboardClosedGeometry() {
@@ -8256,6 +8359,9 @@
       return;
     }
     if (payload.type === "ready") {
+      if (payload.copyForensics === true) {
+        copyForensicsEnabled = true;
+      }
       terminalAuthoritative = false;
       resetDeliveredTerminalSize();
       flushTerminalResize();
@@ -10312,12 +10418,14 @@
     closeTabMenu();
   });
   composerInput.addEventListener("focus", () => {
+    recordViewportForensics("composer-focus");
     composerPanel.classList.remove("hidden");
     setComposerActive(true);
     autoSizeComposer();
     scheduleViewportSettlePasses();
   });
   composerInput.addEventListener("blur", () => {
+    recordViewportForensics("composer-blur");
     setComposerActive(false);
     // iOS can leave visualViewport shrunk without another event after blur.
     // Close the geometry synchronously, then let the shared settle generation
