@@ -468,6 +468,9 @@ CLIENT_SELECTION_STYLE_RE = re.compile(
     r"(?:;inverse)?"
 )
 TMUX_INPUT_CHUNK_BYTES = 1024
+SEED_START_ACK_TIMEOUT_SECONDS = 5.0
+DEGRADED_SEED_QUIET_SECONDS = 2.0
+DEGRADED_SEED_RETRY_INTERVAL_SECONDS = 30.0
 AUTHORITATIVE_SELECTION_DIAGNOSTIC_FLUSH_EVERY = 128
 AUTHORITATIVE_SELECTION_REJECTION_REASONS = frozenset(
     {
@@ -482,6 +485,7 @@ AUTHORITATIVE_SELECTION_REJECTION_REASONS = frozenset(
         "selected-rows-changed",
         "selection-rows-unresolvable",
         "snapshot-capture",
+        "unstable-seed",
         "geometry-buffer-base-mismatch",
         "stability-recheck",
         "provider-tmux-exception",
@@ -563,6 +567,36 @@ def _record_authoritative_selection_rejection(reason: str) -> None:
 
 
 atexit.register(_flush_authoritative_selection_diagnostics)
+
+
+_SEED_FORENSICS_DIAGNOSTIC_LOCK = threading.Lock()
+_SEED_FORENSICS_DIAGNOSTICS: dict[str, int] = {}
+
+
+def _record_seed_forensics_diagnostic(decision: str) -> None:
+    if not COPY_FORENSICS_ENABLED:
+        return
+    with _SEED_FORENSICS_DIAGNOSTIC_LOCK:
+        count = _SEED_FORENSICS_DIAGNOSTICS.get(decision, 0) + 1
+        _SEED_FORENSICS_DIAGNOSTICS[decision] = count
+    try:
+        print(
+            "seed forensics diagnostics "
+            + json.dumps(
+                [
+                    {
+                        "mode": "seed",
+                        "decision": decision,
+                        "count": count,
+                    }
+                ],
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    except Exception:
+        pass
 
 
 def _utc_forensics_timestamp() -> str:
@@ -1139,6 +1173,8 @@ def capture_pane_snapshot(
     session_name: str,
     pane_id: str | None = None,
     history_lines: int = CONNECT_HISTORY_LINES,
+    *,
+    require_stable: bool = True,
 ) -> PaneSnapshot:
     before = pane_metadata(session_name, pane_id)
     (
@@ -1183,7 +1219,12 @@ def capture_pane_snapshot(
         styled_physical.returncode != 0
         or plain_physical.returncode != 0
         or authored.returncode != 0
-        or before != after
+        or (require_stable and before != after)
+        or (
+            not require_stable
+            and (before[0], before[2], before[3], before[4])
+            != (after[0], after[2], after[3], after[4])
+        )
     ):
         raise RuntimeError("tmux pane changed during capture")
     physical_rows = _capture_lines(styled_physical.stdout)
@@ -3047,6 +3088,9 @@ class TmuxBridge:
         self.selection_acks: dict[str, tuple[asyncio.Event, dict[str, Any]]] = {}
         self.selection_hold_request_id: str | None = None
         self.selection_row_identity: SnapshotRowIdentity | None = None
+        self.seed_degraded = False
+        self.last_stabilize_attempt_at: float | None = None
+        self.stabilize_task: asyncio.Task[None] | None = None
 
     @staticmethod
     def unescape_control(value: bytes) -> bytes:
@@ -3666,7 +3710,48 @@ class TmuxBridge:
             return True
         return False
 
-    async def _flush_seed_output(self, epoch: int, cutoff: int) -> None:
+    async def _flush_seed_output(
+        self,
+        epoch: int,
+        cutoff: int,
+        *,
+        degraded: bool = False,
+    ) -> None:
+        if degraded:
+            async with self.send_lock:
+                pending = [record for record in self.held if record["start"] >= cutoff]
+                self.held = []
+                for record in pending:
+                    await self._send_output(record, "postseed")
+                event = asyncio.Event()
+                self.flush_acks[(epoch, 1)] = event
+                through = pending[-1]["end"] if pending else cutoff
+                await self._send_json(
+                    {
+                        "type": "post-flush",
+                        "epoch": epoch,
+                        "cycle": 1,
+                        "through": through,
+                        "bytes": sum(
+                            record["end"] - record["start"] for record in pending
+                        ),
+                    }
+                )
+                await asyncio.wait_for(event.wait(), timeout=5)
+                self.flush_acks.pop((epoch, 1), None)
+                self.phase = "forward"
+                await self._send_json(
+                    {
+                        "type": "seed-open",
+                        "epoch": epoch,
+                        "session": self.session_name,
+                        "paneId": self.pane_id,
+                        "cutoff": cutoff,
+                        "layoutGeneration": self.epoch_state["layout"],
+                    }
+                )
+            return
+
         cycle = 0
         while True:
             pending = [record for record in self.held if record["start"] >= cutoff]
@@ -3706,6 +3791,48 @@ class TmuxBridge:
             }
         )
 
+    def _schedule_stabilize_reseed(self) -> None:
+        if self.closing or self.closed:
+            return
+        if self.stabilize_task is not None and not self.stabilize_task.done():
+            return
+        self.stabilize_task = asyncio.create_task(self._stabilize_when_quiet())
+
+    async def _stabilize_when_quiet(self) -> None:
+        current = asyncio.current_task()
+        try:
+            while self.seed_degraded and not self.closing and not self.closed:
+                try:
+                    await self.quiet(
+                        DEGRADED_SEED_QUIET_SECONDS,
+                        timeout=DEGRADED_SEED_RETRY_INTERVAL_SECONDS,
+                    )
+                except RuntimeError:
+                    continue
+                if not self.seed_degraded or self.closing or self.closed:
+                    return
+                now = time.monotonic()
+                if self.last_stabilize_attempt_at is not None:
+                    remaining = (
+                        DEGRADED_SEED_RETRY_INTERVAL_SECONDS
+                        - (now - self.last_stabilize_attempt_at)
+                    )
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                        continue
+                self.last_stabilize_attempt_at = time.monotonic()
+                try:
+                    await self.reseed("stabilize")
+                except ConnectionClosed:
+                    return
+                except (RuntimeError, asyncio.TimeoutError):
+                    continue
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self.stabilize_task is current:
+                self.stabilize_task = None
+
     async def reseed(
         self,
         reason: str,
@@ -3718,10 +3845,14 @@ class TmuxBridge:
         async with self.seed_lock:
             if self.closing or self.closed:
                 return
+            if reason == "stabilize" and not self.seed_degraded:
+                return
             if reason == "pane-change":
                 self.provenance_state.invalidate_layout()
             elif reason in ("history", "initial", "session-switch"):
                 self.provenance_state.invalidate_active()
+            if reason == "stabilize":
+                _record_seed_forensics_diagnostic("stabilize-reseed")
             async with self.send_lock:
                 self.selection_hold_request_id = None
                 self.phase = "hold"
@@ -3744,8 +3875,35 @@ class TmuxBridge:
                         "invalidFrom": self.offset,
                     }
                 )
-            await asyncio.wait_for(start_event.wait(), timeout=5)
-            self.seed_start_acks.pop(epoch, None)
+            try:
+                await asyncio.wait_for(
+                    start_event.wait(),
+                    timeout=SEED_START_ACK_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    print("terminal seed start acknowledgement timed out", flush=True)
+                except Exception:
+                    pass
+                try:
+                    await self._send_json(
+                        {
+                            "type": "notice",
+                            "message": "Terminal synchronization timed out. Reconnecting…",
+                        }
+                    )
+                except ConnectionClosed:
+                    pass
+                try:
+                    await self.connection.close(
+                        code=1013,
+                        reason="terminal synchronization timeout",
+                    )
+                except ConnectionClosed:
+                    pass
+                return
+            finally:
+                self.seed_start_acks.pop(epoch, None)
             if mutate is not None:
                 await mutate()
             elif reason == "initial":
@@ -3760,29 +3918,51 @@ class TmuxBridge:
             snapshot: PaneSnapshot | None = None
             cutoff = self.offset
             for _attempt in range(3):
-                self.last_output_at = time.monotonic()
-                await self.quiet()
-                cutoff = self.offset
-                candidate = await asyncio.to_thread(
+                try:
+                    self.last_output_at = time.monotonic()
+                    await self.quiet()
+                    candidate_cutoff = self.offset
+                    candidate = await asyncio.to_thread(
+                        capture_pane_snapshot,
+                        self.session_name,
+                        self.pane_id,
+                        requested_history,
+                    )
+                    self.last_output_at = time.monotonic()
+                    await self.quiet(0.05)
+                except (RuntimeError, asyncio.TimeoutError):
+                    continue
+                if self.offset == candidate_cutoff:
+                    snapshot = candidate
+                    cutoff = candidate_cutoff
+                    break
+            degraded = snapshot is None
+            if degraded:
+                snapshot = await asyncio.to_thread(
                     capture_pane_snapshot,
                     self.session_name,
                     self.pane_id,
                     requested_history,
+                    require_stable=False,
                 )
-                self.last_output_at = time.monotonic()
-                await self.quiet(0.05)
-                if self.offset == cutoff:
-                    snapshot = candidate
-                    break
-            if snapshot is None:
-                raise RuntimeError("tmux pane did not remain stable for capture")
+                # Linearize immediately after capture. Anything already observed on the
+                # control stream may also be represented in the snapshot and must not replay.
+                cutoff = self.offset
+                _record_seed_forensics_diagnostic("degraded")
             self.pane_id = snapshot.pane_id
             self.cutoff = cutoff
             self.seed_history = snapshot.seed_history
-            self.selection_row_identity = self.provenance_state.row_tracker.observe(
-                snapshot,
-                cutoff,
-            )
+            if degraded:
+                self.seed_degraded = True
+                self.selection_row_identity = None
+                self.provenance_state.row_tracker.invalidate()
+                self.provenance_state.invalidate_active()
+            else:
+                self.selection_row_identity = self.provenance_state.row_tracker.observe(
+                    snapshot,
+                    cutoff,
+                )
+                self.seed_degraded = False
             self.held = [record for record in self.held if record["start"] >= cutoff]
             await self._send_json(
                 {
@@ -3802,7 +3982,9 @@ class TmuxBridge:
             await self._send_json({"type": "seed-end", "epoch": epoch, "cutoff": cutoff})
             await asyncio.wait_for(seed_event.wait(), timeout=5)
             self.seed_acks.pop(epoch, None)
-            await self._flush_seed_output(epoch, cutoff)
+            await self._flush_seed_output(epoch, cutoff, degraded=degraded)
+            if degraded:
+                self._schedule_stabilize_reseed()
 
     async def _flush_selection_hold(self, request_id: str | None = None) -> None:
         async with self.send_lock:
@@ -3921,6 +4103,8 @@ class TmuxBridge:
 
         await self.settle_active_provenance_fence()
         async with self.seed_lock:
+            if self.seed_degraded:
+                return reject("unstable-seed")
             async with self.write_lock:
                 async with self.send_lock:
                     alternate_request = buffer_type == "alternate"
@@ -4351,6 +4535,14 @@ class TmuxBridge:
 
     async def close(self) -> None:
         self.closing = True
+        stabilize_task = self.stabilize_task
+        self.stabilize_task = None
+        if stabilize_task is not None and stabilize_task is not asyncio.current_task():
+            stabilize_task.cancel()
+            try:
+                await stabilize_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if (
             (
                 self.provenance_state.active is not None

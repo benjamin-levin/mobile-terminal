@@ -925,6 +925,66 @@ class TmuxHarnessLifecycleIntegrationTest(unittest.IsolatedAsyncioTestCase):
             "",
         )
 
+    async def test_continuously_streaming_private_pane_opens_degraded_seed(self):
+        harness = TmuxHarness(self, prefix="mtb-")
+        session_name = f"mt-busy-{uuid.uuid4().hex[:8]}"
+        harness.run(
+            "new-session",
+            "-d",
+            "-x",
+            "40",
+            "-y",
+            "8",
+            "-s",
+            session_name,
+            "/bin/sh",
+        )
+        harness.run("set-option", "-t", session_name, "status", "off")
+        connection = RecordingConnection()
+        bridge = harness.register_async_close(
+            TmuxBridge(
+                connection,
+                session_name,
+                "/bin/sh",
+                "/",
+                create_if_missing=False,
+                initial_size=(40, 8),
+            )
+        )
+        connection.bridge = bridge
+        await bridge.open()
+        bridge.phase = "forward"
+        before = bridge.offset
+        await bridge.write("while :; do printf 'streaming\n'; sleep 0.01; done\r")
+        for _attempt in range(100):
+            if bridge.offset > before:
+                break
+            await asyncio.sleep(0.01)
+        self.assertGreater(bridge.offset, before)
+
+        original_quiet = bridge.quiet
+
+        async def short_quiet(duration=0.14, timeout=3.0):
+            await original_quiet(duration, timeout=min(timeout, 0.05))
+
+        with (
+            mock.patch.object(bridge, "quiet", side_effect=short_quiet),
+            mock.patch.object(bridge, "_schedule_stabilize_reseed") as schedule,
+        ):
+            await bridge.reseed("history")
+
+        self.assertTrue(bridge.seed_degraded)
+        self.assertEqual(bridge.phase, "forward")
+        self.assertIsNone(bridge.selection_row_identity)
+        schedule.assert_called_once_with()
+        payloads = [
+            json.loads(message)
+            for message in connection.messages
+            if isinstance(message, str)
+        ]
+        self.assertIn("seed-data", [payload["type"] for payload in payloads])
+        self.assertEqual(payloads[-1]["type"], "seed-open")
+
 
 class LiveComposerHandlerIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -1700,6 +1760,137 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
             await close_task
 
         self.assertTrue(bridge.closed)
+
+    async def test_busy_reseed_degrades_at_post_capture_cutoff_and_recovers_strictly(self):
+        connection = RecordingConnection()
+        bridge = TmuxBridge(connection, "session", "/bin/sh", "/")
+        connection.bridge = bridge
+        bridge.pane_id = "%1"
+        pane = snapshot(cols=10, authored_lines=["streaming"], rows=1)
+
+        def capture(*_args, **_kwargs):
+            if bridge.offset == 0:
+                bridge.held.append({"start": 0, "end": 5, "data": b"stale"})
+                bridge.offset = 5
+            return pane
+
+        with (
+            mock.patch("server.capture_pane_snapshot", side_effect=capture),
+            mock.patch.object(bridge, "quiet", side_effect=RuntimeError("busy")),
+            mock.patch.object(bridge, "_schedule_stabilize_reseed") as schedule,
+            mock.patch("server.COPY_FORENSICS_ENABLED", True),
+            mock.patch("server._SEED_FORENSICS_DIAGNOSTICS", {}),
+            mock.patch("builtins.print") as output,
+        ):
+            await bridge.reseed("initial")
+
+        self.assertTrue(bridge.seed_degraded)
+        self.assertIsNone(bridge.selection_row_identity)
+        self.assertEqual(bridge.cutoff, 5)
+        self.assertEqual(bridge.phase, "forward")
+        self.assertNotIn(b"stale", connection.messages)
+        self.assertIn(b"post-cutoff", connection.messages)
+        schedule.assert_called_once_with()
+        diagnostics = "\n".join(call.args[0] for call in output.call_args_list)
+        self.assertIn('"decision":"degraded"', diagnostics)
+        self.assertNotIn("session", diagnostics)
+        self.assertNotIn("streaming", diagnostics)
+
+        payload = {
+            "requestId": "unstable-seed",
+            "profile": "",
+            "session": "session",
+            "paneId": "%1",
+            "epoch": bridge.epoch_state["epoch"],
+            "revision": bridge.offset,
+            "cutoff": bridge.cutoff,
+            "layoutGeneration": bridge.epoch_state["layout"],
+            "cols": 10,
+            "rows": 1,
+            "baseY": 0,
+            "bufferType": "normal",
+            "selection": {
+                "start": {"x": 0, "y": 0},
+                "end": {"x": 5, "y": 0},
+            },
+        }
+        with (
+            mock.patch("server._record_authoritative_selection_rejection") as rejected,
+            mock.patch(
+                "server.capture_pane_snapshot",
+                side_effect=AssertionError("degraded selection captured a pane"),
+            ),
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+        self.assertIsNone(text)
+        self.assertEqual(error, "Terminal changed; select again.")
+        rejected.assert_called_once_with("unstable-seed")
+
+        bridge.quiet = mock.AsyncMock()
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.COPY_FORENSICS_ENABLED", True),
+            mock.patch("server._SEED_FORENSICS_DIAGNOSTICS", {}),
+            mock.patch("builtins.print") as output,
+        ):
+            await bridge.reseed("stabilize")
+
+        self.assertFalse(bridge.seed_degraded)
+        self.assertIsNotNone(bridge.selection_row_identity)
+        diagnostics = "\n".join(call.args[0] for call in output.call_args_list)
+        self.assertIn('"decision":"stabilize-reseed"', diagnostics)
+
+    async def test_degraded_seed_schedules_one_rate_limited_reseed_when_quiet(self):
+        bridge = TmuxBridge(RecordingConnection(), "session", "/bin/sh", "/")
+        bridge.seed_degraded = True
+        bridge.quiet = mock.AsyncMock()
+
+        async def reseed(reason):
+            self.assertEqual(reason, "stabilize")
+            bridge.seed_degraded = False
+
+        bridge.reseed = mock.AsyncMock(side_effect=reseed)
+        bridge._schedule_stabilize_reseed()
+        task = bridge.stabilize_task
+        self.assertIsNotNone(task)
+        await task
+
+        bridge.quiet.assert_awaited_once_with(
+            server.DEGRADED_SEED_QUIET_SECONDS,
+            timeout=server.DEGRADED_SEED_RETRY_INTERVAL_SECONDS,
+        )
+        bridge.reseed.assert_awaited_once_with("stabilize")
+        self.assertIsNone(bridge.stabilize_task)
+
+    async def test_seed_start_ack_timeout_notifies_and_closes_for_reconnect(self):
+        connection = QueuedConnection()
+        connection.close = mock.AsyncMock()
+        bridge = TmuxBridge(connection, "session", "/bin/sh", "/")
+        bridge.pane_id = "%1"
+
+        with (
+            mock.patch("server.SEED_START_ACK_TIMEOUT_SECONDS", 0.01),
+            mock.patch("builtins.print") as output,
+        ):
+            await bridge.reseed("initial")
+
+        payloads = [
+            json.loads(message)
+            for message in connection.messages
+            if isinstance(message, str)
+        ]
+        self.assertEqual(payloads[0]["type"], "seed-start")
+        self.assertEqual(payloads[1]["type"], "notice")
+        self.assertIn("Reconnecting", payloads[1]["message"])
+        self.assertEqual(bridge.seed_start_acks, {})
+        connection.close.assert_awaited_once_with(
+            code=1013,
+            reason="terminal synchronization timeout",
+        )
+        self.assertIn(
+            "terminal seed start acknowledgement timed out",
+            output.call_args.args[0],
+        )
 
     async def test_reseed_after_close_emits_no_frames(self):
         connection = RecordingConnection()
