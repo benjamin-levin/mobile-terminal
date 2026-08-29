@@ -793,44 +793,62 @@ assert.deepEqual(termSel, { active: true });
         viewport = extract_function("updateViewportMetrics")
         self.assertIn("scheduleTerminalSelectionUISync();", viewport)
 
-    def test_keyboard_closed_geometry_normalizes_the_full_layout_viewport(self):
+    def test_viewport_geometry_tracks_focused_keyboard_across_ios_modes(self):
         self.run_node(
             ["normalizeViewportGeometry"],
             r"""
 const KEYBOARD_THRESHOLD = 80;
-const stale = { width: 390, height: 510, offsetLeft: 7, offsetTop: 46 };
+const tallLayout = { width: 390, height: 436, offsetLeft: 0, offsetTop: 0 };
 assert.deepEqual(
-  normalizeViewportGeometry(stale, 430, 800, false),
-  {
-    viewportWidth: 430,
-    viewportHeight: 800,
-    offsetLeft: 0,
-    offsetTop: 0,
-    keyboardInset: 0,
-    layoutHeight: 800,
-    hasVisualViewport: true,
-  },
-);
-assert.deepEqual(
-  normalizeViewportGeometry({ width: 400, height: 730, offsetLeft: 0, offsetTop: 10 }, 430, 800, true),
-  {
-    viewportWidth: 430,
-    viewportHeight: 800,
-    offsetLeft: 0,
-    offsetTop: 0,
-    keyboardInset: 0,
-    layoutHeight: 800,
-    hasVisualViewport: true,
-  },
-);
-assert.deepEqual(
-  normalizeViewportGeometry(stale, 430, 800, true),
+  normalizeViewportGeometry(tallLayout, 390, 759, true),
   {
     viewportWidth: 390,
-    viewportHeight: 510,
-    offsetLeft: 7,
-    offsetTop: 46,
-    keyboardInset: 244,
+    viewportHeight: 436,
+    offsetLeft: 0,
+    offsetTop: 0,
+    keyboardInset: 323,
+    keyboardOpen: true,
+    layoutHeight: 759,
+    hasVisualViewport: true,
+  },
+);
+const shrunkenLayout = { width: 390, height: 436, offsetLeft: 0, offsetTop: 323 };
+assert.deepEqual(
+  normalizeViewportGeometry(shrunkenLayout, 390, 436, true),
+  {
+    viewportWidth: 390,
+    viewportHeight: 436,
+    offsetLeft: 0,
+    offsetTop: 323,
+    keyboardInset: 0,
+    keyboardOpen: true,
+    layoutHeight: 436,
+    hasVisualViewport: true,
+  },
+);
+assert.deepEqual(
+  normalizeViewportGeometry(shrunkenLayout, 390, 759, false),
+  {
+    viewportWidth: 390,
+    viewportHeight: 759,
+    offsetLeft: 0,
+    offsetTop: 0,
+    keyboardInset: 0,
+    keyboardOpen: false,
+    layoutHeight: 759,
+    hasVisualViewport: true,
+  },
+);
+const focusedWithoutKeyboard = { width: 400, height: 730, offsetLeft: 3, offsetTop: 10 };
+assert.deepEqual(
+  normalizeViewportGeometry(focusedWithoutKeyboard, 430, 800, true),
+  {
+    viewportWidth: 400,
+    viewportHeight: 730,
+    offsetLeft: 3,
+    offsetTop: 10,
+    keyboardInset: 0,
+    keyboardOpen: false,
     layoutHeight: 800,
     hasVisualViewport: true,
   },
@@ -839,6 +857,12 @@ assert.deepEqual(
         )
         current = extract_function("currentViewportGeometry")
         self.assertIn("focusedElementAcceptsKeyboard()", current)
+        applied = extract_function("applyViewportGeometry")
+        self.assertIn('geometry.keyboardOpen ? "true" : "false"', applied)
+        keyboard_shell = css_rule('body[data-keyboard-open="true"] .app-shell')
+        self.assertIn("height: calc(var(--app-height) + var(--kb-accessory-gap));", keyboard_shell)
+        keyboard_shortcuts = css_rule('body[data-keyboard-open="true"] .shortcut-bar')
+        self.assertIn("padding-bottom: 0;", keyboard_shortcuts)
         blur = app_section(
             '  composerInput.addEventListener("blur", () => {',
             '  composerInput.addEventListener("input", () => {',

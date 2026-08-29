@@ -4721,7 +4721,7 @@ class ClientProtocolSourceTest(unittest.TestCase):
             self.assertIn(field, viewport)
         self.assertIn('recordViewportForensics("viewport-settle-complete"', viewport)
         self.assertIn("flushViewportForensics();", viewport)
-        self.assertIn("lastViewportKeyboardInset > 0 && geometry.keyboardInset === 0", viewport)
+        self.assertIn("lastViewportKeyboardOpen && !geometry.keyboardOpen", viewport)
 
         fit = self.source[
             self.source.index("  function fitTerminal(") :

@@ -710,7 +710,7 @@
   let copyForensicsEnabled = false;
   const viewportForensicsEvents = [];
   let viewportForensicsLastFlushAt = -Infinity;
-  let lastViewportKeyboardInset = 0;
+  let lastViewportKeyboardOpen = false;
   let lastStableViewportWidth = 0;
   let lastStableViewportHeight = 0;
   let currentTabs = [];
@@ -6212,7 +6212,10 @@
     const rawKeyboardInset = Math.max(0, layoutHeight - (viewportHeight + offsetTop));
     const keyboardInset =
       keyboardCapableFocus && rawKeyboardInset > KEYBOARD_THRESHOLD ? rawKeyboardInset : 0;
-    if (keyboardInset === 0) {
+    const keyboardOpen =
+      keyboardCapableFocus &&
+      (rawKeyboardInset > KEYBOARD_THRESHOLD || offsetTop > KEYBOARD_THRESHOLD);
+    if (!keyboardCapableFocus) {
       viewportWidth = layoutWidth;
       viewportHeight = layoutHeight;
       offsetLeft = 0;
@@ -6224,6 +6227,7 @@
       offsetLeft,
       offsetTop,
       keyboardInset,
+      keyboardOpen,
       layoutHeight,
       hasVisualViewport: Boolean(viewport),
     };
@@ -6263,7 +6267,7 @@
     document.documentElement.style.setProperty("--app-top", `${Math.round(geometry.offsetTop)}px`);
     document.documentElement.style.setProperty("--app-height", `${Math.round(geometry.viewportHeight)}px`);
     document.documentElement.style.setProperty("--keyboard-inset", `${Math.round(geometry.keyboardInset)}px`);
-    document.body.dataset.keyboardOpen = geometry.keyboardInset > 0 ? "true" : "false";
+    document.body.dataset.keyboardOpen = geometry.keyboardOpen ? "true" : "false";
     applyEffectiveUiScale(
       geometry.viewportWidth,
       geometry.viewportHeight,
@@ -6280,8 +6284,8 @@
       appliedAppTop: Math.round(geometry.offsetTop),
       appliedAppHeight: Math.round(geometry.viewportHeight),
     });
-    const keyboardClosed = lastViewportKeyboardInset > 0 && geometry.keyboardInset === 0;
-    lastViewportKeyboardInset = geometry.keyboardInset;
+    const keyboardClosed = lastViewportKeyboardOpen && !geometry.keyboardOpen;
+    lastViewportKeyboardOpen = geometry.keyboardOpen;
     if (keyboardClosed) {
       flushViewportForensics();
     }
