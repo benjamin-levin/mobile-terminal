@@ -16,6 +16,7 @@
      the dock meets the pill. Tune if it overshoots (buttons under pill) or
      undershoots (gap remains). */
   --kb-accessory-gap: 12px;
+  --ios-accessory-strip-allowance: 0px;
   /* Keyboard-closed chin: the shortcut dock pads its bottom by the home-indicator
      safe-area strip (~34px) so buttons clear the indicator. That reads as too much
      dead space. Trim this many px off the inset; the padding is floored at 4px
@@ -129,6 +130,13 @@ button {
    overflow:hidden clip a downward transform would cause. */
 body[data-keyboard-open="true"] .app-shell {
   height: calc(var(--app-height) + var(--kb-accessory-gap));
+}
+
+/* In iOS's shrunken-layout keyboard mode, keep the shortcut/composer dock above
+   the accessory strip. Include the shell's normal downward gap so the named
+   allowance is measured from the visual viewport edge, not the grown shell. */
+body[data-keyboard-shrunken="true"] .shortcuts-panel {
+  bottom: calc(var(--ios-accessory-strip-allowance) + var(--kb-accessory-gap));
 }
 
 .topbar {

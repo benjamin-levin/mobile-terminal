@@ -36,6 +36,9 @@
   const AUTHENTICATION_TIMESTAMP_MAX_FUTURE_MS = 24 * 60 * 60 * 1000;
   const AUTHENTICATION_MODES = new Set(["off", "idle", "every-open"]);
   const KEYBOARD_THRESHOLD = 80;
+  // iOS keyboard accessory-strip clearance. Keep this named so device
+  // forensics can tune it without hunting through layout calculations.
+  const IOS_ACCESSORY_STRIP_ALLOWANCE = 44;
   const VIEWPORT_SETTLE_DELAYS = [80, 220, 420, 700, 1000, 1400];
   const VIEWPORT_FORENSICS_MAX_EVENTS = 60;
   const VIEWPORT_FORENSICS_MAX_BYTES = 16 * 1024;
@@ -188,6 +191,7 @@
   const displayPreview = document.getElementById("displayPreview");
   const displayUiPreview = document.getElementById("displayUiPreview");
   const displayTerminalPreview = document.getElementById("displayTerminalPreview");
+  const appShell = document.querySelector(".app-shell");
   const terminalPanel = document.getElementById("terminalPanel");
   const terminalElement = document.getElementById("terminal");
   const fileWorkspace = document.getElementById("fileWorkspace");
@@ -703,6 +707,8 @@
   let terminalResizeDirty = false;
   let terminalResizePending = false;
   let lastTerminalLayoutWidth = 0;
+  let lastTerminalLayoutHeight = 0;
+  let lastShortcutReserve = 0;
   let lastComposerHeight = 0;
   let lastLayoutViewportWidth = 0;
   let viewportSettleGeneration = 0;
@@ -5125,6 +5131,16 @@
     }
   }
 
+  function repaintTerminalAfterGeometryChange() {
+    if (followOutput || performance.now() < bottomPinUntil) {
+      term.scrollToBottom();
+    }
+    if (term.rows > 0) {
+      term.refresh(0, term.rows - 1);
+    }
+    scheduleTerminalSelectionUISync();
+  }
+
   function fitTerminal({ preserveCols = false } = {}) {
     if (terminalPanel.classList.contains("hidden")) {
       return;
@@ -5147,8 +5163,16 @@
       } catch (_error) {
         // Internal API — ignore if shape changes.
       }
-      const terminalWidth = Math.ceil(terminalElement.getBoundingClientRect().width);
+      const terminalRect = terminalElement.getBoundingClientRect();
+      const terminalWidth = Math.ceil(terminalRect.width);
+      const terminalHeight = Math.ceil(terminalRect.height);
       const widthChanged = lastTerminalLayoutWidth > 0 && Math.abs(terminalWidth - lastTerminalLayoutWidth) > 1;
+      const pixelGeometryChanged =
+        lastTerminalLayoutWidth > 0 &&
+        lastTerminalLayoutHeight > 0 &&
+        (terminalWidth !== lastTerminalLayoutWidth || terminalHeight !== lastTerminalLayoutHeight);
+      const previousCols = term.cols;
+      const previousRows = term.rows;
       const shouldPreserveCols = pendingFitPreserveCols && !widthChanged && !terminalHorizontallyOverflows();
       pendingFitPreserveCols = false;
       if (typeof fitAddon.proposeDimensions === "function") {
@@ -5165,20 +5189,30 @@
         fitAddon.fit();
       }
       clampTerminalColumnsToVisibleWidth();
+      const dimensionsChanged = term.cols !== previousCols || term.rows !== previousRows;
       lastTerminalLayoutWidth = terminalWidth;
+      lastTerminalLayoutHeight = terminalHeight;
       setDesiredTerminalSize(term.cols, term.rows);
       const resizeSent = flushTerminalResize();
+      const shellRect = appShell ? appShell.getBoundingClientRect() : null;
       recordViewportForensics("fit-terminal", {
         cols: term.cols,
         rows: term.rows,
         sent: resizeSent,
         authoritative: terminalAuthoritative,
+        shortcutReserve: lastShortcutReserve,
+        shellRectTop: shellRect ? Math.round(shellRect.top) : null,
+        shellRectBottom: shellRect ? Math.round(shellRect.bottom) : null,
+        terminalClientHeight: terminalElement.clientHeight,
       });
-      if (followOutput) {
+      if (followOutput || performance.now() < bottomPinUntil) {
         term.scrollToBottom();
       }
       if (term.rows > 0) {
         term.refresh(0, term.rows - 1);
+      }
+      if (pixelGeometryChanged && !dimensionsChanged) {
+        window.requestAnimationFrame(repaintTerminalAfterGeometryChange);
       }
       scheduleTerminalSelectionUISync();
     });
@@ -6161,6 +6195,7 @@
 
   function measureShortcutHeight() {
     if (shortcutsPanel.classList.contains("hidden")) {
+      lastShortcutReserve = 0;
       document.documentElement.style.setProperty("--shortcut-height", "0px");
       document.documentElement.style.setProperty("--shortcut-reserve", "0px");
       return;
@@ -6174,16 +6209,27 @@
         ? composerPanel.getBoundingClientRect()
         : null;
     const geometry = currentViewportGeometry();
-    const viewportBottom = geometry.offsetTop + geometry.viewportHeight;
+    const shellRect = appShell ? appShell.getBoundingClientRect() : null;
+    // Keep both edges in getBoundingClientRect space. The shell grows past the
+    // visual viewport by the keyboard accessory gap, so remove only that
+    // length; adding visualViewport.offsetTop here mixes origins on iOS when
+    // the layout viewport itself has shrunk.
+    const shellOverflow =
+      shellRect && Number.isFinite(shellRect.height)
+        ? Math.max(0, shellRect.height - geometry.viewportHeight)
+        : 0;
+    const viewportBottom =
+      shellRect && Number.isFinite(shellRect.bottom)
+        ? shellRect.bottom - shellOverflow
+        : panelRect.bottom;
     const top = composerRect ? Math.min(panelRect.top, composerRect.top) : panelRect.top;
     const shortcutHeight = Math.ceil(shortcutRect.height);
     if (shortcutHeight > 0) {
       document.documentElement.style.setProperty("--shortcut-height", `${shortcutHeight}px`);
     }
     const reserve = Math.max(0, Math.ceil(viewportBottom - top));
-    if (reserve > 0) {
-      document.documentElement.style.setProperty("--shortcut-reserve", `${reserve}px`);
-    }
+    lastShortcutReserve = reserve;
+    document.documentElement.style.setProperty("--shortcut-reserve", `${reserve}px`);
   }
 
   function focusedElementAcceptsKeyboard() {
@@ -6242,6 +6288,14 @@
     );
   }
 
+  function iosAccessoryStripAllowance(geometry) {
+    return geometry.keyboardOpen &&
+      geometry.keyboardInset === 0 &&
+      geometry.offsetTop > KEYBOARD_THRESHOLD
+      ? IOS_ACCESSORY_STRIP_ALLOWANCE
+      : 0;
+  }
+
   // Pin the currently-open settings overlay directly to the effective viewport
   // so it stays above the keyboard without inheriting stale visualViewport
   // offsets after focus leaves a keyboard-capable field.
@@ -6267,7 +6321,13 @@
     document.documentElement.style.setProperty("--app-top", `${Math.round(geometry.offsetTop)}px`);
     document.documentElement.style.setProperty("--app-height", `${Math.round(geometry.viewportHeight)}px`);
     document.documentElement.style.setProperty("--keyboard-inset", `${Math.round(geometry.keyboardInset)}px`);
+    const accessoryAllowance = iosAccessoryStripAllowance(geometry);
+    document.documentElement.style.setProperty(
+      "--ios-accessory-strip-allowance",
+      `${accessoryAllowance}px`,
+    );
     document.body.dataset.keyboardOpen = geometry.keyboardOpen ? "true" : "false";
+    document.body.dataset.keyboardShrunken = accessoryAllowance > 0 ? "true" : "false";
     applyEffectiveUiScale(
       geometry.viewportWidth,
       geometry.viewportHeight,

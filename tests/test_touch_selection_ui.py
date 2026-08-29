@@ -872,6 +872,136 @@ assert.deepEqual(
             blur.index("scheduleViewportSettlePasses({ immediate: false });"),
         )
 
+    def test_shortcut_reserve_uses_shell_rect_space_across_ios_modes(self):
+        script = "\n".join(
+            [
+                'const assert = require("node:assert/strict");',
+                "const writes = new Map();",
+                "const document = {",
+                "  body: { dataset: {} },",
+                "  documentElement: { style: { setProperty: (name, value) => writes.set(name, value) } },",
+                "};",
+                "const shortcutsPanel = {",
+                "  classList: { contains: () => false },",
+                "  getBoundingClientRect: () => ({ top: 350, bottom: 448 }),",
+                "};",
+                "const shortcutBar = { getBoundingClientRect: () => ({ height: 42 }) };",
+                "const composerPanel = { classList: { contains: () => true } };",
+                "const appShell = {",
+                "  getBoundingClientRect: () => ({ top: 0, bottom: 448, height: 448 }),",
+                "};",
+                "const mobileComposerMode = false;",
+                "let lastShortcutReserve = 0;",
+                "let geometry = { viewportHeight: 436, offsetTop: 0 };",
+                "function currentViewportGeometry() { return geometry; }",
+                extract_function("measureShortcutHeight"),
+                "measureShortcutHeight();",
+                "assert.equal(lastShortcutReserve, 86);",
+                'assert.equal(writes.get("--shortcut-reserve"), "86px");',
+                "const tallReserve = lastShortcutReserve;",
+                "geometry = { viewportHeight: 436, offsetTop: 323 };",
+                "measureShortcutHeight();",
+                "assert.equal(lastShortcutReserve, tallReserve);",
+                "assert.ok(lastShortcutReserve < geometry.viewportHeight / 2);",
+            ]
+        )
+        self.run_node_source(script)
+        fit = extract_function("fitTerminal")
+        for field in (
+            "shortcutReserve",
+            "shellRectTop",
+            "shellRectBottom",
+            "terminalClientHeight",
+        ):
+            self.assertIn(field, fit)
+
+    def test_shrunken_layout_alone_gets_ios_accessory_allowance(self):
+        self.run_node(
+            ["iosAccessoryStripAllowance"],
+            r"""
+const KEYBOARD_THRESHOLD = 80;
+const IOS_ACCESSORY_STRIP_ALLOWANCE = 44;
+assert.equal(
+  iosAccessoryStripAllowance({ keyboardOpen: true, keyboardInset: 0, offsetTop: 323 }),
+  44,
+);
+assert.equal(
+  iosAccessoryStripAllowance({ keyboardOpen: true, keyboardInset: 323, offsetTop: 0 }),
+  0,
+);
+assert.equal(
+  iosAccessoryStripAllowance({ keyboardOpen: false, keyboardInset: 0, offsetTop: 323 }),
+  0,
+);
+assert.equal(
+  iosAccessoryStripAllowance({ keyboardOpen: true, keyboardInset: 0, offsetTop: 40 }),
+  0,
+);
+""",
+        )
+        self.assertIn("const IOS_ACCESSORY_STRIP_ALLOWANCE = 44;", APP_JS)
+        applied = extract_function("applyViewportGeometry")
+        self.assertIn("iosAccessoryStripAllowance(geometry)", applied)
+        self.assertIn("document.body.dataset.keyboardShrunken", applied)
+        shrunken_shortcuts = css_rule('body[data-keyboard-shrunken="true"] .shortcuts-panel')
+        self.assertIn("var(--ios-accessory-strip-allowance)", shrunken_shortcuts)
+        self.assertIn("var(--kb-accessory-gap)", shrunken_shortcuts)
+
+    def test_fit_repaints_unchanged_grid_after_pixel_geometry_change(self):
+        script = "\n".join(
+            [
+                'const assert = require("node:assert/strict");',
+                "const frames = [];",
+                "const window = { requestAnimationFrame: (callback) => { frames.push(callback); } };",
+                "let now = 50;",
+                "const performance = { now: () => now };",
+                "const terminalPanel = { classList: { contains: () => false } };",
+                "const terminalElement = {",
+                "  clientHeight: 300,",
+                "  getBoundingClientRect: () => ({ width: 390, height: 300 }),",
+                "};",
+                "const appShell = { getBoundingClientRect: () => ({ top: 0, bottom: 436 }) };",
+                "let refreshes = 0;",
+                "let bottomScrolls = 0;",
+                "const term = {",
+                "  cols: 63, rows: 20,",
+                "  resize(cols, rows) { this.cols = cols; this.rows = rows; },",
+                "  refresh() { refreshes += 1; },",
+                "  scrollToBottom() { bottomScrolls += 1; },",
+                "};",
+                "const fitAddon = { proposeDimensions: () => ({ cols: 64, rows: 20 }) };",
+                "const TERMINAL_COL_GUARD = 1;",
+                "let terminalFitScheduled = false;",
+                "let pendingFitPreserveCols = false;",
+                "let lastTerminalLayoutWidth = 390;",
+                "let lastTerminalLayoutHeight = 200;",
+                "let desiredTerminalCols = 63;",
+                "let terminalAuthoritative = true;",
+                "let lastShortcutReserve = 86;",
+                "let followOutput = false;",
+                "let bottomPinUntil = 100;",
+                "function terminalHorizontallyOverflows() { return false; }",
+                "function clampTerminalColumnsToVisibleWidth() {}",
+                "function setDesiredTerminalSize() {}",
+                "function flushTerminalResize() { return false; }",
+                "function recordViewportForensics() {}",
+                "function scheduleTerminalSelectionUISync() {}",
+                extract_function("repaintTerminalAfterGeometryChange"),
+                extract_function("fitTerminal"),
+                "fitTerminal();",
+                "assert.equal(frames.length, 1);",
+                "frames.shift()();",
+                "assert.deepEqual([term.cols, term.rows], [63, 20]);",
+                "assert.equal(refreshes, 1);",
+                "assert.equal(bottomScrolls, 1);",
+                "assert.equal(frames.length, 1);",
+                "frames.shift()();",
+                "assert.equal(refreshes, 2);",
+                "assert.equal(bottomScrolls, 2);",
+            ]
+        )
+        self.run_node_source(script)
+
     def test_viewport_changes_share_one_generation_settle_scheduler(self):
         scheduler = extract_function("scheduleViewportSettlePasses")
         self.assertIn("const generation = ++viewportSettleGeneration;", scheduler)
