@@ -4586,19 +4586,26 @@ class ClientProtocolSourceTest(unittest.TestCase):
             "let deliveredTerminalRows = 0;",
             "let terminalResizeDirty = false;",
             "let terminalResizePending = false;",
+            "let terminalSeedInFlight = false;",
         ):
             self.assertIn(state, self.source)
 
-        flush_start = self.source.index("  function flushTerminalResize()")
+        flush_start = self.source.index("  function flushTerminalResize(")
         flush_end = self.source.index("  function writeTerminal(data)", flush_start)
         flush = self.source[flush_start:flush_end]
-        authority_guard = "!terminalAuthoritative || !socket || socket.readyState !== WebSocket.OPEN"
+        seed_guard = "if (terminalSeedInFlight)"
+        socket_guard = "if (!terminalSocketIsOpen())"
         send = 'sendMessage({ type: "resize", cols: desiredTerminalCols, rows: desiredTerminalRows })'
         delivered = "deliveredTerminalCols = desiredTerminalCols;"
-        self.assertIn(authority_guard, flush)
-        self.assertLess(flush.index(authority_guard), flush.index(send))
+        self.assertIn(seed_guard, flush)
+        self.assertIn(socket_guard, flush)
+        self.assertLess(flush.index(seed_guard), flush.index(send))
+        self.assertLess(flush.index(socket_guard), flush.index(send))
         self.assertLess(flush.index(send), flush.index(delivered))
+        self.assertNotIn("!terminalAuthoritative", flush)
         self.assertIn("!differsFromDelivered", flush)
+        for reason in ("seed-in-flight", "socket-not-open", "duplicate"):
+            self.assertIn(f'recordTerminalResizeWithheld("{reason}")', flush)
 
         fit = self.source[
             self.source.index("  function fitTerminal(") :
@@ -4614,18 +4621,41 @@ class ClientProtocolSourceTest(unittest.TestCase):
             self.source.index('    if (payload.type === "seed-open")') :
             self.source.index('    if (payload.type === "selection-check")')
         ]
-        self.assertLess(seed_open.index("terminalAuthoritative = true;"), seed_open.index("flushTerminalResize();"))
+        self.assertLess(
+            seed_open.index("completeTerminalSeed();"),
+            seed_open.index('flushTerminalResize("seed-open");'),
+        )
         seed_start = self.source[
             self.source.index('    if (payload.type === "seed-start")') :
             self.source.index('    if (payload.type === "seed-data")')
         ]
+        self.assertIn("beginTerminalSeed();", seed_start)
         self.assertNotIn("resetDeliveredTerminalSize();", seed_start)
         ready = self.source[
             self.source.index('    if (payload.type === "ready")') :
             self.source.index('    if (payload.type === "tabs")')
         ]
         self.assertIn("resetDeliveredTerminalSize();", ready)
-        self.assertIn("flushTerminalResize();", ready)
+        self.assertIn('flushTerminalResize("ready");', ready)
+
+    def test_client_resize_and_authority_watchdogs_are_bounded_and_shared(self):
+        for constant in (
+            "const TERMINAL_RESIZE_WATCHDOG_MS = 2000;",
+            "const TERMINAL_SEED_STALL_WATCHDOG_MS = 10000;",
+            "const TERMINAL_AUTHORITY_WATCHDOG_MS = 15000;",
+            "const TERMINAL_RESEED_RATE_LIMIT_MS = 30000;",
+        ):
+            self.assertIn(constant, self.source)
+        self.assertIn('flushTerminalResize("watchdog")', self.source)
+        self.assertIn('requestTerminalRecoveryReseed("seed-stall")', self.source)
+        self.assertIn('requestTerminalRecoveryReseed("stale-authority")', self.source)
+        recovery = self.source[
+            self.source.index("  function terminalReseedRateLimitRemaining(") :
+            self.source.index("  function takeQueuedTerminalOutputBatch(")
+        ]
+        self.assertEqual(recovery.count("lastTerminalRecoveryReseedAt = performance.now();"), 1)
+        self.assertIn("queueState.reseedPending", recovery)
+        self.assertIn('withholdingReason: "rate-limited"', recovery)
 
     def test_seed_establishes_neutral_geometry_and_tabs_before_replaying_rows(self):
         baseline_start = self.source.index("  function terminalReplayBaselineSequence()")
@@ -4717,6 +4747,9 @@ class ClientProtocolSourceTest(unittest.TestCase):
             "focusedAcceptsKeyboard",
             "appliedAppTop",
             "appliedAppHeight",
+            "shellTop",
+            "shellBottom",
+            "terminalHeight",
         ):
             self.assertIn(field, viewport)
         self.assertIn('recordViewportForensics("viewport-settle-complete"', viewport)
@@ -4730,6 +4763,7 @@ class ClientProtocolSourceTest(unittest.TestCase):
         self.assertIn('recordViewportForensics("fit-terminal"', fit)
         self.assertIn("sent: resizeSent", fit)
         self.assertIn("authoritative: terminalAuthoritative", fit)
+        self.assertIn("seedInFlight: terminalSeedInFlight", fit)
         self.assertIn('recordViewportForensics("resize-desired"', self.source)
         self.assertIn('recordViewportForensics("resize-delivered"', self.source)
         self.assertIn('recordViewportForensics("composer-focus")', self.source)

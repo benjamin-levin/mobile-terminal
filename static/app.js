@@ -36,14 +36,15 @@
   const AUTHENTICATION_TIMESTAMP_MAX_FUTURE_MS = 24 * 60 * 60 * 1000;
   const AUTHENTICATION_MODES = new Set(["off", "idle", "every-open"]);
   const KEYBOARD_THRESHOLD = 80;
-  // iOS keyboard accessory-strip clearance. Keep this named so device
-  // forensics can tune it without hunting through layout calculations.
-  const IOS_ACCESSORY_STRIP_ALLOWANCE = 44;
   const VIEWPORT_SETTLE_DELAYS = [80, 220, 420, 700, 1000, 1400];
   const VIEWPORT_FORENSICS_MAX_EVENTS = 60;
   const VIEWPORT_FORENSICS_MAX_BYTES = 16 * 1024;
   const VIEWPORT_FORENSICS_THROTTLE_MS = 5000;
   const VIEWPORT_FORENSICS_SETTLE_FLUSH_MS = 2000;
+  const TERMINAL_RESIZE_WATCHDOG_MS = 2000;
+  const TERMINAL_SEED_STALL_WATCHDOG_MS = 10000;
+  const TERMINAL_AUTHORITY_WATCHDOG_MS = 15000;
+  const TERMINAL_RESEED_RATE_LIMIT_MS = 30000;
   const UI_SCALE_FIT_WIDTH = 430;
   const UI_SCALE_FIT_HEIGHT = 700;
   const EDITOR_TAB_PREFIX = "editor:";
@@ -706,6 +707,14 @@
   let deliveredTerminalRows = 0;
   let terminalResizeDirty = false;
   let terminalResizePending = false;
+  let terminalSeedInFlight = false;
+  let terminalSeedStartedAt = null;
+  let terminalAuthorityLostAt = null;
+  let lastTerminalRecoveryReseedAt = -Infinity;
+  let terminalResizeWatchdogTimer = null;
+  let terminalSeedWatchdogTimer = null;
+  let terminalAuthorityWatchdogTimer = null;
+  let activeSocketMessageQueue = null;
   let lastTerminalLayoutWidth = 0;
   let lastTerminalLayoutHeight = 0;
   let lastShortcutReserve = 0;
@@ -2246,16 +2255,26 @@
     };
   }
 
-  function terminalSelectionViewportRect() {
-    const geometry = currentViewportGeometry();
-    const left = geometry.offsetLeft;
-    const top = geometry.offsetTop;
+  function viewportClientRect(geometry) {
+    const viewportGeometry = geometry || currentViewportGeometry();
     return {
-      left,
-      top,
-      right: left + geometry.viewportWidth,
-      bottom: top + geometry.viewportHeight,
+      left: 0,
+      top: 0,
+      right: viewportGeometry.viewportWidth,
+      bottom: viewportGeometry.viewportHeight,
     };
+  }
+
+  function clientPointToFixedPosition(left, top, geometry) {
+    const viewportGeometry = geometry || currentViewportGeometry();
+    return {
+      left: left + viewportGeometry.offsetLeft,
+      top: top + viewportGeometry.offsetTop,
+    };
+  }
+
+  function terminalSelectionViewportRect() {
+    return viewportClientRect();
   }
 
   function terminalSelectionOverlayBounds(screen) {
@@ -3367,7 +3386,12 @@
     const style = window.getComputedStyle(composerInput);
     const borderHeight =
       Number.parseFloat(style.borderTopWidth || "0") + Number.parseFloat(style.borderBottomWidth || "0");
-    const nextHeight = Math.ceil(Math.min(composerInput.scrollHeight + borderHeight, window.innerHeight * 0.34));
+    const appHeight = Number.parseFloat(
+      window.getComputedStyle(document.documentElement).getPropertyValue("--app-height"),
+    );
+    const composerHeightCap =
+      (Number.isFinite(appHeight) ? appHeight : currentViewportGeometry().viewportHeight) * 0.34;
+    const nextHeight = Math.ceil(Math.min(composerInput.scrollHeight + borderHeight, composerHeightCap));
     composerInput.style.height = `${nextHeight}px`;
     if (Math.abs(nextHeight - previousHeight) > 1) {
       lastComposerHeight = nextHeight;
@@ -4698,6 +4722,42 @@
     return true;
   }
 
+  function terminalSocketIsOpen(messageSocket = socket) {
+    return Boolean(messageSocket && messageSocket.readyState === WebSocket.OPEN);
+  }
+
+  function terminalResizeDiffersFromDelivered() {
+    return (
+      desiredTerminalCols > 0 &&
+      desiredTerminalRows > 0 &&
+      (desiredTerminalCols !== deliveredTerminalCols ||
+        desiredTerminalRows !== deliveredTerminalRows)
+    );
+  }
+
+  function clearTerminalResizeWatchdog() {
+    window.clearTimeout(terminalResizeWatchdogTimer);
+    terminalResizeWatchdogTimer = null;
+  }
+
+  function scheduleTerminalResizeWatchdog() {
+    clearTerminalResizeWatchdog();
+    if (!terminalResizePending || !terminalResizeDiffersFromDelivered()) {
+      return;
+    }
+    terminalResizeWatchdogTimer = window.setTimeout(() => {
+      terminalResizeWatchdogTimer = null;
+      if (!terminalResizePending || !terminalResizeDiffersFromDelivered()) {
+        return;
+      }
+      if (terminalSocketIsOpen() && !terminalSeedInFlight) {
+        flushTerminalResize("watchdog");
+        return;
+      }
+      scheduleTerminalResizeWatchdog();
+    }, TERMINAL_RESIZE_WATCHDOG_MS);
+  }
+
   function setDesiredTerminalSize(cols, rows) {
     const nextCols = Math.floor(Number(cols));
     const nextRows = Math.floor(Number(rows));
@@ -4719,6 +4779,7 @@
     });
     terminalResizeDirty = true;
     terminalResizePending = true;
+    scheduleTerminalResizeWatchdog();
     return true;
   }
 
@@ -4734,39 +4795,66 @@
       rows: 0,
     });
     terminalResizePending = desiredTerminalCols > 0 && desiredTerminalRows > 0;
+    scheduleTerminalResizeWatchdog();
   }
 
-  function flushTerminalResize() {
+  function recordTerminalResizeWithheld(reason) {
+    recordViewportForensics("resize-withheld", {
+      reason,
+      cols: desiredTerminalCols,
+      rows: desiredTerminalRows,
+      authoritative: terminalAuthoritative,
+      seedInFlight: terminalSeedInFlight,
+    });
+  }
+
+  function flushTerminalResize(source = "layout") {
     if (desiredTerminalCols <= 0 || desiredTerminalRows <= 0) {
       return false;
     }
-    const differsFromDelivered =
-      desiredTerminalCols !== deliveredTerminalCols ||
-      desiredTerminalRows !== deliveredTerminalRows;
+    const differsFromDelivered = terminalResizeDiffersFromDelivered();
     if (!terminalResizeDirty && !terminalResizePending && !differsFromDelivered) {
+      recordTerminalResizeWithheld("duplicate");
+      clearTerminalResizeWatchdog();
       return false;
     }
-    if (!terminalAuthoritative || !socket || socket.readyState !== WebSocket.OPEN) {
+    if (terminalSeedInFlight) {
       terminalResizePending = true;
+      recordTerminalResizeWithheld("seed-in-flight");
+      scheduleTerminalResizeWatchdog();
+      return false;
+    }
+    if (!terminalSocketIsOpen()) {
+      terminalResizePending = true;
+      recordTerminalResizeWithheld("socket-not-open");
+      scheduleTerminalResizeWatchdog();
       return false;
     }
     if (!differsFromDelivered) {
       terminalResizeDirty = false;
       terminalResizePending = false;
+      recordTerminalResizeWithheld("duplicate");
+      clearTerminalResizeWatchdog();
       return false;
     }
     if (!sendMessage({ type: "resize", cols: desiredTerminalCols, rows: desiredTerminalRows })) {
       terminalResizePending = true;
+      recordTerminalResizeWithheld("socket-not-open");
+      scheduleTerminalResizeWatchdog();
       return false;
     }
     deliveredTerminalCols = desiredTerminalCols;
     deliveredTerminalRows = desiredTerminalRows;
     recordViewportForensics("resize-delivered", {
+      reason: source,
       cols: deliveredTerminalCols,
       rows: deliveredTerminalRows,
+      authoritative: terminalAuthoritative,
+      seedInFlight: terminalSeedInFlight,
     });
     terminalResizeDirty = false;
     terminalResizePending = false;
+    clearTerminalResizeWatchdog();
     return true;
   }
 
@@ -4879,20 +4967,60 @@
     );
   }
 
-  function requestTerminalBacklogReseed(queueState, generation, messageSocket) {
+  function terminalReseedRateLimitRemaining(now = performance.now()) {
+    return Math.max(
+      0,
+      TERMINAL_RESEED_RATE_LIMIT_MS - (now - lastTerminalRecoveryReseedAt),
+    );
+  }
+
+  function clearTerminalSeedWatchdog() {
+    window.clearTimeout(terminalSeedWatchdogTimer);
+    terminalSeedWatchdogTimer = null;
+  }
+
+  function clearTerminalAuthorityWatchdog() {
+    window.clearTimeout(terminalAuthorityWatchdogTimer);
+    terminalAuthorityWatchdogTimer = null;
+  }
+
+  function resetTerminalRecoveryState() {
+    terminalSeedInFlight = false;
+    terminalSeedStartedAt = null;
+    terminalAuthorityLostAt = null;
+    clearTerminalSeedWatchdog();
+    clearTerminalAuthorityWatchdog();
+    clearTerminalResizeWatchdog();
+  }
+
+  function requestTerminalRecoveryReseed(reason, { dropOutput = false } = {}) {
+    const queueState = activeSocketMessageQueue;
+    const messageSocket = socket;
     if (
+      !queueState ||
       queueState.reseedPending ||
       queueState.closed ||
-      !connectionGenerationIsCurrent(generation) ||
-      messageSocket !== socket ||
-      messageSocket.readyState !== WebSocket.OPEN
+      !terminalSocketIsOpen(messageSocket)
     ) {
       return false;
     }
-    dropQueuedTerminalOutput(queueState);
+    const rateLimitRemaining = terminalReseedRateLimitRemaining();
+    if (rateLimitRemaining > 0) {
+      recordViewportForensics("authority-reseed-withheld", {
+        reason,
+        withholdingReason: "rate-limited",
+        retryAfterMs: Math.ceil(rateLimitRemaining),
+      });
+      return false;
+    }
+    if (dropOutput) {
+      dropQueuedTerminalOutput(queueState);
+    }
     terminalAuthoritative = false;
+    terminalAuthorityLostAt = terminalAuthorityLostAt ?? performance.now();
     historyReseedPending = true;
     queueState.reseedPending = true;
+    lastTerminalRecoveryReseedAt = performance.now();
     messageSocket.send(
       JSON.stringify({
         type: "history-reseed",
@@ -4900,8 +5028,108 @@
         scrollTarget: 0,
       }),
     );
-    console.debug("Terminal render backlog dropped; requesting authoritative reseed");
+    recordViewportForensics("authority-reseed", { reason });
     return true;
+  }
+
+  function scheduleTerminalSeedStallWatchdog(delay = TERMINAL_SEED_STALL_WATCHDOG_MS) {
+    clearTerminalSeedWatchdog();
+    if (!terminalSeedInFlight) {
+      return;
+    }
+    terminalSeedWatchdogTimer = window.setTimeout(() => {
+      terminalSeedWatchdogTimer = null;
+      if (!terminalSeedInFlight || terminalSeedStartedAt === null) {
+        return;
+      }
+      const stalledForMs = performance.now() - terminalSeedStartedAt;
+      if (stalledForMs < TERMINAL_SEED_STALL_WATCHDOG_MS) {
+        scheduleTerminalSeedStallWatchdog(TERMINAL_SEED_STALL_WATCHDOG_MS - stalledForMs);
+        return;
+      }
+      recordViewportForensics("seed-stalled", { stalledForMs: Math.floor(stalledForMs) });
+      if (!requestTerminalRecoveryReseed("seed-stall")) {
+        const retryAfterMs = terminalReseedRateLimitRemaining();
+        if (retryAfterMs > 0) {
+          scheduleTerminalSeedStallWatchdog(retryAfterMs);
+        }
+      }
+    }, Math.max(0, delay));
+  }
+
+  function beginTerminalSeed() {
+    terminalSeedInFlight = true;
+    terminalSeedStartedAt = performance.now();
+    clearTerminalAuthorityWatchdog();
+    scheduleTerminalSeedStallWatchdog();
+  }
+
+  function completeTerminalSeed() {
+    terminalSeedInFlight = false;
+    terminalSeedStartedAt = null;
+    clearTerminalSeedWatchdog();
+  }
+
+  function scheduleTerminalAuthorityWatchdog(delay = null) {
+    clearTerminalAuthorityWatchdog();
+    if (terminalAuthoritative || terminalSeedInFlight || !terminalSocketIsOpen()) {
+      return;
+    }
+    if (terminalAuthorityLostAt === null) {
+      terminalAuthorityLostAt = performance.now();
+    }
+    const staleForMs = performance.now() - terminalAuthorityLostAt;
+    const nextDelay = delay === null
+      ? Math.max(0, TERMINAL_AUTHORITY_WATCHDOG_MS - staleForMs)
+      : Math.max(0, delay);
+    terminalAuthorityWatchdogTimer = window.setTimeout(() => {
+      terminalAuthorityWatchdogTimer = null;
+      if (terminalAuthoritative || terminalSeedInFlight || !terminalSocketIsOpen()) {
+        return;
+      }
+      const currentStaleForMs = performance.now() - terminalAuthorityLostAt;
+      if (currentStaleForMs < TERMINAL_AUTHORITY_WATCHDOG_MS) {
+        scheduleTerminalAuthorityWatchdog(TERMINAL_AUTHORITY_WATCHDOG_MS - currentStaleForMs);
+        return;
+      }
+      recordViewportForensics("authority-stale", {
+        staleForMs: Math.floor(currentStaleForMs),
+      });
+      if (!requestTerminalRecoveryReseed("stale-authority")) {
+        const retryAfterMs = terminalReseedRateLimitRemaining();
+        if (retryAfterMs > 0) {
+          scheduleTerminalAuthorityWatchdog(retryAfterMs);
+        }
+      }
+    }, nextDelay);
+  }
+
+  function setTerminalAuthoritative(authoritative) {
+    terminalAuthoritative = Boolean(authoritative);
+    if (terminalAuthoritative) {
+      terminalAuthorityLostAt = null;
+      clearTerminalAuthorityWatchdog();
+      return;
+    }
+    if (terminalAuthorityLostAt === null) {
+      terminalAuthorityLostAt = performance.now();
+    }
+    scheduleTerminalAuthorityWatchdog();
+  }
+
+  function requestTerminalBacklogReseed(queueState, generation, messageSocket) {
+    if (
+      queueState !== activeSocketMessageQueue ||
+      !connectionGenerationIsCurrent(generation) ||
+      messageSocket !== socket
+    ) {
+      return false;
+    }
+    const requested = requestTerminalRecoveryReseed("render-backlog", { dropOutput: true });
+    if (requested) {
+      console.debug("Terminal render backlog dropped; requesting authoritative reseed");
+    }
+    return requested;
   }
 
   function takeQueuedTerminalOutputBatch(queueState) {
@@ -4987,7 +5215,7 @@
         Number(metadata.start) !== expectedRevision ||
         Number(metadata.end) !== expectedRevision + bytes.byteLength
       ) {
-        terminalAuthoritative = false;
+        setTerminalAuthoritative(false);
         throw new Error("Terminal output ordering changed");
       }
       chunks.push(bytes);
@@ -5200,10 +5428,11 @@
         rows: term.rows,
         sent: resizeSent,
         authoritative: terminalAuthoritative,
+        seedInFlight: terminalSeedInFlight,
         shortcutReserve: lastShortcutReserve,
-        shellRectTop: shellRect ? Math.round(shellRect.top) : null,
-        shellRectBottom: shellRect ? Math.round(shellRect.bottom) : null,
-        terminalClientHeight: terminalElement.clientHeight,
+        shellTop: shellRect ? Math.round(shellRect.top) : null,
+        shellBottom: shellRect ? Math.round(shellRect.bottom) : null,
+        terminalHeight: terminalElement.clientHeight,
       });
       if (followOutput || performance.now() < bottomPinUntil) {
         term.scrollToBottom();
@@ -6208,19 +6437,13 @@
       document.body.dataset.composerActive === "true"
         ? composerPanel.getBoundingClientRect()
         : null;
-    const geometry = currentViewportGeometry();
     const shellRect = appShell ? appShell.getBoundingClientRect() : null;
-    // Keep both edges in getBoundingClientRect space. The shell grows past the
-    // visual viewport by the keyboard accessory gap, so remove only that
-    // length; adding visualViewport.offsetTop here mixes origins on iOS when
-    // the layout viewport itself has shrunk.
-    const shellOverflow =
-      shellRect && Number.isFinite(shellRect.height)
-        ? Math.max(0, shellRect.height - geometry.viewportHeight)
-        : 0;
+    // The terminal stage and dock share the grown shell. Measure both edges in
+    // client coordinates so the reserve includes the keyboard accessory gap
+    // instead of leaving that length of terminal behind the painted dock.
     const viewportBottom =
       shellRect && Number.isFinite(shellRect.bottom)
-        ? shellRect.bottom - shellOverflow
+        ? shellRect.bottom
         : panelRect.bottom;
     const top = composerRect ? Math.min(panelRect.top, composerRect.top) : panelRect.top;
     const shortcutHeight = Math.ceil(shortcutRect.height);
@@ -6288,14 +6511,6 @@
     );
   }
 
-  function iosAccessoryStripAllowance(geometry) {
-    return geometry.keyboardOpen &&
-      geometry.keyboardInset === 0 &&
-      geometry.offsetTop > KEYBOARD_THRESHOLD
-      ? IOS_ACCESSORY_STRIP_ALLOWANCE
-      : 0;
-  }
-
   // Pin the currently-open settings overlay directly to the effective viewport
   // so it stays above the keyboard without inheriting stale visualViewport
   // offsets after focus leaves a keyboard-capable field.
@@ -6321,19 +6536,14 @@
     document.documentElement.style.setProperty("--app-top", `${Math.round(geometry.offsetTop)}px`);
     document.documentElement.style.setProperty("--app-height", `${Math.round(geometry.viewportHeight)}px`);
     document.documentElement.style.setProperty("--keyboard-inset", `${Math.round(geometry.keyboardInset)}px`);
-    const accessoryAllowance = iosAccessoryStripAllowance(geometry);
-    document.documentElement.style.setProperty(
-      "--ios-accessory-strip-allowance",
-      `${accessoryAllowance}px`,
-    );
     document.body.dataset.keyboardOpen = geometry.keyboardOpen ? "true" : "false";
-    document.body.dataset.keyboardShrunken = accessoryAllowance > 0 ? "true" : "false";
     applyEffectiveUiScale(
       geometry.viewportWidth,
       geometry.viewportHeight,
       geometry.keyboardInset,
       geometry.layoutHeight,
     );
+    const shellRect = appShell ? appShell.getBoundingClientRect() : null;
     recordViewportForensics("viewport-update", {
       vvH: window.visualViewport ? window.visualViewport.height : null,
       vvTop: window.visualViewport ? window.visualViewport.offsetTop : null,
@@ -6343,6 +6553,9 @@
       focusedAcceptsKeyboard: focusedElementAcceptsKeyboard(),
       appliedAppTop: Math.round(geometry.offsetTop),
       appliedAppHeight: Math.round(geometry.viewportHeight),
+      shellTop: shellRect ? Math.round(shellRect.top) : null,
+      shellBottom: shellRect ? Math.round(shellRect.bottom) : null,
+      terminalHeight: terminalElement ? terminalElement.clientHeight : null,
     });
     const keyboardClosed = lastViewportKeyboardOpen && !geometry.keyboardOpen;
     lastViewportKeyboardOpen = geometry.keyboardOpen;
@@ -6475,7 +6688,7 @@
     loginRealm = profile.authRealm || "";
     loadActiveProfileState(previousProfileId);
     clearTerminalSelectionUI();
-    terminalAuthoritative = false;
+    setTerminalAuthoritative(false);
     resetComposerTracking(true);
     applyActiveProfile();
     renderProfileMenu();
@@ -7920,6 +8133,9 @@
     clearActiveShortcutRepeatTimers();
     const previousSocket = socket;
     socket = null;
+    activeSocketMessageQueue = null;
+    resetTerminalRecoveryState();
+    terminalAuthoritative = false;
     connectionGeneration += 1;
     reconnectForSessionSwitch = false;
     if (
@@ -7976,8 +8192,10 @@
     const thisConnectionGeneration = connectionGeneration;
     socket.binaryType = "arraybuffer";
     const messageQueue = createSocketMessageQueue();
+    activeSocketMessageQueue = messageQueue;
     pendingTerminalSeed = null;
-    terminalAuthoritative = false;
+    resetTerminalRecoveryState();
+    setTerminalAuthoritative(false);
     resetDeliveredTerminalSize();
     for (const pending of pendingSelectionRequests.values()) {
       window.clearTimeout(pending.timer);
@@ -7996,6 +8214,8 @@
         return;
       }
       updateProfileConnectionState();
+      scheduleTerminalAuthorityWatchdog();
+      scheduleTerminalResizeWatchdog();
     });
 
     const handleSocketMessageError = (error) => {
@@ -8004,7 +8224,7 @@
         socket === thisSocket &&
         connectionGenerationIsCurrent(thisConnectionGeneration)
       ) {
-        terminalAuthoritative = false;
+        setTerminalAuthoritative(false);
         reconnectSocket();
       }
     };
@@ -8111,6 +8331,8 @@
       cancelPasskeyCeremony();
       clearActiveShortcutRepeatTimers();
       terminalAuthoritative = false;
+      activeSocketMessageQueue = null;
+      resetTerminalRecoveryState();
       resetDeliveredTerminalSize();
       updateProfileConnectionState();
       window.clearTimeout(resumeProbeTimer);
@@ -8273,7 +8495,8 @@
 
   async function handleServerMessage(payload, generation, messageSocket, queueState) {
     if (payload.type === "seed-start") {
-      terminalAuthoritative = false;
+      beginTerminalSeed();
+      setTerminalAuthoritative(false);
       queueState.reseedPending = false;
       pendingTerminalSeed = null;
       pendingSeedScrollTarget = null;
@@ -8317,7 +8540,7 @@
     }
     if (payload.type === "seed-open") {
       if (queueState.reseedPending) {
-        terminalAuthoritative = false;
+        setTerminalAuthoritative(false);
         return;
       }
       if (
@@ -8326,17 +8549,18 @@
         Number(payload.cutoff) !== terminalCutoff ||
         Number(payload.layoutGeneration) !== terminalLayoutGeneration
       ) {
-        terminalAuthoritative = false;
+        setTerminalAuthoritative(false);
         return;
       }
-      terminalAuthoritative = true;
+      completeTerminalSeed();
+      setTerminalAuthoritative(true);
       historyReseedPending = false;
       if (pendingSeedScrollTarget !== null && term.buffer.active.type === "normal") {
         term.scrollToLine(Math.max(0, pendingSeedScrollTarget + terminalSeedHistory));
         followOutput = false;
       }
       pendingSeedScrollTarget = null;
-      flushTerminalResize();
+      flushTerminalResize("seed-open");
       return;
     }
     if (payload.type === "selection-check") {
@@ -8426,9 +8650,9 @@
       if (payload.copyForensics === true) {
         copyForensicsEnabled = true;
       }
-      terminalAuthoritative = false;
+      setTerminalAuthoritative(false);
       resetDeliveredTerminalSize();
-      flushTerminalResize();
+      flushTerminalResize("ready");
       resetTerminalInteractionState();
       const readyIsHidden = document.visibilityState === "hidden";
       applyTerminalReadyVisibility(readyIsHidden);
@@ -8791,12 +9015,14 @@
     }
     const rect = button.getBoundingClientRect();
     const menuWidth = Math.max(168, tabMenu.offsetWidth || 168);
+    const geometry = currentViewportGeometry();
     const left = Math.min(
-      window.innerWidth - menuWidth - 12,
+      geometry.viewportWidth - menuWidth - 12,
       Math.max(12, rect.left),
     );
-    tabMenu.style.left = `${left}px`;
-    tabMenu.style.top = `${rect.bottom + 8}px`;
+    const position = clientPointToFixedPosition(left, rect.bottom + 8, geometry);
+    tabMenu.style.left = `${position.left}px`;
+    tabMenu.style.top = `${position.top}px`;
   }
 
   function closeTabMenu() {
@@ -8828,12 +9054,14 @@
     }
     const rect = auxButton.getBoundingClientRect();
     const menuWidth = Math.max(196, sessionMenu.offsetWidth || 196);
+    const geometry = currentViewportGeometry();
     const left = Math.min(
-      window.innerWidth - menuWidth - 12,
+      geometry.viewportWidth - menuWidth - 12,
       Math.max(12, rect.left),
     );
-    sessionMenu.style.left = `${left}px`;
-    sessionMenu.style.top = `${rect.bottom + 8}px`;
+    const position = clientPointToFixedPosition(left, rect.bottom + 8, geometry);
+    sessionMenu.style.left = `${position.left}px`;
+    sessionMenu.style.top = `${position.top}px`;
   }
 
   function closeSessionMenu() {
@@ -8889,12 +9117,14 @@
     }
     const rect = settingsButton.getBoundingClientRect();
     const menuWidth = Math.max(180, settingsMenu.offsetWidth || 180);
+    const geometry = currentViewportGeometry();
     const left = Math.min(
-      window.innerWidth - menuWidth - 12,
+      geometry.viewportWidth - menuWidth - 12,
       Math.max(12, rect.right - menuWidth),
     );
-    settingsMenu.style.left = `${left}px`;
-    settingsMenu.style.top = `${rect.bottom + 8}px`;
+    const position = clientPointToFixedPosition(left, rect.bottom + 8, geometry);
+    settingsMenu.style.left = `${position.left}px`;
+    settingsMenu.style.top = `${position.top}px`;
   }
 
   function closeSettingsMenu() {
@@ -8932,12 +9162,14 @@
   function positionMenuUnder(menu, button, minWidth) {
     const rect = button.getBoundingClientRect();
     const menuWidth = Math.max(minWidth, menu.offsetWidth || minWidth);
+    const geometry = currentViewportGeometry();
     const left = Math.min(
-      window.innerWidth - menuWidth - 12,
+      geometry.viewportWidth - menuWidth - 12,
       Math.max(12, rect.right - menuWidth),
     );
-    menu.style.left = `${left}px`;
-    menu.style.top = `${rect.bottom + 8}px`;
+    const position = clientPointToFixedPosition(left, rect.bottom + 8, geometry);
+    menu.style.left = `${position.left}px`;
+    menu.style.top = `${position.top}px`;
   }
 
   function openBtopTargetMenu() {
@@ -9083,7 +9315,7 @@
     // to switch, then the target's authoritative seed replaces it.
     if (socket && socket.readyState === WebSocket.OPEN) {
       selectedSessionName = sessionName;
-      terminalAuthoritative = false;
+      setTerminalAuthoritative(false);
       const requestSwitch = () => sendMessage({ type: "switch-session", session: sessionName });
       const snapshot = sessionSnapshots.get(sessionSnapshotKey(sessionName));
       if (snapshot) {

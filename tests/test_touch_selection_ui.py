@@ -92,49 +92,165 @@ class TouchSelectionUITest(unittest.TestCase):
             [
                 'const assert = require("node:assert/strict");',
                 "const WebSocket = { OPEN: 1 };",
+                "const timers = new Map();",
+                "let nextTimer = 1;",
+                "const window = {",
+                "  setTimeout(callback) { const id = nextTimer++; timers.set(id, callback); return id; },",
+                "  clearTimeout(id) { timers.delete(id); },",
+                "};",
+                "const TERMINAL_RESIZE_WATCHDOG_MS = 2000;",
                 "const sent = [];",
+                "const forensics = [];",
                 "let socket = { readyState: 0 };",
                 "let terminalAuthoritative = false;",
+                "let terminalSeedInFlight = false;",
                 "let desiredTerminalCols = 0;",
                 "let desiredTerminalRows = 0;",
                 "let deliveredTerminalCols = 0;",
                 "let deliveredTerminalRows = 0;",
                 "let terminalResizeDirty = false;",
                 "let terminalResizePending = false;",
-                "function recordViewportForensics() {}",
+                "let terminalResizeWatchdogTimer = null;",
+                "function recordViewportForensics(type, fields) { forensics.push({ type, ...fields }); }",
                 "function sendMessage(payload) {",
                 "  if (!socket || socket.readyState !== WebSocket.OPEN) return false;",
                 "  sent.push(payload);",
                 "  return true;",
                 "}",
+                extract_function("terminalSocketIsOpen"),
+                extract_function("terminalResizeDiffersFromDelivered"),
+                extract_function("clearTerminalResizeWatchdog"),
+                extract_function("scheduleTerminalResizeWatchdog"),
                 extract_function("setDesiredTerminalSize"),
                 extract_function("resetDeliveredTerminalSize"),
+                extract_function("recordTerminalResizeWithheld"),
                 extract_function("flushTerminalResize"),
                 "assert.equal(setDesiredTerminalSize(80, 24), true);",
                 "assert.equal(flushTerminalResize(), false);",
                 "assert.deepEqual([terminalResizeDirty, terminalResizePending], [true, true]);",
-                "assert.deepEqual([deliveredTerminalCols, deliveredTerminalRows], [0, 0]);",
                 "socket.readyState = WebSocket.OPEN;",
-                "assert.equal(flushTerminalResize(), false);",
-                "assert.equal(sent.length, 0);",
-                "terminalAuthoritative = true;",
                 "assert.equal(flushTerminalResize(), true);",
                 'assert.deepEqual(sent, [{ type: "resize", cols: 80, rows: 24 }]);',
-                "assert.deepEqual([deliveredTerminalCols, deliveredTerminalRows], [80, 24]);",
+                "assert.equal(terminalAuthoritative, false);",
                 "assert.equal(flushTerminalResize(), false);",
                 "assert.equal(sent.length, 1);",
-                "resetDeliveredTerminalSize();",
-                "assert.equal(flushTerminalResize(), true);",
-                "assert.equal(sent.length, 2);",
-                "socket.readyState = 0;",
+                "terminalSeedInFlight = true;",
                 "assert.equal(setDesiredTerminalSize(100, 30), true);",
                 "assert.equal(flushTerminalResize(), false);",
                 "assert.deepEqual([deliveredTerminalCols, deliveredTerminalRows], [80, 24]);",
-                "socket.readyState = WebSocket.OPEN;",
-                "assert.equal(flushTerminalResize(), true);",
-                'assert.deepEqual(sent[2], { type: "resize", cols: 100, rows: 30 });',
+                "terminalSeedInFlight = false;",
+                'assert.equal(flushTerminalResize("seed-open"), true);',
+                'assert.deepEqual(sent[1], { type: "resize", cols: 100, rows: 30 });',
                 "assert.equal(flushTerminalResize(), false);",
+                "assert.equal(sent.length, 2);",
+                "resetDeliveredTerminalSize();",
+                "assert.equal(flushTerminalResize(), true);",
                 "assert.equal(sent.length, 3);",
+                "assert.deepEqual(",
+                "  [...new Set(forensics.filter((event) => event.type === 'resize-withheld').map((event) => event.reason))].sort(),",
+                "  ['duplicate', 'seed-in-flight', 'socket-not-open'],",
+                ");",
+            ]
+        )
+        self.run_node_source(script)
+
+    def test_terminal_resize_and_recovery_watchdogs_are_one_shot_and_rate_limited(self):
+        script = "\n".join(
+            [
+                'const assert = require("node:assert/strict");',
+                "const WebSocket = { OPEN: 1 };",
+                "let now = 0;",
+                "let nextTimer = 1;",
+                "const timers = new Map();",
+                "const window = {",
+                "  setTimeout(callback, delay) {",
+                "    const id = nextTimer++;",
+                "    timers.set(id, { callback, due: now + delay });",
+                "    return id;",
+                "  },",
+                "  clearTimeout(id) { timers.delete(id); },",
+                "};",
+                "const performance = { now: () => now };",
+                "function runTimersAt(timestamp) {",
+                "  now = timestamp;",
+                "  const due = [...timers.entries()].filter(([, timer]) => timer.due <= now);",
+                "  assert.ok(due.length > 0, `no timer due at ${timestamp}`);",
+                "  for (const [id, timer] of due) {",
+                "    if (!timers.delete(id)) continue;",
+                "    timer.callback();",
+                "  }",
+                "}",
+                "const TERMINAL_RESIZE_WATCHDOG_MS = 2000;",
+                "const TERMINAL_SEED_STALL_WATCHDOG_MS = 10000;",
+                "const TERMINAL_AUTHORITY_WATCHDOG_MS = 15000;",
+                "const TERMINAL_RESEED_RATE_LIMIT_MS = 30000;",
+                "const resizeMessages = [];",
+                "const reseedMessages = [];",
+                "let socket = {",
+                "  readyState: WebSocket.OPEN,",
+                "  send(value) { reseedMessages.push(JSON.parse(value)); },",
+                "};",
+                "let desiredTerminalCols = 0;",
+                "let desiredTerminalRows = 0;",
+                "let deliveredTerminalCols = 0;",
+                "let deliveredTerminalRows = 0;",
+                "let terminalResizeDirty = false;",
+                "let terminalResizePending = false;",
+                "let terminalResizeWatchdogTimer = null;",
+                "let terminalSeedInFlight = false;",
+                "let terminalSeedStartedAt = null;",
+                "let terminalAuthorityLostAt = null;",
+                "let terminalAuthoritative = true;",
+                "let terminalSeedWatchdogTimer = null;",
+                "let terminalAuthorityWatchdogTimer = null;",
+                "let lastTerminalRecoveryReseedAt = -Infinity;",
+                "let terminalSeedHistory = 500;",
+                "let historyReseedPending = false;",
+                "let activeSocketMessageQueue = {",
+                "  items: [], reseedPending: false, closed: false, terminalBytes: 0, terminalOldestAt: null,",
+                "};",
+                "function recordViewportForensics() {}",
+                "function sendMessage(payload) { resizeMessages.push(payload); return true; }",
+                "function dropQueuedTerminalOutput() {}",
+                extract_function("terminalSocketIsOpen"),
+                extract_function("terminalResizeDiffersFromDelivered"),
+                extract_function("clearTerminalResizeWatchdog"),
+                extract_function("scheduleTerminalResizeWatchdog"),
+                extract_function("setDesiredTerminalSize"),
+                extract_function("recordTerminalResizeWithheld"),
+                extract_function("flushTerminalResize"),
+                app_section(
+                    "  function terminalReseedRateLimitRemaining(",
+                    "  function clearTerminalSeedWatchdog()",
+                ).rstrip(),
+                extract_function("clearTerminalSeedWatchdog"),
+                extract_function("clearTerminalAuthorityWatchdog"),
+                extract_function("requestTerminalRecoveryReseed"),
+                extract_function("scheduleTerminalSeedStallWatchdog"),
+                extract_function("beginTerminalSeed"),
+                extract_function("completeTerminalSeed"),
+                extract_function("scheduleTerminalAuthorityWatchdog"),
+                extract_function("setTerminalAuthoritative"),
+                "setDesiredTerminalSize(90, 28);",
+                "runTimersAt(2000);",
+                'assert.deepEqual(resizeMessages, [{ type: "resize", cols: 90, rows: 28 }]);',
+                "assert.equal(timers.size, 0);",
+                "beginTerminalSeed();",
+                "runTimersAt(12000);",
+                "assert.equal(reseedMessages.length, 1);",
+                'assert.equal(reseedMessages[0].type, "history-reseed");',
+                "assert.equal(timers.size, 0);",
+                "activeSocketMessageQueue.reseedPending = false;",
+                "completeTerminalSeed();",
+                "setTerminalAuthoritative(true);",
+                "now = 13000;",
+                "setTerminalAuthoritative(false);",
+                "runTimersAt(28000);",
+                "assert.equal(reseedMessages.length, 1);",
+                "assert.equal(timers.size, 1);",
+                "runTimersAt(42000);",
+                "assert.equal(reseedMessages.length, 2);",
+                "assert.equal(timers.size, 0);",
             ]
         )
         self.run_node_source(script)
@@ -525,7 +641,7 @@ assert.deepEqual(
         selection_change = app_section("    term.onSelectionChange(() => {", "    wheelTarget.addEventListener(")
         self.assertIn("dismissTerminalSelection();", to_tab)
         self.assertIn(
-            "clearTerminalSelectionUI();\n    terminalAuthoritative = false;\n"
+            "clearTerminalSelectionUI();\n    setTerminalAuthoritative(false);\n"
             "    resetComposerTracking(true);",
             switch_profile,
         )
@@ -872,7 +988,7 @@ assert.deepEqual(
             blur.index("scheduleViewportSettlePasses({ immediate: false });"),
         )
 
-    def test_shortcut_reserve_uses_shell_rect_space_across_ios_modes(self):
+    def test_shortcut_reserve_prevents_dock_overlap_across_recorded_ios_modes(self):
         script = "\n".join(
             [
                 'const assert = require("node:assert/strict");',
@@ -881,71 +997,126 @@ assert.deepEqual(
                 "  body: { dataset: {} },",
                 "  documentElement: { style: { setProperty: (name, value) => writes.set(name, value) } },",
                 "};",
+                "let panelRect = { top: 350, bottom: 448 };",
+                "let shellRect = { top: 0, bottom: 448, height: 448 };",
                 "const shortcutsPanel = {",
                 "  classList: { contains: () => false },",
-                "  getBoundingClientRect: () => ({ top: 350, bottom: 448 }),",
+                "  getBoundingClientRect: () => panelRect,",
                 "};",
                 "const shortcutBar = { getBoundingClientRect: () => ({ height: 42 }) };",
                 "const composerPanel = { classList: { contains: () => true } };",
-                "const appShell = {",
-                "  getBoundingClientRect: () => ({ top: 0, bottom: 448, height: 448 }),",
-                "};",
+                "const appShell = { getBoundingClientRect: () => shellRect };",
                 "const mobileComposerMode = false;",
                 "let lastShortcutReserve = 0;",
-                "let geometry = { viewportHeight: 436, offsetTop: 0 };",
-                "function currentViewportGeometry() { return geometry; }",
                 extract_function("measureShortcutHeight"),
                 "measureShortcutHeight();",
-                "assert.equal(lastShortcutReserve, 86);",
-                'assert.equal(writes.get("--shortcut-reserve"), "86px");',
-                "const tallReserve = lastShortcutReserve;",
-                "geometry = { viewportHeight: 436, offsetTop: 323 };",
-                "measureShortcutHeight();",
-                "assert.equal(lastShortcutReserve, tallReserve);",
-                "assert.ok(lastShortcutReserve < geometry.viewportHeight / 2);",
+                "assert.equal(lastShortcutReserve, 98);",
+                'assert.equal(writes.get("--shortcut-reserve"), "98px");',
+                "const modes = [",
+                "  { name: 'tall', innerH: 759, vvH: 436, vvTop: 0, shellBottom: 448, dockTop: 361, stageTop: 108, expectedReserve: 87, expectedTerminalHeight: 253 },",
+                "  { name: 'shrunken', innerH: 436, vvH: 436, vvTop: 323, shellBottom: 448, dockTop: 361, stageTop: 108, expectedReserve: 87, expectedTerminalHeight: 253 },",
+                "  { name: 'closed', innerH: 759, vvH: 759, vvTop: 0, shellBottom: 759, dockTop: 668, stageTop: 108, expectedReserve: 91, expectedTerminalHeight: 560 },",
+                "];",
+                "for (const mode of modes) {",
+                "  const keyboardOpen = mode.vvH < mode.innerH || mode.vvTop > 0;",
+                "  assert.equal(mode.shellBottom, mode.vvH + (keyboardOpen ? 12 : 0));",
+                "  panelRect = { top: mode.dockTop, bottom: mode.shellBottom };",
+                "  shellRect = { top: 0, bottom: mode.shellBottom, height: mode.shellBottom };",
+                "  measureShortcutHeight();",
+                "  const terminalHeight = mode.shellBottom - mode.stageTop - lastShortcutReserve;",
+                "  const terminalBottom = mode.stageTop + terminalHeight;",
+                "  const overlap = Math.max(0, terminalBottom - mode.dockTop);",
+                "  assert.equal(lastShortcutReserve, mode.expectedReserve, `${mode.name} reserve`);",
+                "  assert.equal(terminalHeight, mode.expectedTerminalHeight, `${mode.name} terminal height`);",
+                "  assert.equal(overlap, 0, `${mode.name} overlap`);",
+                "}",
             ]
         )
         self.run_node_source(script)
         fit = extract_function("fitTerminal")
         for field in (
             "shortcutReserve",
-            "shellRectTop",
-            "shellRectBottom",
-            "terminalClientHeight",
+            "shellTop",
+            "shellBottom",
+            "terminalHeight",
         ):
             self.assertIn(field, fit)
 
-    def test_shrunken_layout_alone_gets_ios_accessory_allowance(self):
+    def test_keyboard_layout_has_no_extra_ios_accessory_allowance(self):
+        self.assertNotIn("IOS_ACCESSORY_STRIP_ALLOWANCE", APP_JS)
+        self.assertNotIn("iosAccessoryStripAllowance", APP_JS)
+        self.assertNotIn("keyboardShrunken", APP_JS)
+        self.assertNotIn("--ios-accessory-strip-allowance", STYLES_CSS)
+        self.assertNotIn('body[data-keyboard-shrunken="true"]', STYLES_CSS)
+
+    def test_composer_cap_uses_visual_viewport_height_in_both_ios_modes(self):
+        script = "\n".join(
+            [
+                'const assert = require("node:assert/strict");',
+                "let viewportHeight = 436;",
+                "const document = { documentElement: {} };",
+                "const window = {",
+                "  innerHeight: 759,",
+                "  getComputedStyle: (element) => element === document.documentElement",
+                "    ? { getPropertyValue: () => '436px' }",
+                "    : { borderTopWidth: '1', borderBottomWidth: '1' },",
+                "};",
+                "const composerInput = {",
+                "  scrollHeight: 500,",
+                "  style: { height: '' },",
+                "  getBoundingClientRect: () => ({ height: 48 }),",
+                "};",
+                "const mobileComposerMode = true;",
+                "let lastComposerHeight = 0;",
+                "let refreshes = 0;",
+                "function currentViewportGeometry() { return { viewportHeight }; }",
+                "function scheduleLayoutRefresh() { refreshes += 1; }",
+                extract_function("autoSizeComposer"),
+                "autoSizeComposer();",
+                'assert.equal(composerInput.style.height, "149px");',
+                "window.innerHeight = 436;",
+                "lastComposerHeight = 0;",
+                "composerInput.style.height = '';",
+                "autoSizeComposer();",
+                'assert.equal(composerInput.style.height, "149px");',
+            ]
+        )
+        self.run_node_source(script)
+        composer = css_rule(".composer-input")
+        self.assertIn("calc(var(--app-height) * 0.34)", composer)
+        self.assertNotIn("34vh", composer)
+
+    def test_fixed_geometry_converts_client_coordinates_only_at_assignment(self):
         self.run_node(
-            ["iosAccessoryStripAllowance"],
+            ["viewportClientRect", "clientPointToFixedPosition"],
             r"""
-const KEYBOARD_THRESHOLD = 80;
-const IOS_ACCESSORY_STRIP_ALLOWANCE = 44;
-assert.equal(
-  iosAccessoryStripAllowance({ keyboardOpen: true, keyboardInset: 0, offsetTop: 323 }),
-  44,
+const geometry = {
+  viewportWidth: 390,
+  viewportHeight: 436,
+  offsetLeft: 7,
+  offsetTop: 323,
+};
+assert.deepEqual(
+  viewportClientRect(geometry),
+  { left: 0, top: 0, right: 390, bottom: 436 },
 );
-assert.equal(
-  iosAccessoryStripAllowance({ keyboardOpen: true, keyboardInset: 323, offsetTop: 0 }),
-  0,
-);
-assert.equal(
-  iosAccessoryStripAllowance({ keyboardOpen: false, keyboardInset: 0, offsetTop: 323 }),
-  0,
-);
-assert.equal(
-  iosAccessoryStripAllowance({ keyboardOpen: true, keyboardInset: 0, offsetTop: 40 }),
-  0,
+assert.deepEqual(
+  clientPointToFixedPosition(12, 58, geometry),
+  { left: 19, top: 381 },
 );
 """,
         )
-        self.assertIn("const IOS_ACCESSORY_STRIP_ALLOWANCE = 44;", APP_JS)
-        applied = extract_function("applyViewportGeometry")
-        self.assertIn("iosAccessoryStripAllowance(geometry)", applied)
-        self.assertIn("document.body.dataset.keyboardShrunken", applied)
-        shrunken_shortcuts = css_rule('body[data-keyboard-shrunken="true"] .shortcuts-panel')
-        self.assertIn("var(--ios-accessory-strip-allowance)", shrunken_shortcuts)
-        self.assertIn("var(--kb-accessory-gap)", shrunken_shortcuts)
+        selection_viewport = extract_function("terminalSelectionViewportRect")
+        self.assertIn("return viewportClientRect();", selection_viewport)
+        for name in (
+            "positionTabMenu",
+            "positionSessionMenu",
+            "positionSettingsMenu",
+            "positionMenuUnder",
+        ):
+            positioner = extract_function(name)
+            self.assertIn("clientPointToFixedPosition", positioner)
+            self.assertIn("geometry.viewportWidth", positioner)
 
     def test_fit_repaints_unchanged_grid_after_pixel_geometry_change(self):
         script = "\n".join(
@@ -977,7 +1148,8 @@ assert.equal(
                 "let lastTerminalLayoutHeight = 200;",
                 "let desiredTerminalCols = 63;",
                 "let terminalAuthoritative = true;",
-                "let lastShortcutReserve = 86;",
+                "let terminalSeedInFlight = false;",
+                "let lastShortcutReserve = 98;",
                 "let followOutput = false;",
                 "let bottomPinUntil = 100;",
                 "function terminalHorizontallyOverflows() { return false; }",

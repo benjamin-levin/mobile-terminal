@@ -108,6 +108,7 @@ class ProfileClientWiringTest(unittest.TestCase):
                 '  events.push(`load-state:${previousProfileId}`);',
                 '}',
                 'function clearTerminalSelectionUI() { events.push("clear-selection"); }',
+                'function setTerminalAuthoritative(value) { terminalAuthoritative = Boolean(value); }',
                 'function resetComposerTracking() { events.push("reset-composer"); }',
                 'function applyActiveProfile() { events.push("apply-profile"); }',
                 'function renderProfileMenu() { events.push("render-profile-menu"); }',
