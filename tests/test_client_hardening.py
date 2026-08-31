@@ -18,7 +18,7 @@ def section(source, start_marker, end_marker):
 
 class ClientHardeningWiringTest(unittest.TestCase):
     def test_service_worker_tracks_revalidation_and_uses_network_first_navigation(self):
-        self.assertIn('const CACHE = "mobile-terminal-v20";', SW_JS)
+        self.assertIn('const CACHE = "mobile-terminal-v22";', SW_JS)
         self.assertIn("const NAVIGATION_TIMEOUT_MS = 2500;", SW_JS)
         self.assertIn('if (req.mode === "navigate")', SW_JS)
         self.assertIn("Promise.race([", SW_JS)
@@ -35,10 +35,10 @@ class ClientHardeningWiringTest(unittest.TestCase):
         )
 
     def test_proxy_service_worker_rewrite_matches_the_current_cache_name(self):
-        self.assertIn("'const CACHE = \"mobile-terminal-v20\";'", PROXY_PY)
-        self.assertIn("'const CACHE = \"mobile-terminal-proxy-v15\";'", PROXY_PY)
-        self.assertNotIn("mobile-terminal-v19", SW_JS)
-        self.assertNotIn("mobile-terminal-proxy-v14", PROXY_PY)
+        self.assertIn("'const CACHE = \"mobile-terminal-v22\";'", PROXY_PY)
+        self.assertIn("'const CACHE = \"mobile-terminal-proxy-v16\";'", PROXY_PY)
+        self.assertNotIn("mobile-terminal-v20", SW_JS)
+        self.assertNotIn("mobile-terminal-proxy-v15", PROXY_PY)
 
     def test_controller_change_reload_is_early_or_deferred_until_inactive(self):
         controller_change = section(

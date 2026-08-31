@@ -8,7 +8,7 @@
  * the next open, with a short timeout and cached fallback for slow/offline links.
  * Static assets remain stale-while-revalidate for instant repeat loads.
  */
-const CACHE = "mobile-terminal-v20";
+const CACHE = "mobile-terminal-v22";
 const NAVIGATION_TIMEOUT_MS = 2500;
 // The app shell (xterm, app.js, CSS) is inlined into the HTML, so caching "/"
 // caches everything needed to boot; icons/manifest are cached on demand.

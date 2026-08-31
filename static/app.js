@@ -678,6 +678,7 @@
   installSemanticPromptHandlers();
 
   let socket = null;
+  let applicationProtocolReady = false;
   let pendingTerminalSeed = null;
   let terminalEpoch = 0;
   let terminalPaneId = "";
@@ -4637,7 +4638,7 @@
 
   function reportActivity(force = false) {
     const now = performance.now();
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!applicationProtocolReady || !socket || socket.readyState !== WebSocket.OPEN) {
       return false;
     }
     if (force) {
@@ -4663,7 +4664,7 @@
   }
 
   function sendMessage(payload) {
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!applicationProtocolReady || !socket || socket.readyState !== WebSocket.OPEN) {
       return false;
     }
     if (
@@ -4723,7 +4724,11 @@
   }
 
   function terminalSocketIsOpen(messageSocket = socket) {
-    return Boolean(messageSocket && messageSocket.readyState === WebSocket.OPEN);
+    return Boolean(
+      applicationProtocolReady &&
+      messageSocket &&
+      messageSocket.readyState === WebSocket.OPEN
+    );
   }
 
   function terminalResizeDiffersFromDelivered() {
@@ -8133,6 +8138,7 @@
     clearActiveShortcutRepeatTimers();
     const previousSocket = socket;
     socket = null;
+    applicationProtocolReady = false;
     activeSocketMessageQueue = null;
     resetTerminalRecoveryState();
     terminalAuthoritative = false;
@@ -8327,6 +8333,7 @@
       if (socket !== thisSocket) {
         return;
       }
+      applicationProtocolReady = false;
       connectionGeneration += 1;
       cancelPasskeyCeremony();
       clearActiveShortcutRepeatTimers();
@@ -8647,6 +8654,7 @@
       return;
     }
     if (payload.type === "ready") {
+      applicationProtocolReady = true;
       if (payload.copyForensics === true) {
         copyForensicsEnabled = true;
       }
