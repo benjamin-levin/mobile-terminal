@@ -57,6 +57,20 @@ installer does not grant trust. Review the installed commands in Codex and then
 verify a new session's binding, live PID/start identity, and ownership boundaries.
 See the [official hook discovery and trust documentation](https://learn.chatgpt.com/docs/hooks).
 
+The isolated hook lifecycle regression invokes installed commands from a synthetic
+provider process in private tmux and verifies binding creation and closure. It
+does not prove actual Codex event delivery or renderer compatibility. Claude
+`2.1.261` assistant output is now supported by six recorded synthetic transcript
+resumes at 60 and 100 columns, covering prose, authored breaks, headings,
+emphasis, lists, Unicode, and code. The captures use the installed CLI with no
+submitted prompt or model request. They do not validate streaming states or
+user echoes for this version. Codex `0.153.3` is supported by six equivalent
+captures. Its profile verifies retained heading markers, dash lists with spacing
+after wrapped items, cyan inline code, and fenced code. Presentation markers and
+inserted spacing are omitted from copied text; source hard breaks remain. These
+fixtures validate completed rendering; they do not establish streaming states,
+actual Codex hook trust, delivery, or live pane ownership.
+
 An isolated `0.153.3` probe confirmed discovery of the corrected user-hook file
 and persisted trust through Codex's normal review UI. Relaunching a synthetic
 legacy saved session did not produce an observed lifecycle callback, even with

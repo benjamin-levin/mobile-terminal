@@ -1,0 +1,27 @@
+{
+  "provider": "codex",
+  "version": "0.153.3",
+  "cols": 60,
+  "method": "synthetic-transcript-resume",
+  "modelRequests": 0,
+  "source": "FIXTURE-BEGIN\n\nInline `code_value()` remains here.\n\n```python\nprint(\"東京 ✅\")\n```\n\nFIXTURE-END",
+  "expected": "FIXTURE-BEGIN\n\nInline code_value() remains here.\n\nprint(\"東京 ✅\")\n\nFIXTURE-END",
+  "plain": [
+    "• FIXTURE-BEGIN",
+    "",
+    "  Inline code_value() remains here.",
+    "",
+    "  print(\"東京 ✅\")",
+    "",
+    "  FIXTURE-END"
+  ],
+  "styled": [
+    "\u001b[2m• \u001b[0mFIXTURE-BEGIN",
+    "",
+    "  Inline \u001b[38;5;6mcode_value()\u001b[39m remains here.",
+    "",
+    "  \u001b[38;2;250;179;135mprint\u001b[38;2;147;153;178m(\u001b[38;2;166;227;161m\"東京 ✅\"\u001b[38;2;147;153;178m)\u001b[39m",
+    "",
+    "  FIXTURE-END"
+  ]
+}

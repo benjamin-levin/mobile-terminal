@@ -311,9 +311,19 @@ class RendererProfile:
     role: str = "assistant"
     first_text_style: str | None = None
     wrap_margin: int = 0
+    heading_markers_visible: bool = False
+    separate_wrapped_list_items: bool = False
+    inline_code_style: str = "code"
 
 
 CLAUDE_PROFILES = {
+    # Validated against synthetic transcript resumes of the installed binary
+    # at 60 and 100 columns (tests/fixtures/provider_resume_2_1_261).
+    "2.1.261": RendererProfile(
+        "claude", "2.1.261", "● ", "  ", "- ", "{number}. ",
+        marker_style="assistant",
+        first_gutter_styles=("assistant-dot", "assistant"),
+    ),
     "2.1.241": RendererProfile(
         "claude",
         "2.1.241",
@@ -341,6 +351,13 @@ CLAUDE_USER_ECHO_PROFILES = {
     ),
 }
 CODEX_PROFILES = {
+    # Actual installed-binary synthetic resume captures at 60 and 100 columns.
+    "0.153.3": RendererProfile(
+        "codex", "0.153.3", "• ", "  ", "- ", "{number}. ",
+        marker_style="assistant", first_gutter_styles=("list-marker", "list-marker"),
+        heading_markers_visible=True, separate_wrapped_list_items=True,
+        inline_code_style="plain;fg-indexed-6",
+    ),
     "0.147.0": RendererProfile("codex", "0.147.0", "• ", "  ", "• ", "{number}. "),
 }
 
@@ -893,8 +910,15 @@ class TranscriptIndex:
                 raise ProviderAuthorityError("transcript-session-mismatch")
             self._codex_thread_id = thread_id
             return ()
+        if data["type"] == "turn_context":
+            # Context is metadata, not a typed message/event payload. It must
+            # never create text authority or change the bound session identity.
+            return ()
         if not isinstance(payload.get("type"), str):
             raise ProviderAuthorityError("schema-drift")
+        if data["type"] == "event_msg":
+            # UI replay events are not response-item source authority.
+            return ()
         if payload.get("type") != "message" or payload.get("role") != "assistant":
             return ()
         if self._codex_thread_id is None:
@@ -1369,6 +1393,8 @@ def _compile_render_lines(
             style = profile.text_style
         elif style == "list-marker":
             style = profile.marker_style
+        elif style == "code":
+            style = profile.inline_code_style
         if token.semantic.startswith("heading:"):
             try:
                 lines[-1].heading_level = int(token.semantic.split(":", 1)[1])
@@ -1687,6 +1713,7 @@ def render_semantic_candidate(
     active_list_padding = 0
     previous_line_index: int | None = None
     previous_line: _CompiledLine | None = None
+    previous_line_wrapped = False
     for line_index in content_lines:
         line = lines[line_index]
         lazy_continuation = False
@@ -1694,7 +1721,11 @@ def render_semantic_candidate(
             begin_row()
         else:
             separated = line_index - previous_line_index > 1
-            margin = previous_line.heading_level is not None or separated
+            margin = (
+                previous_line.heading_level is not None or separated
+                or (selected_profile.separate_wrapped_list_items and previous_line_wrapped
+                    and previous_line.marker is not None and line.marker is not None)
+            )
             crossed_rows = []
             if margin:
                 begin_row()
@@ -1720,6 +1751,11 @@ def render_semantic_candidate(
                     0,
                 )
 
+        line_start_row = row
+        if selected_profile.heading_markers_visible and line.heading_level is not None:
+            for grapheme in "#" * line.heading_level + " ":
+                put(grapheme, None, None, "heading", presentation=True, verify_style=True)
+
         continuation_padding = active_list_padding if lazy_continuation else 0
         if line.marker is not None:
             marker, copy_start, copy_end, style = line.marker
@@ -1734,6 +1770,7 @@ def render_semantic_candidate(
             if column > cols:
                 raise ProviderAuthorityError("renderer-width-too-small")
         place_units(line.units, continuation_padding)
+        previous_line_wrapped = row > line_start_row
         previous_line_index = line_index
         previous_line = line
 

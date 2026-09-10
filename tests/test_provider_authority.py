@@ -473,6 +473,35 @@ class TranscriptIndexTest(unittest.TestCase):
         self.assertIn(f":{metadata_bytes}:item_1", records[0].record_id)
         self.assertTrue(records[0].source_id.endswith(":turn_1"))
 
+    def test_codex_context_metadata_between_messages_and_incremental_updates(self):
+        context = {"type": "turn_context", "payload": {
+            "turn_id": "turn_1", "cwd": "/synthetic/project", "model": "test-model",
+        }}
+        write_jsonl(self.path, [codex_meta(), context, codex_text("first")])
+        index = TranscriptIndex()
+        self.assertEqual([r.text for r in self.update(index, "codex")], ["first"])
+        with self.path.open("a") as output:
+            output.write(json.dumps(context) + "\n")
+            output.write(json.dumps(codex_text("second", item_id="item_2", turn_id="turn_2")) + "\n")
+        records = self.update(index, "codex")
+        self.assertEqual([r.text for r in records], ["first", "second"])
+        self.assertNotEqual(records[0].source_id, records[1].source_id)
+
+    def test_codex_context_cannot_grant_message_authority_or_replace_session_metadata(self):
+        context = codex_text("not an assistant message")
+        context["type"] = "turn_context"
+        write_jsonl(self.path, [codex_meta(), context])
+        self.assertEqual(self.update(TranscriptIndex(), "codex"), ())
+        replay = dict(context, type="event_msg")
+        write_jsonl(self.path, [codex_meta(), replay])
+        self.assertEqual(self.update(TranscriptIndex(), "codex"), ())
+        write_jsonl(self.path, [context, codex_text("answer")])
+        with self.assertRaisesRegex(ProviderAuthorityError, "missing-codex-session"):
+            self.update(TranscriptIndex(), "codex")
+        write_jsonl(self.path, [codex_meta(), {"type": "turn_context", "payload": []}])
+        with self.assertRaisesRegex(ProviderAuthorityError, "schema-drift"):
+            self.update(TranscriptIndex(), "codex")
+
     def test_codex_requires_session_metadata_and_exact_session(self):
         write_jsonl(self.path, [codex_text("answer")])
         with self.assertRaisesRegex(ProviderAuthorityError, "missing-codex-session"):
@@ -2061,6 +2090,67 @@ class ProviderLiveFixtureReplayTest(unittest.TestCase):
         pending = self.match(streaming, (24, 0), (24, 19))
         self.assertFalse(pending.matched)
         self.assertEqual(pending.internal_reason, "no-renderable-records")
+
+
+class CurrentProviderResumeFixtureTest(unittest.TestCase):
+    def check_fixtures(self, provider, version):
+        root = Path(__file__).parent / f"fixtures/provider_resume_{version.replace('.', '_')}"
+        fixtures = sorted(root.glob("*.json"))
+        self.assertEqual(len(fixtures), 6)
+        for fixture_path in fixtures:
+            with self.subTest(fixture=fixture_path.name), tempfile.TemporaryDirectory() as temporary:
+                fixture = json.loads(fixture_path.read_text())
+                self.assertEqual(fixture["version"], version)
+                self.assertEqual(fixture["modelRequests"], 0)
+                path = Path(temporary) / f"{SESSION_ID}.jsonl"
+                records = ([claude_text(fixture["source"])] if provider == "claude" else [
+                    codex_meta(), {"type": "turn_context", "payload": {
+                        "turn_id": "turn_1", "cwd": temporary, "model": "fixture-model",
+                    }}, codex_text(fixture["source"]),
+                ])
+                write_jsonl(path, records)
+                current = binding(provider, path, version=fixture["version"])
+                plain, styles = provider_authority_module._normalize_captured_rows(
+                    fixture["styled"], fixture["plain"], fixture["cols"],
+                )
+                result = authoritative_provider_match(
+                    current, TranscriptIndex(), transcript_root=Path(temporary),
+                    cols=fixture["cols"], plain_rows=plain, style_rows=styles,
+                    selection_start=(0, 2), selection_end=(len(plain) - 1, 13),
+                    proc_start_reader=lambda pid: current.proc_start,
+                    proc_environ_reader=lambda pid: {"TMUX_PANE": current.pane_id},
+                )
+                self.assertTrue(result.matched, result.internal_reason)
+                self.assertEqual(result.text, fixture["expected"])
+                if provider == "codex" and fixture_path.stem.startswith("rich-"):
+                    heading_row = next(i for i, value in enumerate(fixture["plain"]) if "## Strong heading" in value)
+                    partial = authoritative_provider_match(
+                        current, TranscriptIndex(), transcript_root=Path(temporary),
+                        cols=fixture["cols"], plain_rows=plain, style_rows=styles,
+                        selection_start=(heading_row, 2), selection_end=(heading_row, 19),
+                        proc_start_reader=lambda pid: current.proc_start,
+                        proc_environ_reader=lambda pid: {"TMUX_PANE": current.pane_id},
+                    )
+                    self.assertTrue(partial.matched, partial.internal_reason)
+                    self.assertEqual(partial.text, "Strong heading")
+                if provider == "codex" and fixture_path.stem.startswith("code-"):
+                    wrong_styles = tuple(tuple((start, end, "plain" if style == "plain;fg-indexed-6" else style)
+                                               for start, end, style in row) for row in styles)
+                    mismatch = authoritative_provider_match(
+                        current, TranscriptIndex(), transcript_root=Path(temporary),
+                        cols=fixture["cols"], plain_rows=plain, style_rows=wrong_styles,
+                        selection_start=(0, 2), selection_end=(len(plain) - 1, 13),
+                        proc_start_reader=lambda pid: current.proc_start,
+                        proc_environ_reader=lambda pid: {"TMUX_PANE": current.pane_id},
+                    )
+                    self.assertFalse(mismatch.matched)
+                    self.assertEqual(mismatch.internal_reason, "style-mismatch")
+
+    def test_current_claude_matches_recorded_assistant_layouts(self):
+        self.check_fixtures("claude", "2.1.261")
+
+    def test_current_codex_matches_recorded_assistant_layouts(self):
+        self.check_fixtures("codex", "0.153.3")
 
 
 class RuntimeBindingCacheTest(unittest.TestCase):

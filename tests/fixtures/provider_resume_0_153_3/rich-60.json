@@ -1,0 +1,41 @@
+{
+  "provider": "codex",
+  "version": "0.153.3",
+  "cols": 60,
+  "method": "synthetic-transcript-resume",
+  "modelRequests": 0,
+  "source": "FIXTURE-BEGIN\n\n## Strong heading\n\nPlain **bold** and *italic* words.\n\n- first bullet wraps across a narrow terminal while retaining its own authored identity\n- second bullet\n\nStatus ✅ 東京\n\nFIXTURE-END",
+  "expected": "FIXTURE-BEGIN\n\nStrong heading\n\nPlain bold and italic words.\n\n- first bullet wraps across a narrow terminal while retaining its own authored identity\n- second bullet\n\nStatus ✅ 東京\n\nFIXTURE-END",
+  "plain": [
+    "• FIXTURE-BEGIN",
+    "",
+    "  ## Strong heading",
+    "",
+    "  Plain bold and italic words.",
+    "",
+    "  - first bullet wraps across a narrow terminal while",
+    "    retaining its own authored identity",
+    "",
+    "  - second bullet",
+    "",
+    "  Status ✅ 東京",
+    "",
+    "  FIXTURE-END"
+  ],
+  "styled": [
+    "\u001b[2m• \u001b[0mFIXTURE-BEGIN",
+    "",
+    "  \u001b[1m## Strong heading\u001b[0m",
+    "",
+    "  Plain \u001b[1mbold\u001b[0m and \u001b[3mitalic\u001b[0m words.",
+    "",
+    "  - first bullet wraps across a narrow terminal while",
+    "    retaining its own authored identity",
+    "",
+    "  - second bullet",
+    "",
+    "  Status ✅ 東京",
+    "",
+    "  FIXTURE-END"
+  ]
+}
