@@ -319,8 +319,23 @@ class RendererProfile:
 CLAUDE_PROFILES = {
     # Validated against synthetic transcript resumes of the installed binary
     # at 60 and 100 columns (tests/fixtures/provider_resume_2_1_261).
+    "2.1.263": RendererProfile(
+        "claude", "2.1.263", "● ", "  ", "- ", "{number}. ",
+        marker_style="assistant",
+        first_gutter_styles=("assistant-dot", "assistant"),
+    ),
     "2.1.261": RendererProfile(
         "claude", "2.1.261", "● ", "  ", "- ", "{number}. ",
+        marker_style="assistant",
+        first_gutter_styles=("assistant-dot", "assistant"),
+    ),
+    "2.1.260": RendererProfile(
+        "claude", "2.1.260", "● ", "  ", "- ", "{number}. ",
+        marker_style="assistant",
+        first_gutter_styles=("assistant-dot", "assistant"),
+    ),
+    "2.1.251": RendererProfile(
+        "claude", "2.1.251", "● ", "  ", "- ", "{number}. ",
         marker_style="assistant",
         first_gutter_styles=("assistant-dot", "assistant"),
     ),

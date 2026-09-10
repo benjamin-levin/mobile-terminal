@@ -1,0 +1,25 @@
+{
+  "provider": "claude",
+  "version": "2.1.260",
+  "cols": 100,
+  "method": "synthetic-transcript-resume",
+  "modelRequests": 0,
+  "source": "FIXTURE-BEGIN\nReliable terminal copying preserves authored words while removing visual wraps added by the provider renderer without inventing line breaks.\nNEXT\n\nFIXTURE-END",
+  "expected": "FIXTURE-BEGIN\nReliable terminal copying preserves authored words while removing visual wraps added by the provider renderer without inventing line breaks.\nNEXT\n\nFIXTURE-END",
+  "plain": [
+    "● FIXTURE-BEGIN",
+    "  Reliable terminal copying preserves authored words while removing visual wraps added by the",
+    "  provider renderer without inventing line breaks.",
+    "  NEXT",
+    "",
+    "  FIXTURE-END"
+  ],
+  "styled": [
+    "\u001b[38;5;231m\u001b[49m●\u001b[39m FIXTURE-BEGIN",
+    "  Reliable terminal copying preserves authored words while removing visual wraps added by the",
+    "  provider renderer without inventing line breaks.",
+    "  NEXT",
+    "",
+    "  FIXTURE-END"
+  ]
+}

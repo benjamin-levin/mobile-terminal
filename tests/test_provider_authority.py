@@ -2149,6 +2149,15 @@ class CurrentProviderResumeFixtureTest(unittest.TestCase):
     def test_current_claude_matches_recorded_assistant_layouts(self):
         self.check_fixtures("claude", "2.1.261")
 
+    def test_claude_2_1_251_matches_recorded_assistant_layouts(self):
+        self.check_fixtures("claude", "2.1.251")
+
+    def test_claude_2_1_260_matches_recorded_assistant_layouts(self):
+        self.check_fixtures("claude", "2.1.260")
+
+    def test_claude_2_1_263_matches_recorded_assistant_layouts(self):
+        self.check_fixtures("claude", "2.1.263")
+
     def test_current_codex_matches_recorded_assistant_layouts(self):
         self.check_fixtures("codex", "0.153.3")
 
