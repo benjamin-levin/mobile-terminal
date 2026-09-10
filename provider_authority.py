@@ -3320,9 +3320,12 @@ def _provider_selection_locked(
         tuple[int, str, tuple[tuple[int, int, str], ...]]
     ]
     | None = None,
+    forensics_trace: dict[str, Any] | None = None,
 ) -> ProviderSelectionResult:
     mode = provider_authority_mode()
     if mode == "off":
+        if forensics_trace is not None:
+            forensics_trace["binding"]["reason"] = "authority-disabled"
         return ProviderSelectionResult(
             False,
             decision="unowned",
@@ -3342,6 +3345,8 @@ def _provider_selection_locked(
     provider_home = Path(home) if home is not None else Path.home()
     cache: Mapping[str, Any] | None = None
     cached: ProviderBinding | None = None
+    binding: ProviderBinding | None = None
+    binding_reason = "binding-unavailable"
     owned = False
     provider_signal = False
     try:
@@ -3349,6 +3354,8 @@ def _provider_selection_locked(
         if cache is not None:
             provider_signal = True
             cached = _cache_binding(cache, require_active=False)
+            if not cache["active"]:
+                binding_reason = "binding-cache-stale"
             if cached.provider == "codex":
                 owned = _selection_is_owned(cached, cache, snapshot, start_row, end_row)
                 if not cache["active"]:
@@ -3361,12 +3368,14 @@ def _provider_selection_locked(
                 return decision("unowned", False, "inactive-unowned")
         try:
             binding, cache = resolve_provider_binding(snapshot.pane_id, home=provider_home)
-        except ProviderAuthorityError:
+        except ProviderAuthorityError as exc:
+            binding_reason = exc.reason
             if cached is not None and cached.provider == "claude" and not bool(snapshot.alternate):
                 return decision("unowned", False, "inactive-unowned")
             raise
         if binding is None:
             return decision("unowned", False, "binding-unavailable")
+        binding_reason = "bound"
         provider_signal = True
         owned = _selection_is_owned(binding, cache, snapshot, start_row, end_row)
         if not owned:
@@ -3414,6 +3423,8 @@ def _provider_selection_locked(
             "provider-exact",
         )
     except ProviderAuthorityError as exc:
+        if binding is None:
+            binding_reason = exc.reason
         if mode == "shadow":
             _record_provider_diagnostic(mode, "fallback", exc.reason)
             return ProviderSelectionResult(
@@ -3432,6 +3443,8 @@ def _provider_selection_locked(
         _record_provider_diagnostic(mode, "rejected", exc.reason)
         raise
     except Exception as exc:
+        if binding is None:
+            binding_reason = "provider-internal-failure"
         if mode in ("shadow", "prefer"):
             _record_provider_diagnostic(mode, "fallback", "provider-internal-failure")
             return ProviderSelectionResult(
@@ -3446,6 +3459,41 @@ def _provider_selection_locked(
             )
         _record_provider_diagnostic(mode, "rejected", "provider-internal-failure")
         raise ProviderAuthorityError("provider-internal-failure") from exc
+    finally:
+        if forensics_trace is not None:
+            metadata = forensics_trace["binding"]
+            metadata["reason"] = binding_reason
+            metadata["cacheState"] = (
+                "active" if cache.get("active") is True else "inactive"
+            ) if cache is not None else "absent"
+            if binding_reason in (
+                "binding-cache-invalid", "binding-cache-oversized", "binding-cache-unavailable",
+            ):
+                metadata["cacheState"] = binding_reason.removeprefix("binding-cache-")
+            identity = binding or cached
+            if identity is not None:
+                metadata.update(
+                    {
+                        "provider": identity.provider,
+                        "pane": identity.pane_id,
+                        "pid": identity.pid,
+                        "procStart": identity.proc_start,
+                        "generation": identity.generation,
+                        "sessionId": identity.session_id,
+                        "version": identity.version,
+                        "transcriptPath": str(identity.transcript_path),
+                    }
+                )
+                if identity.provider == "claude":
+                    registry_path = provider_home / ".claude" / "sessions" / f"{identity.pid}.json"
+                    try:
+                        registry_path.stat()
+                    except FileNotFoundError:
+                        metadata["registryFilePresent"] = False
+                    except OSError:
+                        pass
+                    else:
+                        metadata["registryFilePresent"] = True
 
 
 def provider_selection(
@@ -3460,6 +3508,7 @@ def provider_selection(
         tuple[int, str, tuple[tuple[int, int, str], ...]]
     ]
     | None = None,
+    forensics_trace: dict[str, Any] | None = None,
 ) -> ProviderSelectionResult:
     with _PROVIDER_SELECTION_LOCK:
         return _provider_selection_locked(
@@ -3470,6 +3519,7 @@ def provider_selection(
             end_row,
             home=home,
             client_rows=client_rows,
+            **({"forensics_trace": forensics_trace} if forensics_trace is not None else {}),
         )
 
 

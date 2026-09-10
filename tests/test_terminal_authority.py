@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import provider_authority
 import server
 from tests.tmux_harness import TmuxHarness
 
@@ -3421,6 +3422,9 @@ class ForensicsPersistenceTest(unittest.IsolatedAsyncioTestCase):
             "rows": 1,
             "baseY": 0,
             "bufferType": "normal",
+            "clientRows": [
+                {"y": 0, "text": "provider    ", "styles": [[0, 12, "plain"]], "isWrapped": False},
+            ],
             "selection": {"start": {"x": 0, "y": 0}, "end": {"x": 8, "y": 0}},
         }
         binding = {
@@ -3482,11 +3486,99 @@ class ForensicsPersistenceTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["selectedText"], "provider")
             self.assertEqual(record["resultText"], result_text)
             self.assertEqual(record["binding"], binding)
+            self.assertTrue(record["clientRowsPresent"])
+            self.assertEqual(record["clientRows"], [
+                {"y": 0, "text": "provider    ", "isWrapped": False},
+            ])
             self.assertEqual(record["session"], "session")
             self.assertEqual(record["paneId"], "%1")
             self.assertEqual(record["cols"], 12)
             self.assertEqual(record["rows"], 1)
             self.assertGreaterEqual(record["elapsedMs"], 0)
+
+    async def test_binding_forensics_reuses_resolved_or_cached_identity(self):
+        pane = replace(snapshot(cols=8, authored_lines=["rendered"]), alternate=True)
+        identity = provider_authority.ProviderBinding(
+            "claude", "%1", 123, "456", "fixture-session", "fixture-session",
+            Path("/fixture/transcript.jsonl"), "test-version", 7,
+        )
+        for registry_error, present in ((None, True), (FileNotFoundError(), False),
+                                        (PermissionError(), None)):
+            for binding_error in (None, "claude-binding-unavailable", "registry-hook-disagreement"):
+                with self.subTest(present=present, binding_error=binding_error):
+                    trace = {"binding": server._copy_binding_forensics("%1")}
+                    cache = {"active": True}
+                    with (
+                        mock.patch("provider_authority.provider_authority_mode", return_value="prefer"),
+                        mock.patch("provider_authority._load_binding_cache", return_value=cache) as load,
+                        mock.patch("provider_authority._cache_binding", return_value=identity),
+                        mock.patch("provider_authority.resolve_provider_binding",
+                                   side_effect=provider_authority.ProviderAuthorityError(binding_error)
+                                   if binding_error else None,
+                                   return_value=(identity, cache)) as resolve,
+                        mock.patch("provider_authority._selection_is_owned", return_value=True),
+                        mock.patch("provider_authority._transcript_index"),
+                        mock.patch("provider_authority.authoritative_provider_match",
+                                   return_value=mock.Mock(matched=True, text="source")),
+                        mock.patch("provider_authority._record_provider_diagnostic"),
+                        mock.patch.object(Path, "stat", side_effect=registry_error) as stat,
+                        mock.patch.object(Path, "read_bytes") as read,
+                        mock.patch.object(Path, "glob") as scan,
+                    ):
+                        result = provider_authority.provider_selection(
+                            pane, 0, 0, 8, 0, home="/fixture", forensics_trace=trace,
+                        )
+                        without_trace = provider_authority.provider_selection(
+                            pane, 0, 0, 8, 0, home="/fixture",
+                        )
+                    self.assertEqual(result, without_trace)
+                    self.assertEqual(trace["binding"], {
+                        "reason": binding_error or "bound",
+                        "pane": "%1", "pid": 123, "procStart": "456", "generation": 7,
+                        "sessionId": "fixture-session", "provider": "claude",
+                        "version": "test-version", "transcriptPath": "/fixture/transcript.jsonl",
+                        "cacheState": "active", "registryFilePresent": present,
+                    })
+                    self.assertEqual(load.call_args_list, [mock.call(Path("/fixture"), "%1")] * 2)
+                    self.assertEqual(resolve.call_args_list, [mock.call("%1", home=Path("/fixture"))] * 2)
+                    stat.assert_called_once_with()
+                    read.assert_not_called()
+                    scan.assert_not_called()
+
+    async def test_binding_forensics_unknown_identity_and_gate_off_do_no_extra_io(self):
+        pane = replace(snapshot(cols=8, authored_lines=["rendered"]), alternate=True)
+        for enabled in (False, True):
+            for mode, failure, expected_reason in (
+                ("off", None, "authority-disabled"),
+                ("prefer", None, "binding-unavailable"),
+                ("prefer", "binding-cache-invalid", "binding-cache-invalid"),
+            ):
+                with self.subTest(enabled=enabled, mode=mode, failure=failure):
+                    trace = {"binding": server._copy_binding_forensics("%1")}
+                    with (
+                        mock.patch("provider_authority.provider_authority_mode", return_value=mode),
+                        mock.patch("provider_authority._load_binding_cache", return_value=None,
+                                   side_effect=provider_authority.ProviderAuthorityError(failure)
+                                   if failure else None) as load,
+                        mock.patch("provider_authority.resolve_provider_binding", return_value=(None, None)) as resolve,
+                        mock.patch("provider_authority._record_provider_diagnostic"),
+                        mock.patch.object(Path, "stat") as stat,
+                        mock.patch.object(Path, "read_bytes") as read,
+                        mock.patch.object(Path, "glob") as scan,
+                    ):
+                        provider_authority.provider_selection(
+                            pane, 0, 0, 8, 0, home="/fixture",
+                            **({"forensics_trace": trace} if enabled else {}),
+                        )
+                    self.assertEqual(trace["binding"]["reason"], expected_reason if enabled else "not-attempted")
+                    for key in ("pid", "procStart", "generation", "sessionId", "version",
+                                "transcriptPath", "registryFilePresent"):
+                        self.assertIsNone(trace["binding"][key])
+                    self.assertEqual(load.call_count, int(mode != "off"))
+                    self.assertEqual(resolve.call_count, int(mode != "off" and failure is None))
+                    stat.assert_not_called()
+                    read.assert_not_called()
+                    scan.assert_not_called()
 
     async def test_forensics_rotation_caps_files_and_retains_newest(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4090,6 +4182,138 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
                     tuple((index, text, ((0, 8, "plain"),))
                           for index, text in enumerate(pieces)),
                 )
+
+    async def test_copy_forensics_wrap_rows_and_gate_off_preserve_wire_bytes(self):
+        pane = replace(
+            snapshot(cols=8, authored_lines=["changed"] * 3, rows=3),
+            alternate=True,
+        )
+        pieces = ("abcdefgh", "ijklmnop", "hard    ")
+        wraps = (False, True, False)
+        for enabled in (False, True):
+            for invalid in (False, True):
+                with self.subTest(enabled=enabled, invalid=invalid), tempfile.TemporaryDirectory() as temporary:
+                    bridge, payload = self.make_bridge(pane)
+                    payload.update({
+                        "type": "selection-request", "requestId": "forensics",
+                        "bufferType": "alternate",
+                        "selection": {"start": {"x": 0, "y": 0}, "end": {"x": 4, "y": 2}},
+                        "clientRows": [
+                            {"y": y, "text": text, "styles": [[0, 8, "plain"]], "isWrapped": wrapped}
+                            for y, (text, wrapped) in enumerate(zip(pieces, wraps))
+                        ],
+                    })
+                    if invalid:
+                        payload["clientRows"][1]["isWrapped"] = "invalid"
+                    root = Path(temporary) / "forensics"
+                    with (
+                        mock.patch("server.COPY_FORENSICS_ENABLED", enabled),
+                        mock.patch("server.FORENSICS_ROOT", root),
+                        mock.patch("server.capture_pane_snapshot", return_value=pane),
+                        mock.patch("server.provider_selection", return_value=provider_authority.ProviderSelectionResult(
+                            False, authority="terminal-raw", decision="fallback", reason="no-canonical-candidate",
+                        )) as select,
+                        mock.patch("server._copy_binding_forensics", wraps=server._copy_binding_forensics) as metadata,
+                        mock.patch("provider_authority._load_binding_cache") as load,
+                        mock.patch("provider_authority.resolve_provider_binding") as resolve,
+                        mock.patch.object(Path, "stat", autospec=True, side_effect=Path.stat) as stat,
+                        mock.patch("server._record_authoritative_selection_rejection") as diagnostic,
+                        mock.patch("builtins.print") as journal,
+                    ):
+                        app = object.__new__(AppServer)
+                        await app.handle_command(bridge.connection, bridge, {"session": "session"}, payload)
+                        if not enabled:
+                            metadata.assert_not_called()
+                            stat.assert_not_called()
+                            journal.assert_not_called()
+                        load.assert_not_called()
+                        resolve.assert_not_called()
+                        if invalid:
+                            select.assert_not_called()
+                            diagnostic.assert_called_once_with("client-rows-invalid")
+                        else:
+                            diagnostic.assert_not_called()
+                            self.assertEqual("forensics_trace" in select.call_args.kwargs, enabled)
+                            self.assertEqual(select.call_args.kwargs["client_rows"], tuple(
+                                (y, text, ((0, 8, "plain"),)) for y, text in enumerate(pieces)
+                            ))
+                    expected = (
+                        b'{"type": "selection-result", "requestId": "forensics", "error": "Terminal changed; select again."}'
+                        if invalid else
+                        b'{"type": "selection-result", "requestId": "forensics", "text": "abcdefghijklmnop\\nhard", "authority": "terminal-raw"}'
+                    )
+                    responses = [message.encode("utf-8") for message in bridge.connection.messages
+                                 if isinstance(message, str) and json.loads(message).get("type") == "selection-result"]
+                    self.assertEqual(responses, [expected])
+                    if enabled:
+                        records = [json.loads(line) for path in root.glob("copy-*.jsonl")
+                                   for line in path.read_text().splitlines()]
+                        self.assertEqual(len(records), 1)
+                        self.assertTrue(records[0]["clientRowsPresent"])
+                        self.assertEqual(records[0]["clientRows"], [] if invalid else [
+                            {"y": y, "text": text, "isWrapped": wrapped}
+                            for y, (text, wrapped) in enumerate(zip(pieces, wraps))
+                        ])
+                        self.assertEqual(records[0]["selectedText"], None if invalid else "abcdefghijklmnop\nhard")
+                        self.assertEqual(records[0]["resultText"], None if invalid else "abcdefghijklmnop\nhard")
+                        self.assertEqual(records[0]["binding"], server._copy_binding_forensics("%1"))
+                    else:
+                        self.assertFalse(root.exists())
+
+    async def test_copy_forensics_persists_stale_binding_and_wrap_flags_together(self):
+        pane = replace(snapshot(cols=8, authored_lines=["changed"] * 2, rows=2), alternate=True)
+        bridge, payload = self.make_bridge(pane)
+        payload.update({
+            "bufferType": "alternate",
+            "selection": {"start": {"x": 0, "y": 0}, "end": {"x": 4, "y": 1}},
+            "clientRows": [
+                {"y": 0, "text": "abcdefgh", "styles": [[0, 8, "plain"]], "isWrapped": False},
+                {"y": 1, "text": "ijkl    ", "styles": [[0, 8, "plain"]], "isWrapped": True},
+            ],
+        })
+        identity = provider_authority.ProviderBinding(
+            "claude", "%1", 123, "456", "fixture-session", "fixture-session",
+            Path("/fixture/transcript.jsonl"), "test-version", 7,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            root = home / "forensics"
+            with (
+                mock.patch("server.COPY_FORENSICS_ENABLED", True),
+                mock.patch("server.FORENSICS_ROOT", root),
+                mock.patch("server.capture_pane_snapshot", return_value=pane),
+                mock.patch("provider_authority.provider_authority_mode", return_value="prefer"),
+                mock.patch("provider_authority._load_binding_cache", return_value={"active": True}) as load,
+                mock.patch("provider_authority._cache_binding", return_value=identity),
+                mock.patch("provider_authority.resolve_provider_binding",
+                           side_effect=provider_authority.ProviderAuthorityError("claude-binding-unavailable")) as resolve,
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch("provider_authority._record_provider_diagnostic"),
+                mock.patch("builtins.print") as journal,
+            ):
+                result = await bridge.authoritative_selection_result(payload)
+            records = [json.loads(line) for path in root.glob("copy-*.jsonl")
+                       for line in path.read_text().splitlines()]
+        self.assertEqual(result, AuthoritativeSelectionResult(text="abcdefghijkl", authority="terminal-raw"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["binding"], {
+            "reason": "claude-binding-unavailable", "pane": "%1", "pid": 123,
+            "procStart": "456", "generation": 7, "sessionId": "fixture-session",
+            "provider": "claude", "version": "test-version",
+            "transcriptPath": "/fixture/transcript.jsonl", "cacheState": "active",
+            "registryFilePresent": False,
+        })
+        self.assertEqual(records[0]["clientRows"], [
+            {"y": 0, "text": "abcdefgh", "isWrapped": False},
+            {"y": 1, "text": "ijkl    ", "isWrapped": True},
+        ])
+        self.assertEqual(records[0]["reason"], "claude-binding-unavailable")
+        self.assertEqual(records[0]["selectedText"], "abcdefghijkl")
+        self.assertEqual(records[0]["resultText"], "abcdefghijkl")
+        load.assert_called_once_with(home, "%1")
+        resolve.assert_called_once_with("%1", home=home)
+        for value in ("abcdefgh", "fixture-session", "/fixture/transcript.jsonl"):
+            self.assertNotIn(value, str(journal.call_args_list))
 
     async def test_alternate_provider_exact_accepts_client_emoji_rows(self):
         pane = replace(

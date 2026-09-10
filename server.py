@@ -653,48 +653,19 @@ def _append_forensics_record(kind: str, record: dict[str, Any]) -> bool:
 
 
 def _copy_binding_forensics(pane_id: str) -> dict[str, Any]:
-    metadata: dict[str, Any] = {
+    return {
+        "reason": "not-attempted",
+        "pane": pane_id,
+        "pid": None,
+        "procStart": None,
+        "generation": None,
+        "sessionId": None,
         "provider": None,
         "version": None,
         "transcriptPath": None,
-        "cacheState": "absent",
+        "cacheState": None,
+        "registryFilePresent": None,
     }
-    if not re.fullmatch(r"%[1-9][0-9]*", pane_id):
-        metadata["cacheState"] = "invalid-pane"
-        return metadata
-    path = Path.home() / ".mobile-terminal" / "provider-bindings" / f"{pane_id[1:]}.json"
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        return metadata
-    except OSError:
-        metadata["cacheState"] = "unavailable"
-        return metadata
-    if len(raw) > 64 * 1024:
-        metadata["cacheState"] = "oversized"
-        return metadata
-    try:
-        cache = json.loads(raw)
-    except json.JSONDecodeError:
-        metadata["cacheState"] = "invalid"
-        return metadata
-    if not isinstance(cache, dict):
-        metadata["cacheState"] = "invalid"
-        return metadata
-    provider = cache.get("provider")
-    version = cache.get("version")
-    transcript_path = cache.get("transcriptPath")
-    metadata.update(
-        {
-            "provider": provider if isinstance(provider, str) else None,
-            "version": version if isinstance(version, str) else None,
-            "transcriptPath": (
-                transcript_path if isinstance(transcript_path, str) else None
-            ),
-            "cacheState": "active" if cache.get("active") is True else "inactive",
-        }
-    )
-    return metadata
 
 
 def _store_copy_forensics(
@@ -733,7 +704,7 @@ def _store_copy_forensics(
         rows = int(payload.get("rows", -1))
     except (TypeError, ValueError):
         rows = -1
-    binding = _copy_binding_forensics(str(payload.get("paneId", bridge.pane_id)))
+    binding = trace["binding"]
     stored = _append_forensics_record(
         "copy",
         {
@@ -746,6 +717,7 @@ def _store_copy_forensics(
             "resultText": result.text if result.error is None else None,
             "bufferType": str(payload.get("bufferType", "")),
             "clientRowsPresent": isinstance(payload.get("clientRows"), list),
+            "clientRows": trace.get("clientRows", []),
             "paneId": str(payload.get("paneId", bridge.pane_id)),
             "session": str(payload.get("session", bridge.session_name)),
             "epoch": epoch,
@@ -4374,6 +4346,11 @@ class TmuxBridge:
             or not 0 <= end_y <= base_y + client_rows - 1
         ):
             return reject("geometry-buffer-base-mismatch")
+        if forensics_trace is not None:
+            forensics_trace["clientRows"] = [
+                {"y": y, "text": text, "isWrapped": is_wrapped}
+                for y, text, _, is_wrapped in client_selection_rows
+            ]
         if (
             payload.get("session") != self.session_name
             or payload.get("profile", "") != self.profile_id
@@ -4492,6 +4469,7 @@ class TmuxBridge:
                             end_x,
                             relative_end_row,
                             client_rows=tuple(row[:3] for row in client_selection_rows),
+                            **({"forensics_trace": forensics_trace} if forensics_trace is not None else {}),
                         )
                         observe_provider_result(provider)
                         if provider.owned:
@@ -4709,6 +4687,7 @@ class TmuxBridge:
                             resolved_start_row,
                             end_x,
                             resolved_end_row,
+                            **({"forensics_trace": forensics_trace} if forensics_trace is not None else {}),
                         )
                         observe_provider_result(provider)
 
@@ -4835,7 +4814,10 @@ class TmuxBridge:
                 defer_hold_release=defer_hold_release,
             )
         started_at = time.perf_counter()
-        trace: dict[str, Any] = {"selectedText": None}
+        trace: dict[str, Any] = {
+            "selectedText": None,
+            "binding": _copy_binding_forensics(str(payload.get("paneId", self.pane_id))),
+        }
         result = await self._authoritative_selection_result(
             payload,
             defer_hold_release=defer_hold_release,
