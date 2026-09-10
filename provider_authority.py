@@ -420,6 +420,7 @@ def bind_claude_pane(
     *,
     sessions_root: Path | str | None = None,
     transcript_root: Path | str | None = None,
+    bindings_root: Path | str | None = None,
     expected_pid: int | None = None,
     expected_session_id: str | None = None,
     proc_start_reader: Callable[[int], str] = _read_proc_start,
@@ -477,6 +478,50 @@ def bind_claude_pane(
                 version=version,
             )
         )
+    if not matches:
+        cache_root = Path(bindings_root) if bindings_root is not None else home / ".mobile-terminal" / "provider-bindings"
+        try:
+            data = json.loads((cache_root / f"{pane_id[1:]}.json").read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError
+            pid = data.get("pid")
+            session_id = data.get("sessionId")
+            proc_start = data.get("procStart")
+            version = data.get("version")
+            if (
+                data.get("provider") != "claude"
+                or data.get("active") is not True
+                or data.get("terminalEvent") == "SessionEnd"
+                or data.get("paneId") != pane_id
+                or isinstance(pid, bool)
+                or not isinstance(pid, int)
+                or not all(isinstance(value, str) and value for value in (session_id, proc_start, version))
+                or not UUID_RE.fullmatch(session_id)
+                or (expected_pid is not None and pid != expected_pid)
+                or (expected_session_id is not None and session_id != expected_session_id)
+            ):
+                raise ValueError
+            if proc_start_reader(pid) != proc_start or proc_environ_reader(pid).get("TMUX_PANE") != pane_id:
+                raise ValueError
+            # The hook path is only a hint; discover the transcript independently.
+            paths = tuple(transcript_paths(approved_root, session_id))
+            if len(paths) != 1 or paths[0].name != f"{session_id}.jsonl":
+                raise ValueError
+            _relative_transcript_path(approved_root, paths[0])
+            matches.append(
+                ProviderBinding(
+                    provider="claude",
+                    pane_id=pane_id,
+                    pid=pid,
+                    proc_start=proc_start,
+                    session_id=session_id,
+                    transcript_id=session_id,
+                    transcript_path=paths[0],
+                    version=version,
+                )
+            )
+        except (OSError, UnicodeError, ValueError, ProviderAuthorityError):
+            pass
     if len(matches) != 1:
         raise ProviderAuthorityError("ambiguous-claude-binding" if matches else "claude-binding-unavailable")
     return matches[0]

@@ -355,6 +355,170 @@ class AuthoritativeSelectionTest(unittest.TestCase):
             extract_authoritative_selection(pane, 0, -1, 1, 0)
 
 
+class ClaudePaneCacheFallbackTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name)
+        self.registry = self.home / ".claude" / "sessions"
+        self.transcripts = self.home / ".claude" / "projects"
+        self.bindings = self.home / ".mobile-terminal" / "provider-bindings"
+        self.registry.mkdir(parents=True)
+        self.bindings.mkdir(parents=True)
+        self.session_id = "12345678-1234-4123-8123-123456789abc"
+        self.path = self.transcripts / "project" / f"{self.session_id}.jsonl"
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("{}\n", encoding="utf-8")
+        self.cache_path = self.bindings / "9.json"
+        self.cache = {
+            "schema": 1,
+            "provider": "claude",
+            "paneId": "%9",
+            "sessionId": self.session_id,
+            "transcriptPath": str(self.path),
+            "pid": 321,
+            "procStart": "444",
+            "generation": 1,
+            "eventTimeNs": 100,
+            "active": True,
+            "terminalEvent": "",
+            "version": "2.1.261",
+        }
+        self.write_cache()
+
+    def write_cache(self, **updates):
+        self.cache_path.write_text(json.dumps(dict(self.cache, **updates)), encoding="utf-8")
+
+    def write_registry(self, registry_pid, **updates):
+        data = {
+            "pid": registry_pid,
+            "sessionId": self.session_id,
+            "procStart": "444",
+            "version": "2.1.241",
+            "tmux": "name:@2.%9",
+        }
+        (self.registry / f"{registry_pid}.json").write_text(
+            json.dumps(dict(data, **updates)), encoding="utf-8"
+        )
+
+    def bind(self, **updates):
+        options = {
+            "sessions_root": self.registry,
+            "transcript_root": self.transcripts,
+            "bindings_root": self.bindings,
+            "proc_start_reader": lambda pid: "444",
+            "proc_environ_reader": lambda pid: {"TMUX_PANE": "%9"},
+            "transcript_paths": lambda root, session: tuple(root.rglob(f"{session}.jsonl")),
+        }
+        options.update(updates)
+        return provider_authority.bind_claude_pane("%9", **options)
+
+    def test_cache_binds_without_native_registry_and_ignores_cached_path(self):
+        self.write_cache(transcriptPath="/not/authority.jsonl")
+        result = self.bind()
+        self.assertEqual(result, provider_authority.ProviderBinding(
+            "claude", "%9", 321, "444", self.session_id, self.session_id,
+            self.path, "2.1.261",
+        ))
+        self.assertEqual(list(self.registry.iterdir()), [])
+
+    def test_cache_defaults_to_home_provider_bindings(self):
+        with mock.patch("provider_authority.Path.home", return_value=self.home):
+            self.assertEqual(self.bind(bindings_root=None).pid, 321)
+
+    def test_cache_rejects_invalid_identity_and_lifecycle_fields(self):
+        cases = (
+            {"provider": "codex"}, {"active": False}, {"active": 1},
+            {"active": "true"}, {"terminalEvent": "SessionEnd"},
+            {"paneId": "%8"}, {"sessionId": "not-a-uuid"},
+            {"sessionId": None}, {"pid": True}, {"pid": "321"},
+            {"pid": 321.0}, {"pid": None}, {"procStart": ""},
+            {"procStart": 444}, {"version": ""}, {"version": None},
+        )
+        for updates in cases:
+            with self.subTest(updates=updates):
+                self.write_cache(**updates)
+                with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "claude-binding-unavailable"):
+                    self.bind()
+
+    def test_cache_rejects_missing_malformed_and_non_object_files(self):
+        self.cache_path.unlink()
+        with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "claude-binding-unavailable"):
+            self.bind()
+        for value in (b"{", b"[]", b"null", b"true", b"\xff"):
+            with self.subTest(value=value):
+                self.cache_path.write_bytes(value)
+                with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "claude-binding-unavailable"):
+                    self.bind()
+
+    def test_cache_revalidates_live_process_start_and_pane(self):
+        for readers in (
+            {"proc_start_reader": lambda pid: "445"},
+            {"proc_environ_reader": lambda pid: {"TMUX_PANE": "%8"}},
+            {"proc_environ_reader": lambda pid: {}},
+            {"proc_start_reader": mock.Mock(side_effect=OSError)},
+            {"proc_environ_reader": mock.Mock(side_effect=provider_authority.ProviderAuthorityError("process-unavailable"))},
+        ):
+            with self.subTest(readers=tuple(readers)):
+                with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "claude-binding-unavailable"):
+                    self.bind(**readers)
+
+    def test_cache_requires_one_independently_discovered_approved_transcript(self):
+        other = self.transcripts / "other" / self.path.name
+        outside = self.home / self.path.name
+        for paths in ((), (self.path, other), (self.path.with_name("wrong.jsonl"),), (outside,)):
+            with self.subTest(paths=paths):
+                with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "claude-binding-unavailable"):
+                    self.bind(transcript_paths=lambda root, session: paths)
+        other.parent.mkdir()
+        other.write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "claude-binding-unavailable"):
+            self.bind()
+        other.unlink()
+        self.path.unlink()
+        with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "claude-binding-unavailable"):
+            self.bind()
+
+    def test_cache_expected_pid_and_session_filters(self):
+        self.assertEqual(self.bind(expected_pid=321, expected_session_id=self.session_id).pid, 321)
+        for filters in ({"expected_pid": 322}, {"expected_session_id": str(uuid.uuid4())}):
+            with self.subTest(filters=filters):
+                with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "claude-binding-unavailable"):
+                    self.bind(**filters)
+
+    def test_native_binding_wins_without_reading_valid_cache(self):
+        self.write_registry(322)
+        with mock.patch.object(Path, "read_text", autospec=True, wraps=Path.read_text) as read:
+            read.side_effect = lambda path, **kwargs: (
+                self.fail("native match must not read cache") if path == self.cache_path
+                else path.read_bytes().decode("utf-8")
+            )
+            result = self.bind()
+        self.assertEqual((result.pid, result.version), (322, "2.1.241"))
+
+    def test_native_ambiguity_never_falls_back_to_valid_cache(self):
+        self.write_registry(322)
+        self.write_registry(323)
+        with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "ambiguous-claude-binding"):
+            self.bind()
+        self.assertEqual(self.bind(expected_pid=322).pid, 322)
+
+    def test_native_expected_filters_and_zero_match_fallback(self):
+        self.write_registry(322)
+        self.assertEqual(self.bind(expected_pid=321).pid, 321)
+        self.assertEqual(self.bind(expected_session_id=self.session_id).pid, 322)
+        other_session = str(uuid.uuid4())
+        self.write_registry(322, sessionId=other_session)
+        self.assertEqual(self.bind(expected_session_id=self.session_id).pid, 321)
+        self.write_registry(322, pid=999)
+        self.assertEqual(self.bind().pid, 321)
+
+    def test_registry_enumeration_failure_preserves_unavailable_reason(self):
+        with mock.patch.object(Path, "glob", side_effect=OSError):
+            with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "registry-unavailable"):
+                self.bind()
+
+
 class CommandProvenanceSelectionTest(unittest.TestCase):
     def setUp(self):
         self.draft = (
