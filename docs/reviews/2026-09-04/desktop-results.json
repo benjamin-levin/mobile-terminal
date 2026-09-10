@@ -1,0 +1,109 @@
+[
+  {
+    "name": "desktop-start",
+    "state": {
+      "mobileComposerMode": false,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 2,
+      "terminalRevision": 30,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 195,
+      "desiredTerminalRows": 53,
+      "deliveredTerminalCols": 195,
+      "deliveredTerminalRows": 53,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "1",
+      "followOutput": false,
+      "cols": 195,
+      "rows": 53,
+      "baseY": 0,
+      "viewportY": 0
+    }
+  },
+  {
+    "name": "fresh-normal-first",
+    "result": {
+      "text": "powerhouse@p"
+    }
+  },
+  {
+    "name": "fresh-normal-second",
+    "result": {
+      "text": "powerhouse@p"
+    }
+  },
+  {
+    "name": "desktop-native-paste",
+    "messages": [
+      {
+        "dir": "out",
+        "t": 1788560705246,
+        "type": "input",
+        "data": "\u001b[200~alpha  beta\r  gamma\u001b[201~"
+      }
+    ]
+  },
+  {
+    "name": "desktop-query-replies",
+    "emitted": [
+      "\u001b[5;26R",
+      "\u001b[?1;2c"
+    ],
+    "forwarded": [
+      {
+        "dir": "out",
+        "t": 1788560706449,
+        "type": "input",
+        "data": "\u001b[5;26R"
+      },
+      {
+        "dir": "out",
+        "t": 1788560706449,
+        "type": "input",
+        "data": "\u001b[?1;2c"
+      }
+    ]
+  },
+  {
+    "name": "paste-mode-before",
+    "mode": true
+  },
+  {
+    "name": "paste-mode-after",
+    "mode": true
+  },
+  {
+    "name": "new-history-first",
+    "state": {
+      "mobileComposerMode": false,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 3,
+      "terminalRevision": 4013,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 195,
+      "desiredTerminalRows": 53,
+      "deliveredTerminalCols": 195,
+      "deliveredTerminalRows": 53,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "1",
+      "followOutput": true,
+      "cols": 195,
+      "rows": 53,
+      "baseY": 66,
+      "viewportY": 66
+    },
+    "result": {
+      "error": "Terminal changed; select again."
+    }
+  },
+  {
+    "name": "new-history-second",
+    "result": {
+      "error": "Terminal changed; select again."
+    }
+  },
+  {
+    "name": "desktop-errors",
+    "errors": []
+  }
+]

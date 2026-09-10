@@ -1,0 +1,40 @@
+[
+  {
+    "name": "protocol-before-reload",
+    "mode": true,
+    "received": [
+      "\u001b[1;23R",
+      "\u001b[1;23R"
+    ]
+  },
+  {
+    "name": "protocol-after-reload",
+    "mode": false,
+    "state": {
+      "mobileComposerMode": false,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 3,
+      "terminalRevision": 0,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 25,
+      "desiredTerminalRows": 20,
+      "deliveredTerminalCols": 25,
+      "deliveredTerminalRows": 20,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "5",
+      "followOutput": false,
+      "cols": 25,
+      "rows": 20,
+      "baseY": 5,
+      "viewportY": 5
+    }
+  },
+  {
+    "name": "protocol-paste-bytes",
+    "received": [
+      "\u001b[1;23R",
+      "\u001b[1;23R",
+      "one\rtwo"
+    ]
+  }
+]

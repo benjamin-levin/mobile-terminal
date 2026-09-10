@@ -1,0 +1,608 @@
+[
+  {
+    "name": "mobile-start",
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 2,
+      "terminalRevision": 0,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 61,
+      "desiredTerminalRows": 53,
+      "deliveredTerminalCols": 61,
+      "deliveredTerminalRows": 53,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "1",
+      "followOutput": false,
+      "cols": 61,
+      "rows": 53,
+      "baseY": 0,
+      "viewportY": 0
+    }
+  },
+  {
+    "name": "mobile-terminal-query-replies",
+    "emitted": [
+      "\u001b[1;26R",
+      "\u001b[?1;2c",
+      "\u001b]10;rgb:e6e6/eded/f3f3\u001b\\"
+    ],
+    "forwarded": []
+  },
+  {
+    "name": "normal-softwrap-copy",
+    "select": {
+      "y": 0,
+      "raw": "START aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa END",
+      "pos": {
+        "start": {
+          "x": 0,
+          "y": 0
+        },
+        "end": {
+          "x": 8,
+          "y": 2
+        }
+      }
+    },
+    "result": {
+      "error": "Terminal changed; select again."
+    }
+  },
+  {
+    "name": "paste-toolbar-unfocused",
+    "messages": [
+      {
+        "dir": "out",
+        "t": 1788560601560,
+        "type": "input",
+        "data": "a b c"
+      }
+    ],
+    "composer": ""
+  },
+  {
+    "name": "paste-toolbar-focused",
+    "messages": [
+      {
+        "dir": "out",
+        "t": 1788560603160,
+        "type": "composer-sync",
+        "value": "a  b\n  c",
+        "cursor": 8,
+        "revision": 2
+      }
+    ],
+    "composer": "a  b\n  c"
+  },
+  {
+    "name": "copy-failure-dismisses",
+    "toast": "Terminal changed; select again."
+  },
+  {
+    "name": "unicode-word-hit-test",
+    "result": {
+      "ok": true,
+      "selected": " hell",
+      "position": {
+        "start": {
+          "x": 2,
+          "y": 4
+        },
+        "end": {
+          "x": 7,
+          "y": 4
+        }
+      },
+      "expected": "hello"
+    }
+  },
+  {
+    "name": "rapid-settings-display-tap",
+    "elapsed": 150,
+    "displayVisible": false,
+    "settingsVisible": true
+  },
+  {
+    "name": "new-tab",
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 7,
+      "terminalRevision": 330,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 61,
+      "desiredTerminalRows": 53,
+      "deliveredTerminalCols": 61,
+      "deliveredTerminalRows": 53,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "2",
+      "followOutput": false,
+      "cols": 61,
+      "rows": 53,
+      "baseY": 0,
+      "viewportY": 0
+    },
+    "tabs": "1\n2"
+  },
+  {
+    "name": "viewport-1280x800",
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 12,
+      "terminalRevision": 90,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 209,
+      "desiredTerminalRows": 50,
+      "deliveredTerminalCols": 209,
+      "deliveredTerminalRows": 50,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "1",
+      "followOutput": false,
+      "cols": 209,
+      "rows": 50,
+      "baseY": 0,
+      "viewportY": 0
+    },
+    "tmux": "209x50",
+    "events": [
+      {
+        "dir": "in",
+        "t": 1788560617651,
+        "type": "seed-open",
+        "epoch": 11,
+        "session": "1",
+        "paneId": "%0",
+        "cutoff": 60,
+        "layoutGeneration": 11
+      },
+      {
+        "dir": "out",
+        "t": 1788560617660,
+        "type": "resize",
+        "cols": 209,
+        "rows": 50
+      },
+      {
+        "dir": "in",
+        "t": 1788560617660,
+        "type": "seed-start",
+        "epoch": 12,
+        "reason": "resize",
+        "session": "1",
+        "paneId": "%0",
+        "invalidFrom": 60
+      },
+      {
+        "dir": "in",
+        "t": 1788560618016,
+        "type": "seed-open",
+        "epoch": 12,
+        "session": "1",
+        "paneId": "%0",
+        "cutoff": 90,
+        "layoutGeneration": 12
+      }
+    ],
+    "bounds": {
+      "terminal": {
+        "x": 0,
+        "y": 60.0625,
+        "width": 1280,
+        "height": 650.9375,
+        "top": 60.0625,
+        "right": 1280,
+        "bottom": 711,
+        "left": 0
+      },
+      "screen": {
+        "x": 0,
+        "y": 60.0625,
+        "width": 1258,
+        "height": 650,
+        "top": 60.0625,
+        "right": 1258,
+        "bottom": 710.0625,
+        "left": 0
+      },
+      "dock": {
+        "x": 0,
+        "y": 711.3125,
+        "width": 1280,
+        "height": 88.6875,
+        "top": 711.3125,
+        "right": 1280,
+        "bottom": 800,
+        "left": 0
+      }
+    }
+  },
+  {
+    "name": "viewport-844x390",
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 13,
+      "terminalRevision": 120,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 136,
+      "desiredTerminalRows": 18,
+      "deliveredTerminalCols": 136,
+      "deliveredTerminalRows": 18,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "1",
+      "followOutput": false,
+      "cols": 136,
+      "rows": 18,
+      "baseY": 1,
+      "viewportY": 1
+    },
+    "tmux": "136x18",
+    "events": [
+      {
+        "dir": "out",
+        "t": 1788560619577,
+        "type": "resize",
+        "cols": 136,
+        "rows": 18
+      },
+      {
+        "dir": "in",
+        "t": 1788560619577,
+        "type": "seed-start",
+        "epoch": 13,
+        "reason": "resize",
+        "session": "1",
+        "paneId": "%0",
+        "invalidFrom": 90
+      },
+      {
+        "dir": "in",
+        "t": 1788560619922,
+        "type": "seed-open",
+        "epoch": 13,
+        "session": "1",
+        "paneId": "%0",
+        "cutoff": 120,
+        "layoutGeneration": 13
+      }
+    ],
+    "bounds": {
+      "terminal": {
+        "x": 0,
+        "y": 60.0625,
+        "width": 844,
+        "height": 240.9375,
+        "top": 60.0625,
+        "right": 844,
+        "bottom": 301,
+        "left": 0
+      },
+      "screen": {
+        "x": 0,
+        "y": 60.0625,
+        "width": 819,
+        "height": 234,
+        "top": 60.0625,
+        "right": 819,
+        "bottom": 294.0625,
+        "left": 0
+      },
+      "dock": {
+        "x": 0,
+        "y": 301.3125,
+        "width": 844,
+        "height": 88.6875,
+        "top": 301.3125,
+        "right": 844,
+        "bottom": 390,
+        "left": 0
+      }
+    }
+  },
+  {
+    "name": "viewport-390x240",
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 14,
+      "terminalRevision": 150,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 61,
+      "desiredTerminalRows": 6,
+      "deliveredTerminalCols": 61,
+      "deliveredTerminalRows": 6,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "1",
+      "followOutput": false,
+      "cols": 61,
+      "rows": 6,
+      "baseY": 6,
+      "viewportY": 6
+    },
+    "tmux": "61x6",
+    "events": [
+      {
+        "dir": "out",
+        "t": 1788560621443,
+        "type": "resize",
+        "cols": 61,
+        "rows": 6
+      },
+      {
+        "dir": "in",
+        "t": 1788560621443,
+        "type": "seed-start",
+        "epoch": 14,
+        "reason": "resize",
+        "session": "1",
+        "paneId": "%0",
+        "invalidFrom": 120
+      },
+      {
+        "dir": "in",
+        "t": 1788560621794,
+        "type": "seed-open",
+        "epoch": 14,
+        "session": "1",
+        "paneId": "%0",
+        "cutoff": 150,
+        "layoutGeneration": 14
+      }
+    ],
+    "bounds": {
+      "terminal": {
+        "x": 0,
+        "y": 60.0625,
+        "width": 390,
+        "height": 90.9375,
+        "top": 60.0625,
+        "right": 390,
+        "bottom": 151,
+        "left": 0
+      },
+      "screen": {
+        "x": 0,
+        "y": 60.0625,
+        "width": 367,
+        "height": 78,
+        "top": 60.0625,
+        "right": 367,
+        "bottom": 138.0625,
+        "left": 0
+      },
+      "dock": {
+        "x": 0,
+        "y": 151.3125,
+        "width": 390,
+        "height": 88.6875,
+        "top": 151.3125,
+        "right": 390,
+        "bottom": 240,
+        "left": 0
+      }
+    }
+  },
+  {
+    "name": "viewport-390x160",
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 15,
+      "terminalRevision": 150,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 61,
+      "desiredTerminalRows": 1,
+      "deliveredTerminalCols": 61,
+      "deliveredTerminalRows": 1,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "1",
+      "followOutput": false,
+      "cols": 61,
+      "rows": 1,
+      "baseY": 11,
+      "viewportY": 6
+    },
+    "tmux": "61x6",
+    "events": [
+      {
+        "dir": "out",
+        "t": 1788560623292,
+        "type": "resize",
+        "cols": 61,
+        "rows": 1
+      },
+      {
+        "dir": "in",
+        "t": 1788560623292,
+        "type": "seed-start",
+        "epoch": 15,
+        "reason": "resize",
+        "session": "1",
+        "paneId": "%0",
+        "invalidFrom": 150
+      },
+      {
+        "dir": "in",
+        "t": 1788560623636,
+        "type": "seed-open",
+        "epoch": 15,
+        "session": "1",
+        "paneId": "%0",
+        "cutoff": 150,
+        "layoutGeneration": 15
+      }
+    ],
+    "bounds": {
+      "terminal": {
+        "x": 0,
+        "y": 60.0625,
+        "width": 390,
+        "height": 10.9375,
+        "top": 60.0625,
+        "right": 390,
+        "bottom": 71,
+        "left": 0
+      },
+      "screen": {
+        "x": 0,
+        "y": 60.0625,
+        "width": 367,
+        "height": 13,
+        "top": 60.0625,
+        "right": 367,
+        "bottom": 73.0625,
+        "left": 0
+      },
+      "dock": {
+        "x": 0,
+        "y": 71.3125,
+        "width": 390,
+        "height": 88.6875,
+        "top": 71.3125,
+        "right": 390,
+        "bottom": 160,
+        "left": 0
+      }
+    }
+  },
+  {
+    "name": "viewport-390x844",
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 16,
+      "terminalRevision": 180,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 61,
+      "desiredTerminalRows": 53,
+      "deliveredTerminalCols": 61,
+      "deliveredTerminalRows": 53,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "1",
+      "followOutput": false,
+      "cols": 61,
+      "rows": 53,
+      "baseY": 0,
+      "viewportY": 0
+    },
+    "tmux": "61x53",
+    "events": [
+      {
+        "dir": "out",
+        "t": 1788560626843,
+        "type": "resize",
+        "cols": 61,
+        "rows": 53
+      },
+      {
+        "dir": "in",
+        "t": 1788560626844,
+        "type": "seed-start",
+        "epoch": 16,
+        "reason": "resize",
+        "session": "1",
+        "paneId": "%0",
+        "invalidFrom": 150
+      },
+      {
+        "dir": "in",
+        "t": 1788560627184,
+        "type": "seed-open",
+        "epoch": 16,
+        "session": "1",
+        "paneId": "%0",
+        "cutoff": 180,
+        "layoutGeneration": 16
+      }
+    ],
+    "bounds": {
+      "terminal": {
+        "x": 0,
+        "y": 60.0625,
+        "width": 390,
+        "height": 694.9375,
+        "top": 60.0625,
+        "right": 390,
+        "bottom": 755,
+        "left": 0
+      },
+      "screen": {
+        "x": 0,
+        "y": 60.0625,
+        "width": 367,
+        "height": 689,
+        "top": 60.0625,
+        "right": 367,
+        "bottom": 749.0625,
+        "left": 0
+      },
+      "dock": {
+        "x": 0,
+        "y": 755.3125,
+        "width": 390,
+        "height": 88.6875,
+        "top": 755.3125,
+        "right": 390,
+        "bottom": 844,
+        "left": 0
+      }
+    }
+  },
+  {
+    "name": "resize-during-repaint",
+    "duration": 11003,
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 17,
+      "terminalRevision": 4272,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 68,
+      "desiredTerminalRows": 53,
+      "deliveredTerminalCols": 68,
+      "deliveredTerminalRows": 53,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "1",
+      "followOutput": false,
+      "cols": 68,
+      "rows": 53,
+      "baseY": 0,
+      "viewportY": 0
+    },
+    "events": [
+      {
+        "dir": "out",
+        "t": 1788560629409,
+        "type": "resize",
+        "cols": 68,
+        "rows": 53
+      },
+      {
+        "dir": "in",
+        "t": 1788560629409,
+        "type": "seed-start",
+        "epoch": 17,
+        "reason": "resize",
+        "session": "1",
+        "paneId": "%0",
+        "invalidFrom": 710
+      },
+      {
+        "dir": "in",
+        "t": 1788560638456,
+        "type": "seed-open",
+        "epoch": 17,
+        "session": "1",
+        "paneId": "%0",
+        "cutoff": 3648,
+        "layoutGeneration": 17
+      }
+    ]
+  },
+  {
+    "name": "browser-errors",
+    "errors": []
+  }
+]

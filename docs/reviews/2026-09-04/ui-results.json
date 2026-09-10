@@ -1,0 +1,73 @@
+[
+  {
+    "name": "ui-editShortcutsButton",
+    "visible": true
+  },
+  {
+    "name": "ui-editGesturesButton",
+    "visible": true
+  },
+  {
+    "name": "ui-usageButton",
+    "visible": true
+  },
+  {
+    "name": "ui-authenticationButton",
+    "visible": true
+  },
+  {
+    "name": "ui-accountButton",
+    "available": false
+  },
+  {
+    "name": "file-workspace",
+    "visible": true,
+    "tree": "review.txt"
+  },
+  {
+    "name": "file-save",
+    "content": "Changed in UI\n"
+  },
+  {
+    "name": "image-paste-file-editor",
+    "uploadCount": 1,
+    "toast": "Screenshot added \u2014 type a message and send."
+  },
+  {
+    "name": "small-screen-max-scale",
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 7,
+      "terminalRevision": 90,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 21,
+      "desiredTerminalRows": 10,
+      "deliveredTerminalCols": 21,
+      "deliveredTerminalRows": 10,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "1",
+      "followOutput": false,
+      "cols": 21,
+      "rows": 10,
+      "baseY": 142,
+      "viewportY": 142
+    },
+    "screen": {
+      "x": 0,
+      "y": 96.375,
+      "width": 303,
+      "height": 335
+    },
+    "settings": {
+      "x": 195.84375,
+      "y": 16.796875,
+      "width": 123.0625,
+      "height": 61.78125
+    }
+  },
+  {
+    "name": "ui-errors",
+    "errors": []
+  }
+]

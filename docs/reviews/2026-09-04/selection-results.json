@@ -1,0 +1,99 @@
+[
+  {
+    "name": "fresh-first",
+    "selected": {
+      "raw": "FRESH OUTPUT",
+      "pos": {
+        "start": {
+          "x": 0,
+          "y": 1
+        },
+        "end": {
+          "x": 12,
+          "y": 1
+        }
+      }
+    },
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 6,
+      "terminalRevision": 949,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 61,
+      "desiredTerminalRows": 53,
+      "deliveredTerminalCols": 61,
+      "deliveredTerminalRows": 53,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "3",
+      "followOutput": true,
+      "cols": 61,
+      "rows": 53,
+      "baseY": 0,
+      "viewportY": 0
+    },
+    "pane": [
+      "powerhouse@powerhouse:~$ printf 'FRESH OUTPUT\\n'",
+      "FRESH OUTPUT",
+      "powerhouse@powerhouse:~$"
+    ],
+    "result": {
+      "error": "Terminal changed; select again."
+    }
+  },
+  {
+    "name": "fresh-second",
+    "result": {
+      "text": "FRESH OUTPUT"
+    }
+  },
+  {
+    "name": "history-first",
+    "selected": {
+      "raw": "NEW-ROW-100",
+      "pos": {
+        "start": {
+          "x": 0,
+          "y": 103
+        },
+        "end": {
+          "x": 11,
+          "y": 103
+        }
+      }
+    },
+    "state": {
+      "mobileComposerMode": true,
+      "terminalAuthoritative": true,
+      "terminalEpoch": 6,
+      "terminalRevision": 2781,
+      "terminalSeedInFlight": false,
+      "desiredTerminalCols": 61,
+      "desiredTerminalRows": 53,
+      "deliveredTerminalCols": 61,
+      "deliveredTerminalRows": 53,
+      "activePaneLocalScroll": true,
+      "activeSessionName": "3",
+      "followOutput": true,
+      "cols": 61,
+      "rows": 53,
+      "baseY": 52,
+      "viewportY": 52
+    },
+    "result": {
+      "error": "Terminal changed; select again."
+    }
+  },
+  {
+    "name": "history-second",
+    "result": {
+      "error": "Terminal changed; select again."
+    }
+  },
+  {
+    "name": "history-after-reseed",
+    "result": {
+      "text": "NEW-ROW-100"
+    }
+  }
+]
