@@ -61,7 +61,15 @@ ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / "static"
 NODE_MODULES_ROOT = ROOT / "node_modules"
 WS_PATH = "/_ws"
+# Speech defaults to a tailnet call to powerspec (the GPU host); socket mode
+# supports a local voice service. The bearer token is read per call from a 0600 file.
+TTS_MODE = os.environ.get("MOBILE_TERMINAL_TTS_MODE", "tcp").strip().lower()
 TTS_SOCKET = os.environ.get("MOBILE_TERMINAL_TTS_SOCKET", "/home/powerhouse/voice/run/voice.sock")
+TTS_HOST = os.environ.get("MOBILE_TERMINAL_TTS_HOST", "100.70.108.32")
+TTS_PORT = int(os.environ.get("MOBILE_TERMINAL_TTS_PORT", "18443"))
+TTS_TOKEN_PATH = Path(
+    os.environ.get("MOBILE_TERMINAL_TTS_TOKEN_FILE", str(Path.home() / ".config/voice/auth-token"))
+)
 TTS_TIMEOUT_SECONDS = 10
 TTS_MAX_TEXT_CHARS = 2000
 TTS_MAX_REQUEST_BYTES = 32768
@@ -3131,14 +3139,22 @@ class TerminalHTTPConnection(ServerConnection):
         super().data_received(b"\r\n".join(forwarded) + b"\r\n\r\n")
 
 
+def _tts_token() -> str:
+    return TTS_TOKEN_PATH.read_text(encoding="utf-8").strip()
+
+
 async def synthesize_terminal_speech(text: str) -> bytes:
-    async with asyncio.timeout(TTS_TIMEOUT_SECONDS):
-        reader, writer = await asyncio.open_unix_connection(TTS_SOCKET)
+    token = await asyncio.to_thread(_tts_token)
+    host = "localhost" if TTS_MODE == "socket" else f"{TTS_HOST}:{TTS_PORT}"
+
+    async def request(reader, writer):
         try:
             body = json.dumps({"text": text}).encode("utf-8")
             writer.write(
-                b"POST /synthesize HTTP/1.1\r\nHost: voice\r\n"
-                b"Content-Type: application/json\r\nConnection: close\r\n"
+                b"POST /v1/synthesize HTTP/1.1\r\n"
+                + f"Host: {host}\r\n".encode("ascii")
+                + f"Authorization: Bearer {token}\r\n".encode("ascii")
+                + b"Content-Type: application/json\r\nConnection: close\r\n"
                 + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
                 + body
             )
@@ -3166,6 +3182,13 @@ async def synthesize_terminal_speech(text: str) -> bytes:
         finally:
             writer.close()
             await writer.wait_closed()
+
+    async with asyncio.timeout(TTS_TIMEOUT_SECONDS):
+        if TTS_MODE == "socket":
+            reader, writer = await asyncio.open_unix_connection(TTS_SOCKET)
+        else:
+            reader, writer = await asyncio.open_connection(TTS_HOST, TTS_PORT)
+        return await request(reader, writer)
 
 
 _COMPRESSIBLE = ("text/", "application/javascript", "application/json", "application/manifest", "image/svg")

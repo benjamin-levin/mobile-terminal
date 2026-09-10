@@ -21,10 +21,16 @@ class TerminalSpeechTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.socket_path = str(Path(self.temp.name) / "voice.sock")
-        self.socket_patch = mock.patch("server.TTS_SOCKET", self.socket_path)
-        self.socket_patch.start()
-        self.addCleanup(self.socket_patch.stop)
+        self.token_path = Path(self.temp.name) / "auth-token"
+        self.token_path.write_text("test-voice-token", encoding="utf-8")
+        self.patches = [
+            mock.patch("server.TTS_MODE", "tcp"),
+            mock.patch("server.TTS_HOST", "127.0.0.1"),
+            mock.patch("server.TTS_TOKEN_PATH", self.token_path),
+        ]
+        for patch in self.patches:
+            patch.start()
+            self.addCleanup(patch.stop)
         self.app = server.AppServer(
             host="127.0.0.1", port=0, session_name="test", shell="/bin/sh",
             cwd=self.temp.name, token="test-bootstrap", require_token=True,
@@ -43,7 +49,14 @@ class TerminalSpeechTest(unittest.IsolatedAsyncioTestCase):
         self.audio = output.getvalue()
         self.voice_body = self.audio
         self.voice_delay = 0
-        self.voice_server = await asyncio.start_unix_server(self.voice, path=self.socket_path)
+        self.voice_response = None
+        self.voice_server = await asyncio.start_server(self.voice, "127.0.0.1", 0)
+        # Patch the port only once the ephemeral port is known.
+        port_patch = mock.patch(
+            "server.TTS_PORT", self.voice_server.sockets[0].getsockname()[1]
+        )
+        port_patch.start()
+        self.addCleanup(port_patch.stop)
         self.http_server = await serve(
             self.app.websocket_handler, "127.0.0.1", 0,
             process_request=self.app.process_request,
@@ -68,11 +81,11 @@ class TerminalSpeechTest(unittest.IsolatedAsyncioTestCase):
             self.requests.append((lines, body))
             if self.voice_delay:
                 await asyncio.sleep(self.voice_delay)
-            writer.write(
+            writer.write(self.voice_response if self.voice_response is not None else (
                 f"HTTP/1.1 {self.voice_status} Result\r\nContent-Type: {self.voice_type}\r\n"
                 f"Content-Length: {len(self.voice_body)}\r\n\r\n".encode("ascii")
                 + self.voice_body
-            )
+            ))
             await writer.drain()
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
@@ -134,16 +147,109 @@ class TerminalSpeechTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_authenticated_wav_and_inclusive_text_boundary(self):
         for text in ("hello\n  world", "x" * 2000, "\U0001f600" * 2000):
-            status, headers, body = await self.post({"text": text}, capability=await self.capability(), split=True)
+            capability = await self.capability()
+            status, headers, body = await self.post({"text": text}, capability=capability, split=True)
             self.assertEqual(status, 200)
             self.assertIn(b"Content-Type: audio/wav", headers)
             self.assertIn(b"Cache-Control: no-store", headers)
             self.assertEqual(body, self.audio)
             lines, payload = self.requests[-1]
-            self.assertEqual(lines[0], "POST /synthesize HTTP/1.1")
-            self.assertIn("Host: voice", lines)
-            self.assertFalse(any(line.startswith("Authorization:") for line in lines))
+            self.assertEqual(lines[0], "POST /v1/synthesize HTTP/1.1")
+            self.assertIn(f"Host: {server.TTS_HOST}:{server.TTS_PORT}", lines)
+            # The shared voice endpoint is authenticated, so the call carries exactly
+            # one Authorization header and it is the SERVICE token. The browser
+            # client's own capability must never be forwarded upstream.
+            authorizations = [line for line in lines if line.startswith("Authorization:")]
+            self.assertEqual(authorizations, ["Authorization: Bearer test-voice-token"])
+            self.assertNotIn(capability, "\r\n".join(lines))
             self.assertEqual(payload, {"text": text})
+
+    async def test_socket_mode_authenticated_wav_request(self):
+        socket_path = str(Path(self.temp.name) / "voice.sock")
+        async with await asyncio.start_unix_server(self.voice, path=socket_path):
+            with (
+                mock.patch("server.TTS_MODE", "socket"),
+                mock.patch("server.TTS_SOCKET", socket_path),
+            ):
+                self.assertEqual(
+                    await server.synthesize_terminal_speech("hello\n  world"), self.audio,
+                )
+                capability = await self.capability()
+                status, headers, body = await self.post(
+                    {"text": "hello\n  world"}, capability=capability,
+                )
+        self.assertEqual(status, 200)
+        self.assertIn(b"Content-Type: audio/wav", headers)
+        self.assertEqual(body, self.audio)
+        lines, payload = self.requests[-1]
+        self.assertEqual(lines[0], "POST /v1/synthesize HTTP/1.1")
+        self.assertIn("Host: localhost", lines)
+        self.assertIn("Content-Type: application/json", lines)
+        self.assertIn("Connection: close", lines)
+        self.assertEqual(
+            [line for line in lines if line.startswith("Authorization:")],
+            ["Authorization: Bearer test-voice-token"],
+        )
+        self.assertNotIn(capability, "\r\n".join(lines))
+        self.assertEqual(payload, {"text": "hello\n  world"})
+
+    async def test_both_transports_reject_invalid_upstream_responses(self):
+        socket_path = str(Path(self.temp.name) / "voice.sock")
+        length = f"Content-Length: {len(self.audio)}\r\n".encode("ascii")
+        cases = (
+            (b"HTTP/1.1 503 Error", length, self.audio),
+            (b"HTTP/1.0 200 OK", length, self.audio),
+            (b"HTTP/1.1 200 OK", b"", self.audio),
+            (b"HTTP/1.1 200 OK", length * 2, self.audio),
+            (b"HTTP/1.1 200 OK", b"Content-Length: wat\r\n", self.audio),
+            (b"HTTP/1.1 200 OK", b"Content-Length: 43\r\n", self.audio),
+            (b"HTTP/1.1 200 OK", b"Content-Length: 33554433\r\n", self.audio),
+            (b"HTTP/1.1 200 OK", length + b"Transfer-Encoding: chunked\r\n", self.audio),
+            (b"HTTP/1.1 200 OK", length, b"not a WAV" * 16),
+            (b"HTTP/1.1 200 OK", length, self.audio[:44]),
+        )
+        async with await asyncio.start_unix_server(self.voice, path=socket_path):
+            for mode in ("tcp", "socket"):
+                with (
+                    mock.patch("server.TTS_MODE", mode),
+                    mock.patch("server.TTS_SOCKET", socket_path),
+                ):
+                    for index, (status_line, framing, audio) in enumerate(cases):
+                        with self.subTest(mode=mode, case=index):
+                            self.voice_response = (
+                                status_line + b"\r\nContent-Type: audio/wav\r\n"
+                                + framing + b"\r\n" + audio
+                            )
+                            status, _, body = await self.post(
+                                {"text": "hello"}, capability=await self.capability(),
+                            )
+                            self.assertEqual(status, 503)
+                            self.assertEqual(json.loads(body), {"error": "Speech service unavailable."})
+                    self.voice_response = None
+                    self.voice_type = "text/plain"
+                    status, _, body = await self.post(
+                        {"text": "hello"}, capability=await self.capability(),
+                    )
+                    self.assertEqual(status, 503)
+                    self.assertEqual(json.loads(body), {"error": "Speech service unavailable."})
+
+    async def test_socket_mode_deadline_and_missing_socket_are_generic_503(self):
+        socket_path = str(Path(self.temp.name) / "voice.sock")
+        with (
+            mock.patch("server.TTS_MODE", "socket"),
+            mock.patch("server.TTS_SOCKET", socket_path),
+        ):
+            status, _, body = await self.post({"text": "hello"}, capability=await self.capability())
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(body), {"error": "Speech service unavailable."})
+            self.assertNotIn(socket_path.encode(), body)
+            async with await asyncio.start_unix_server(self.voice, path=socket_path):
+                self.voice_delay = 0.1
+                with mock.patch("server.TTS_TIMEOUT_SECONDS", 0.02):
+                    status, _, body = await self.post({"text": "hello"}, capability=await self.capability())
+                self.assertEqual(status, 503)
+                self.assertEqual(json.loads(body), {"error": "Speech service unavailable."})
+                await asyncio.sleep(0.11)
 
     async def test_empty_type_malformed_and_oversized_text_rejected_before_proxy(self):
         for payload in ({}, {"text": ""}, {"text": " \n\t"}, {"text": None},
@@ -166,16 +272,17 @@ class TerminalSpeechTest(unittest.IsolatedAsyncioTestCase):
             response = await self.post({"text": "hello"}, capability=await self.capability())
             self.assertEqual(response[0], 503)
             self.assertEqual(json.loads(response[2]), {"error": "Speech service unavailable."})
-        missing = str(Path(self.temp.name) / "missing.sock")
-        refused = str(Path(self.temp.name) / "refused.sock")
-        with socket.socket(socket.AF_UNIX) as sock:
-            sock.bind(refused)
-        for path in (missing, refused):
-            with mock.patch("server.TTS_SOCKET", path):
-                status, _, body = await self.post({"text": "hello"}, capability=await self.capability())
-            self.assertEqual(status, 503)
-            self.assertEqual(json.loads(body), {"error": "Speech service unavailable."})
-            self.assertNotIn(path.encode(), body)
+        # An unreachable endpoint must also be a generic 503 that never names the host
+        # or port. Binding then closing yields a port nothing listens on.
+        with socket.socket(socket.AF_INET) as sock:
+            sock.bind(("127.0.0.1", 0))
+            closed_port = sock.getsockname()[1]
+        with mock.patch("server.TTS_PORT", closed_port):
+            status, _, body = await self.post({"text": "hello"}, capability=await self.capability())
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body), {"error": "Speech service unavailable."})
+        self.assertNotIn(str(closed_port).encode(), body)
+        self.assertNotIn(b"127.0.0.1", body)
 
     async def test_upstream_deadline_returns_json_503(self):
         self.assertEqual(server.TTS_TIMEOUT_SECONDS, 10)
