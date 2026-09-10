@@ -1609,15 +1609,12 @@
   }
 
   function terminalSelectionClientRows(buffer, selection) {
-    if (buffer.type !== "alternate") {
-      return undefined;
-    }
     const rows = [];
     for (let y = selection.start.y; y <= selection.end.y; y += 1) {
-      if (y < 0 || y >= term.rows) {
+      if (y < 0 || y >= buffer.baseY + term.rows) {
         return null;
       }
-      const line = buffer.getLine(buffer.viewportY + y);
+      const line = buffer.getLine(y);
       if (!line) {
         return null;
       }
@@ -1645,6 +1642,7 @@
         y,
         text: line.translateToString(false, 0, term.cols),
         styles,
+        isWrapped: line.isWrapped === true,
       });
     }
     return rows;
@@ -1658,7 +1656,7 @@
     }
     const buffer = term.buffer.active;
     const clientRows = terminalSelectionClientRows(buffer, selection);
-    if (buffer.type === "alternate" && !clientRows) {
+    if (!clientRows) {
       return null;
     }
     return {
@@ -1813,7 +1811,7 @@
       selectionPromise = Promise.resolve(requestAuthoritativeSelection());
     } catch (_error) {
       showToast("Terminal changed; select again.");
-      return;
+      return false;
     }
     const clipboardWritePromise = beginAuthoritativeClipboardWrite(selectionPromise);
     let result;
@@ -1821,11 +1819,11 @@
       result = await selectionPromise;
     } catch (_error) {
       showToast("Terminal changed; select again.");
-      return;
+      return false;
     }
     if (result.error) {
       showToast(result.error);
-      return;
+      return false;
     }
     const text = normalizeTerminalCopyText(result.text);
     const successMessage =
@@ -1836,22 +1834,21 @@
       try {
         await clipboardWritePromise;
         showToast(successMessage);
-        return;
+        return true;
       } catch (_error) {
         // A delayed write may still work in browsers without promised ClipboardItem support.
       }
     }
     if (await copyClipboardTextWithFallback(text)) {
       showToast(successMessage);
-      return;
+      return true;
     }
     showToast("Clipboard copy is blocked by this browser.");
+    return false;
   }
 
   async function copyTerminalSelectionAndDismiss() {
-    try {
-      await copyTerminalSelection();
-    } finally {
+    if (await copyTerminalSelection()) {
       dismissTerminalSelection();
     }
   }
@@ -1889,12 +1886,16 @@
     const result = await requestAuthoritativeSelection();
     if (result.error) {
       showToast(result.error);
-      return;
+      return false;
     }
     const target = recentOtherSession();
     if (!target) {
       showToast("No other tab to send to.");
-      return;
+      return false;
+    }
+    if (isBtopSession(target)) {
+      showToast("This tab doesn't accept pasted text.");
+      return false;
     }
     pendingPasteAfterSwitch = {
       session: target,
@@ -1903,12 +1904,11 @@
       ready: false,
     };
     switchSession(target);
+    return true;
   }
 
   async function pasteSelectionToRecentTabAndDismiss() {
-    try {
-      await pasteSelectionToRecentTab();
-    } finally {
+    if (await pasteSelectionToRecentTab()) {
       dismissTerminalSelection();
     }
   }
@@ -3048,19 +3048,30 @@
     if (!line) {
       return false;
     }
-    const text = line.translateToString(true); // trims trailing blanks
     if (col < 0) {
       col = 0;
     }
-    if (col >= text.length || /\s/.test(text[col])) {
+    if (col >= term.cols) {
+      return false;
+    }
+    // A wide glyph's continuation cell belongs to its leading cell. Cell
+    // strings also contain combining marks, which do not consume columns.
+    while (col > 0 && line.getCell(col)?.getWidth() === 0) {
+      col -= 1;
+    }
+    const isWordCell = (column) => {
+      const entry = line.getCell(column);
+      return Boolean(entry && (entry.getWidth() === 0 || (entry.getChars() && !/\s/.test(entry.getChars()))));
+    };
+    if (!isWordCell(col)) {
       return false; // tapped past the content or on whitespace → no word
     }
     let start = col;
     let end = col;
-    while (start > 0 && !/\s/.test(text[start - 1])) {
+    while (start > 0 && isWordCell(start - 1)) {
       start -= 1;
     }
-    while (end < text.length - 1 && !/\s/.test(text[end + 1])) {
+    while (end < term.cols - 1 && isWordCell(end + 1)) {
       end += 1;
     }
     term.select(start, absRow, end - start + 1);
@@ -10914,18 +10925,6 @@
   document.addEventListener("pointerdown", reportForcedActivity, { capture: true, passive: true });
   document.addEventListener("touchstart", reportForcedActivity, { capture: true, passive: true });
 
-  let lastTouchEndAt = 0;
-  document.addEventListener(
-    "touchend",
-    (event) => {
-      const now = Date.now();
-      if (now - lastTouchEndAt < 300) {
-        event.preventDefault();
-      }
-      lastTouchEndAt = now;
-    },
-    { passive: false },
-  );
   document.addEventListener(
     "gesturestart",
     (event) => {

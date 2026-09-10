@@ -261,7 +261,7 @@ class TouchSelectionUITest(unittest.TestCase):
     def test_activity_sources_exclude_pointer_moves_and_generated_terminal_replies(self):
         pointer_section = app_section(
             'document.addEventListener("pointerdown", reportForcedActivity',
-            "  let lastTouchEndAt = 0;",
+            '    "gesturestart",',
         )
         self.assertIn('document.addEventListener("pointerdown", reportForcedActivity', pointer_section)
         self.assertIn('document.addEventListener("touchstart", reportForcedActivity', pointer_section)

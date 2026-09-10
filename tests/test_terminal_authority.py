@@ -131,31 +131,23 @@ class QueuedConnection:
 
 
 class AuthoritativeSelectionTest(unittest.TestCase):
-    def test_wrapped_http_urls_join_only_when_every_line_is_a_continuation(self):
+    def test_url_looking_authored_lines_are_preserved(self):
         cases = (
-            (
-                "https://console.example.test/oauth/authorize?client_id=mobile\n"
-                "  &code=abc123&state=long-token_-.~\n"
-                "  &redirect_uri=https%3A%2F%2Flocalhost%2Fcallback",
-                "https://console.example.test/oauth/authorize?client_id=mobile"
-                "&code=abc123&state=long-token_-.~"
-                "&redirect_uri=https%3A%2F%2Flocalhost%2Fcallback",
-            ),
-            (
-                "  https://example.test/login?code=abc&state=xyz  \n"
-                "  /continue?token=a-b_c.123  \n"
-                "  #complete  ",
-                "https://example.test/login?code=abc&state=xyz"
-                "/continue?token=a-b_c.123#complete",
-            ),
+            "https://console.example.test/oauth/authorize?client_id=mobile\n"
+            "  &code=abc123&state=long-token_-.~\n"
+            "  &redirect_uri=https%3A%2F%2Flocalhost%2Fcallback",
+            "  https://example.test/login?code=abc&state=xyz  \n"
+            "  /continue?token=a-b_c.123  \n"
+            "  #complete  ",
         )
-        for value, expected in cases:
+        for value in cases:
             with self.subTest(value=value):
-                self.assertEqual(unwrap_selected_url(value), expected)
+                self.assertEqual(unwrap_selected_url(value), value)
 
     def test_nonmatching_url_selections_are_preserved_byte_for_byte(self):
         cases = (
             "https://example.test/single",
+            "https://example.com/docs\nNEXT",
             "https://one.example.test/path\nhttps://two.example.test/path",
             "https://example.test/path\n  continuation contains spaces  ",
             "https://example.test/path\n\ncontinuation",
@@ -2637,7 +2629,7 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(result.error)
             self.assertEqual(result.authority, expected_authority)
 
-    async def test_normal_terminal_fallback_unwraps_urls_but_provider_exact_does_not(self):
+    async def test_normal_terminal_fallback_and_provider_preserve_authored_url_breaks(self):
         connection = RecordingConnection()
         bridge = TmuxBridge(
             connection,
@@ -2693,7 +2685,7 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.text, exact_text)
         self.assertEqual(result.authority, "provider-exact")
 
-        expected = "".join(pieces)
+        expected = "\n".join(pieces)
         cases = (
             ("terminal-raw", "terminal-raw"),
             (None, None),
@@ -3562,6 +3554,22 @@ class ForensicsPersistenceTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
+    def anchor(self, payload, pane):
+        start = payload["selection"]["start"]["y"]
+        end = payload["selection"]["end"]["y"]
+        signatures = server._selection_row_signatures(pane)
+        payload["clientRows"] = [
+            {"y": y, "text": "".join(
+                " " * (end - start) if token == "\t" else token
+                for token, start, end in server._display_tokens(
+                    signatures[y].plain, pane.tab_stops, pane.cols,
+                )[0]
+             ),
+             "styles": [[0, pane.cols, "plain"]],
+             "isWrapped": signatures[y].continues_from_previous}
+            for y in range(start, end + 1)
+        ]
+
     def make_bridge(self, pane, *, offset=0, revision=None):
         connection = RecordingConnection()
         bridge = TmuxBridge(connection, "session", "/bin/sh", "/")
@@ -3593,6 +3601,72 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
             },
         }
         return bridge, payload
+
+    async def test_fresh_browser_anchor_accepts_output_after_seed_first_attempt(self):
+        seed = snapshot(cols=8, authored_lines=["old", ""], rows=2)
+        current = snapshot(cols=8, authored_lines=["FRESH", ""], rows=2)
+        bridge, payload = self.make_bridge(seed, offset=5)
+        payload["selection"]["end"]["x"] = 5
+        self.anchor(payload, current)
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=current),
+            mock.patch("server.provider_selection", return_value=mock.Mock(owned=False, authority=None)),
+        ):
+            self.assertEqual(await bridge.authoritative_selection(payload), ("FRESH", None))
+
+    async def test_browser_anchor_keeps_unchanged_rows_after_nonprinting_output(self):
+        pane = snapshot(cols=8, authored_lines=["KEEP", ""], rows=2)
+        bridge, payload = self.make_bridge(pane, offset=5)
+        self.anchor(payload, pane)
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=pane),
+            mock.patch("server.provider_selection", return_value=mock.Mock(owned=False, authority=None)),
+        ):
+            self.assertEqual(await bridge.authoritative_selection(payload), ("KEEP", None))
+
+    async def test_fresh_browser_anchor_accepts_history_beyond_old_snapshot(self):
+        seed = snapshot(cols=8, authored_lines=["old", ""], rows=2)
+        current = snapshot(cols=8, authored_lines=[f"ROW-{i}" for i in range(100)], rows=2)
+        bridge, payload = self.make_bridge(seed, offset=500)
+        payload["baseY"] = current.history
+        payload["selection"] = {"start": {"x": 0, "y": 99}, "end": {"x": 6, "y": 99}}
+        self.anchor(payload, current)
+        with (
+            mock.patch("server.capture_pane_snapshot", return_value=current),
+            mock.patch("server.provider_selection", return_value=mock.Mock(owned=False, authority=None)),
+        ):
+            self.assertEqual(await bridge.authoritative_selection(payload), ("ROW-99", None))
+
+    async def test_browser_anchor_rejects_text_or_wrap_changes_before_capture(self):
+        seed = snapshot(cols=4, authored_lines=["old", ""], rows=2)
+        selected = snapshot(cols=4, authored_lines=["abcd", "efgh"], rows=2)
+        for current in (
+            snapshot(cols=4, authored_lines=["abcd", "oops"], rows=2),
+            replace(selected, authored_lines=["abcdefgh"]),
+        ):
+            bridge, payload = self.make_bridge(seed, offset=5)
+            payload["selection"]["end"] = {"x": 4, "y": 1}
+            self.anchor(payload, selected)
+            with (
+                mock.patch("server.capture_pane_snapshot", return_value=current),
+                mock.patch("server.provider_selection") as provider,
+            ):
+                self.assertEqual(await bridge.authoritative_selection(payload), (None, "Terminal changed; select again."))
+                provider.assert_not_called()
+
+    async def test_browser_anchor_rejects_selected_authored_changes_during_copy(self):
+        seed = snapshot(cols=8, authored_lines=["old", ""], rows=2)
+        selected = snapshot(cols=8, authored_lines=["a\tb", ""], rows=2, tab_stops=(4,))
+        changed = replace(selected, tab_stops=(3,))
+        bridge, payload = self.make_bridge(seed, offset=5)
+        payload["selection"]["end"]["x"] = 5
+        self.anchor(payload, selected)
+        with (
+            mock.patch("server.capture_pane_snapshot", side_effect=(selected, changed)),
+            mock.patch("server.provider_selection", return_value=mock.Mock(owned=False, authority=None)) as provider,
+        ):
+            self.assertEqual(await bridge.authoritative_selection(payload), (None, "Terminal changed; select again."))
+            provider.assert_called_once()
 
     async def test_old_revision_with_intact_identity_succeeds_without_rejection(self):
         pane = snapshot(
@@ -3888,7 +3962,7 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.error)
         self.assertEqual(select.call_args.kwargs["client_rows"][0][1], "😀é界")
 
-    async def test_alternate_terminal_raw_fallback_unwraps_client_url_rows(self):
+    async def test_alternate_terminal_raw_fallback_preserves_client_url_rows(self):
         pane = replace(
             snapshot(
                 cols=64,
@@ -3932,9 +4006,7 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             result.text,
-            "https://console.example.test/oauth?code=abc&"
-            "state=long-token_-.~&redirect_uri="
-            "https%3A%2F%2Flocalhost%2Fcallback#done",
+            "\n".join(pieces),
         )
         self.assertEqual(result.authority, "terminal-raw")
         self.assertIsNone(result.error)
@@ -4085,6 +4157,25 @@ class PrivateTmuxSelectionStabilityIntegrationTest(unittest.IsolatedAsyncioTestC
                 "end": {"x": 8, "y": self.keep_index},
             },
         }
+
+    async def test_fresh_output_and_new_history_copy_without_reseed_or_retry(self):
+        for command, expected in (
+            ("printf 'FRESH OUTPUT\\n'\r", "FRESH OUTPUT"),
+            ("i=1; while [ $i -le 100 ]; do printf 'NEW-ROW-%s\\n' \"$i\"; i=$((i+1)); done\r", "NEW-ROW-100"),
+        ):
+            await self.bridge.write(command)
+            await self.bridge.quiet(0.08)
+            pane = capture_pane_snapshot(self.session_name, self.bridge.pane_id, server.MAX_HISTORY_SEED_LINES)
+            selected_y = next(i for i, row in enumerate(pane.plain_physical_rows) if row.startswith(expected))
+            payload = self.payload(pane)
+            payload["revision"] = self.bridge.offset
+            payload["selection"] = {"start": {"x": 0, "y": selected_y},
+                                    "end": {"x": len(expected), "y": selected_y}}
+            payload["clientRows"] = [{"y": selected_y,
+                "text": pane.plain_physical_rows[selected_y],
+                "styles": [[0, pane.cols, "plain"]], "isWrapped": False}]
+            with mock.patch("server.provider_selection", return_value=mock.Mock(owned=False, authority=None)):
+                self.assertEqual(await self.bridge.authoritative_selection(payload), (expected, None))
 
     async def test_streaming_outside_selection_keeps_old_revision_and_provider_coordinates(self):
         for index in range(3):
@@ -4715,7 +4806,8 @@ class ClientProtocolSourceTest(unittest.TestCase):
         client_rows = self.source[
             self.source.index("  function terminalCellStyleToken(cell)") : selection_start
         ]
-        self.assertIn('buffer.type !== "alternate"', client_rows)
+        self.assertIn("buffer.getLine(y)", client_rows)
+        self.assertIn("isWrapped: line.isWrapped === true", client_rows)
         self.assertIn("line.translateToString(false, 0, term.cols)", client_rows)
         self.assertIn("styles.push([runStart, column, runToken])", client_rows)
         self.assertIn("fg-indexed-", client_rows)

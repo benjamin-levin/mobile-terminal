@@ -4,7 +4,7 @@ Claude and Codex add gutters and application-level wrapping before text reaches 
 
 - the provider transcript supplies authored bytes and semantic hard breaks;
 - a fenced tmux snapshot supplies pane identity, geometry, ownership, and binding context;
-- for alternate-screen panes, the authenticated browser supplies the bounded rendered rows on which the selection was made, because a repainting alternate screen has no retained tmux row identity.
+- the authenticated browser supplies bounded selected rows and wrap flags. Normal-buffer selections verify these against tracked tmux rows and a second snapshot; alternate-screen panes use the browser rows because a repainting alternate screen has no retained tmux row identity.
 
 Terminal or client-rendered whitespace verifies transcript-derived candidates. It never invents, trims, dedents, or normalizes provider-exact source content.
 

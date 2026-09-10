@@ -1721,21 +1721,9 @@ def _extract_client_selection_rows(
 
 
 def unwrap_selected_url(text: str) -> str:
-    lines = text.split("\n")
-    if len(lines) < 2:
-        return text
-    stripped = [line.strip() for line in lines]
-    if re.fullmatch(r"https?://\S+", stripped[0]) is None:
-        return text
-    if any(
-        not line or re.search(r"\s", line) or re.match(r"https?://", line)
-        for line in stripped[1:]
-    ):
-        return text
-    joined = "".join(stripped)
-    if re.fullmatch(r"https?://\S+", joined) is None:
-        return text
-    return joined
+    # Wraps are resolved by tmux/source provenance before reaching this point.
+    # A remaining newline is authored; URL syntax cannot establish continuation.
+    return text
 
 
 def extract_authoritative_selection(
@@ -4055,6 +4043,18 @@ class TmuxBridge:
         client_selection_rows: tuple[
             tuple[int, str, tuple[tuple[int, int, str], ...]], ...
         ] = ()
+        normal_client_wraps: tuple[bool, ...] = ()
+        if buffer_type == "normal" and "clientRows" in payload:
+            try:
+                client_selection_rows = _validated_client_selection_rows(
+                    payload["clientRows"], client_cols, base_y + client_rows,
+                    start_y, end_y,
+                )
+                if any(type(row.get("isWrapped")) is not bool for row in payload["clientRows"]):
+                    raise ValueError("missing client wrap provenance")
+                normal_client_wraps = tuple(row["isWrapped"] for row in payload["clientRows"])
+            except ValueError:
+                return reject("client-rows-invalid")
         if buffer_type == "alternate":
             request_wire_bytes = payload.get("_selectionRequestWireBytes")
             if (
@@ -4232,7 +4232,28 @@ class TmuxBridge:
                     entry_stable_rows: tuple[
                         tuple[int, SelectionRowSignature], ...
                     ] = ()
-                    if not alternate_request and self.selection_row_identity is not None:
+
+                    def matches_client_row(signature: SelectionRowSignature, index: int) -> bool:
+                        rendered = "".join(
+                            " " * (end - start) if token == "\t" else token
+                            for token, start, end in _display_tokens(
+                                signature.plain, signature.tab_stops, client_cols,
+                            )[0]
+                        )
+                        return (
+                            client_selection_rows[index][1].rstrip(" ") == rendered.rstrip(" ")
+                            and (index == 0 or normal_client_wraps[index] == signature.continues_from_previous)
+                        )
+
+                    if self.selection_row_identity is not None:
+                        # An older observation is not the selection-time row.
+                        # Reuse it only if the browser anchor agrees; fresh or
+                        # newly appended rows are established by this snapshot.
+                        # Legacy requests still require the cached signatures.
+                        require_previous_rows = (
+                            not client_selection_rows
+                            or revision <= self.provenance_state.row_tracker.revision
+                        )
                         if (
                             self.selection_row_identity.epoch
                             != self.provenance_state.row_tracker.epoch
@@ -4254,12 +4275,22 @@ class TmuxBridge:
                         ):
                             index = identity_row - tracker.first_row
                             if not 0 <= index < len(tracker.row_signatures):
-                                return reject("selection-rows-unresolvable")
+                                if require_previous_rows:
+                                    return reject("selection-rows-unresolvable")
+                                break
                             signature = tracker.row_signatures[index]
                             if signature is None:
-                                return reject("selection-rows-unresolvable")
+                                if require_previous_rows:
+                                    return reject("selection-rows-unresolvable")
+                                break
+                            if (
+                                not require_previous_rows
+                                and not matches_client_row(signature, identity_row - entry_start_identity)
+                            ):
+                                break
                             entry_stable.append((identity_row, signature))
-                        entry_stable_rows = _scope_selection_rows(tuple(entry_stable))
+                        else:
+                            entry_stable_rows = _scope_selection_rows(tuple(entry_stable))
                     identity = self.provenance_state.row_tracker.observe(
                         snapshot,
                         snapshot_revision,
@@ -4339,6 +4370,10 @@ class TmuxBridge:
                     )
                     if entry_stable_rows and selected_rows != entry_stable_rows:
                         return reject("selected-rows-changed")
+                    if client_selection_rows:
+                        for index, (_, signature) in enumerate(selected_rows):
+                            if not matches_client_row(signature, index):
+                                return reject("selected-rows-changed")
                     resolved_start_row = _absolute_row(
                         snapshot,
                         identity,

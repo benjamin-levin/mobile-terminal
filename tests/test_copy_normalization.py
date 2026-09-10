@@ -75,7 +75,7 @@ assert.equal(normalizeTerminalCopyText("crlf\r\nlone-cr\rfinal\r\n"),
             "...(clientRows ? { clientRows } : {})",
         ):
             self.assertIn(field, APP_JS)
-        self.assertIn('buffer.type !== "alternate"', APP_JS)
+        self.assertIn("buffer.baseY + term.rows", APP_JS)
         self.assertIn("line.translateToString(false, 0, term.cols)", APP_JS)
         self.assertIn('type: "selection-request"', request)
         self.assertIn("selection: {", APP_JS)
@@ -270,6 +270,7 @@ let pendingPasteAfterSwitch = null;
   });
   global.showToast = (message) => { toasts.push(message); };
   global.recentOtherSession = () => "other";
+  global.isBtopSession = () => false;
   global.switchSession = (session) => { switched.push(session); };
 
   await copyTerminalSelection();
@@ -286,7 +287,7 @@ let pendingPasteAfterSwitch = null;
 '''
         )
 
-    def test_copy_teardown_runs_for_error_exception_and_clipboard_failure(self):
+    def test_copy_retains_selection_for_error_exception_and_clipboard_failure(self):
         self.run_node(
             [
                 "normalizeTerminalCopyText",
@@ -311,23 +312,23 @@ let pendingPasteAfterSwitch = null;
 
   global.requestAuthoritativeSelection = () => Promise.resolve({ error: "Exact selection failed." });
   await copyTerminalSelectionAndDismiss();
-  assert.equal(dismissals, 1);
+  assert.equal(dismissals, 0);
   assert.deepEqual(toasts, ["Exact selection failed."]);
 
   global.requestAuthoritativeSelection = () => Promise.resolve({ text: null });
   await assert.rejects(copyTerminalSelectionAndDismiss(), TypeError);
-  assert.equal(dismissals, 2);
+  assert.equal(dismissals, 0);
 
   navigator.clipboard.writeText = async () => { throw new Error("clipboard denied"); };
   global.requestAuthoritativeSelection = () => Promise.resolve({ text: "selected" });
   await copyTerminalSelectionAndDismiss();
-  assert.equal(dismissals, 3);
+  assert.equal(dismissals, 0);
   assert.equal(toasts.at(-1), "Clipboard copy is blocked by this browser.");
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 ''',
         )
 
-    def test_to_tab_teardown_runs_for_error_and_thrown_exception(self):
+    def test_to_tab_retains_selection_for_error_and_thrown_exception(self):
         self.run_node(
             [
                 "normalizeTerminalCopyText",
@@ -346,12 +347,12 @@ let pendingPasteAfterSwitch = null;
 
   global.requestAuthoritativeSelection = () => Promise.resolve({ error: "Selection unavailable." });
   await pasteSelectionToRecentTabAndDismiss();
-  assert.equal(dismissals, 1);
+  assert.equal(dismissals, 0);
   assert.deepEqual(toasts, ["Selection unavailable."]);
 
   global.requestAuthoritativeSelection = () => { throw new Error("selection request crashed"); };
   await assert.rejects(pasteSelectionToRecentTabAndDismiss(), /selection request crashed/);
-  assert.equal(dismissals, 2);
+  assert.equal(dismissals, 0);
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 ''',
         )
