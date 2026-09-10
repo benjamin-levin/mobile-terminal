@@ -112,6 +112,10 @@ def _pane_coordinates(pane_id: str) -> dict[str, int | bool]:
     }
 
 
+class _AmbiguousClaudeRegistry(ValueError):
+    pass
+
+
 def _claude_registry(home: Path, pane_id: str, session_id: str) -> tuple[int, int, str]:
     matches: list[tuple[int, int, str]] = []
     for path in (home / ".claude" / "sessions").glob("*.json"):
@@ -125,6 +129,68 @@ def _claude_registry(home: Path, pane_id: str, session_id: str) -> tuple[int, in
                 )
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
+    if len(matches) > 1:
+        raise _AmbiguousClaudeRegistry
+    if not matches:
+        raise ValueError
+    return matches[0]
+
+
+def _claude_process_identity(pid: int, proc_root: Path = Path("/proc")) -> bool:
+    names: set[str] = set()
+    try:
+        names.add(Path(os.readlink(proc_root / str(pid) / "exe")).name)
+    except OSError:
+        pass
+    try:
+        names.add((proc_root / str(pid) / "comm").read_text().strip())
+    except OSError:
+        pass
+    if not names:
+        raise ValueError
+    return "claude" in names
+
+
+def _claude_process_pane(pid: int, proc_root: Path = Path("/proc")) -> str:
+    raw = (proc_root / str(pid) / "environ").read_bytes()
+    panes = [item[len(b"TMUX_PANE="):] for item in raw.split(b"\0") if item.startswith(b"TMUX_PANE=")]
+    if len(panes) > 1:
+        raise ValueError
+    return panes[0].decode("utf-8") if panes else ""
+
+
+def _claude_process(
+    pane_id: str,
+    *,
+    start_pid: int | None = None,
+    proc_stat_reader: Any = None,
+    proc_identity_reader: Any = _claude_process_identity,
+    proc_pane_reader: Any = _claude_process_pane,
+) -> tuple[int, str]:
+    pid = os.getpid() if start_pid is None else start_pid
+    stat_reader = proc_stat_reader or (lambda pid: Path(f"/proc/{pid}/stat").read_text(encoding="utf-8"))
+    matches: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for _ in range(32):
+        if pid <= 1 or pid in seen:
+            raise ValueError
+        seen.add(pid)
+        value = stat_reader(pid)
+        # Keep this byte-identical to provider_authority._read_proc_start: the
+        # native registry uses post-')' field [19], not a normalized integer.
+        close = value.rfind(")")
+        fields = value[close + 2 :].split() if close >= 0 else []
+        if len(fields) <= 19:
+            raise ValueError
+        proc_start = fields[19]
+        parent = int(fields[1])
+        if proc_identity_reader(pid) and proc_pane_reader(pid) == pane_id:
+            matches.append((pid, proc_start))
+        if parent <= 1:
+            break
+        pid = parent
+    else:
+        raise ValueError
     if len(matches) != 1:
         raise ValueError
     return matches[0]
@@ -170,6 +236,7 @@ def update_binding(
     pane_coordinates: Any = _pane_coordinates,
     state_root: Path | None = None,
     claude_registry: Any = None,
+    claude_process: Any = None,
 ) -> None:
     pane_id = os.environ.get("TMUX_PANE", "")
     if not PANE_RE.fullmatch(pane_id):
@@ -192,9 +259,21 @@ def update_binding(
     transcript = _safe_transcript(provider, Path(transcript_value), home)
     if provider == "claude":
         registry_reader = claude_registry or _claude_registry
-        pid, proc_start, registry_version = registry_reader(home, pane_id, session_id)
-        if registry_version:
-            version = registry_version
+        try:
+            pid, proc_start, registry_version = registry_reader(home, pane_id, session_id)
+        except _AmbiguousClaudeRegistry:
+            raise
+        except Exception:
+            process_reader = claude_process or _claude_process
+            pid, proc_start = process_reader(pane_id)
+            payload_version = event.get("version")
+            if isinstance(payload_version, str) and payload_version:
+                version = payload_version
+            if not isinstance(version, str) or not version:
+                raise ValueError
+        else:
+            if registry_version:
+                version = registry_version
         coordinates = None
     else:
         pid, proc_start = _provider_process(provider, pane_id)

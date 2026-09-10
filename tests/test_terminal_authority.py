@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 import provider_authority
+import provider_binding_hook
 import server
 from tests.tmux_harness import TmuxHarness
 
@@ -517,6 +518,236 @@ class ClaudePaneCacheFallbackTest(unittest.TestCase):
         with mock.patch.object(Path, "glob", side_effect=OSError):
             with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "registry-unavailable"):
                 self.bind()
+
+
+class ClaudeHookAncestorFallbackTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name)
+        self.proc = self.home / "proc"
+        self.registry = self.home / ".claude" / "sessions"
+        self.registry.mkdir(parents=True)
+        self.session_id = "12345678-1234-4123-8123-123456789abc"
+        self.path = self.home / ".claude" / "projects" / "project" / f"{self.session_id}.jsonl"
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("{}\n", encoding="utf-8")
+        self.cache_path = self.home / ".mobile-terminal" / "provider-bindings" / "9.json"
+        self.event = {
+            "session_id": self.session_id,
+            "transcript_path": str(self.path),
+            "hook_event_name": "SessionStart",
+            "event_time_ns": 100,
+            "version": "2.1.261",
+        }
+        self.process(100, 99, "555", "/usr/bin/python3", "python3")
+        self.process(99, 98, "500", "/bin/sh", "sh")
+        self.process(98, 1, "00444", "/opt/claude", "claude")
+
+    def process(self, pid, parent, start, executable, command, pane=b"TMUX_PANE=%9\0"):
+        path = self.proc / str(pid)
+        path.mkdir(parents=True, exist_ok=True)
+        fields = ["S", str(parent), *("0" for _ in range(17)), start, "999"]
+        (path / "stat").write_text(f"{pid} ({command}) {' '.join(fields)}\n", encoding="utf-8")
+        (path / "environ").write_bytes(pane)
+        (path / "comm").write_text(f"{command}\n", encoding="utf-8")
+        (path / "cmdline").write_bytes(f"{executable}\0/path/containing/claude\0".encode())
+        link = path / "exe"
+        if link.is_symlink():
+            link.unlink()
+        link.symlink_to(executable)
+
+    def ancestor(self, pane):
+        return provider_binding_hook._claude_process(
+            pane,
+            proc_stat_reader=lambda pid: (self.proc / str(pid) / "stat").read_text(encoding="utf-8"),
+            proc_identity_reader=lambda pid: provider_binding_hook._claude_process_identity(pid, self.proc),
+            proc_pane_reader=lambda pid: provider_binding_hook._claude_process_pane(pid, self.proc),
+        )
+
+    def update(self, event=None, **options):
+        with (
+            mock.patch.dict(os.environ, {"TMUX_PANE": "%9"}, clear=False),
+            mock.patch("provider_binding_hook.os.getpid", return_value=100),
+        ):
+            provider_binding_hook.update_binding(
+                "claude", self.event if event is None else event,
+                options.pop("version", "2.1.241"), self.home,
+                claude_process=options.pop("claude_process", self.ancestor), **options,
+            )
+
+    def bind(self):
+        return provider_authority.bind_claude_pane(
+            "%9", sessions_root=self.registry, transcript_root=self.path.parent.parent,
+            bindings_root=self.cache_path.parent,
+            proc_start_reader=lambda pid: "00444" if pid == 98 else "wrong",
+            proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"} if pid == 98 else {},
+        )
+
+    def assert_no_write(self):
+        with self.assertRaises((OSError, ValueError)):
+            self.update()
+        self.assertFalse(self.cache_path.exists())
+        self.assertFalse(self.cache_path.parent.exists())
+        self.assertEqual(list(self.registry.iterdir()), [])
+
+    def test_ancestor_hook_cache_binds_without_native_registry(self):
+        self.update()
+        cached = json.loads(self.cache_path.read_text())
+        self.assertEqual((cached["pid"], cached["procStart"], cached["version"]), (98, "00444", "2.1.261"))
+        binding = self.bind()
+        self.assertEqual((binding.pid, binding.proc_start, binding.transcript_path), (98, "00444", self.path))
+        self.assertEqual(list(self.registry.iterdir()), [])
+        self.assertEqual(self.cache_path.stat().st_mode & 0o777, 0o600)
+
+    def test_ancestor_raw_start_matches_authority_parser_byte_for_byte(self):
+        self.process(99, 98, "500", "/bin/sh", "wrapper (with) spaces")
+        self.update()
+        with mock.patch.object(Path, "read_text", return_value=(self.proc / "98" / "stat").read_text()):
+            start = provider_authority._read_proc_start(98)
+        self.assertEqual(start, "00444")
+        self.assertEqual(json.loads(self.cache_path.read_text())["procStart"], start)
+
+    def test_registry_failures_use_injected_ancestor_reader(self):
+        for error in (ValueError, OSError, AttributeError):
+            with self.subTest(error=error):
+                reader = mock.Mock(return_value=(98, "00444"))
+                self.update(claude_registry=mock.Mock(side_effect=error), claude_process=reader)
+                reader.assert_called_once_with("%9")
+                self.assertEqual(self.bind().pid, 98)
+                self.cache_path.unlink()
+        reader = mock.Mock(return_value=(98, "00444"))
+        self.update(claude_registry=mock.Mock(return_value=None), claude_process=reader)
+        reader.assert_called_once_with("%9")
+        self.assertEqual(self.bind().pid, 98)
+        self.assertEqual(list(self.registry.iterdir()), [])
+
+    def test_fallback_version_prefers_nonempty_payload_otherwise_default(self):
+        for payload, expected in (("2.1.261", "2.1.261"), ("", "2.1.241"),
+                                  (None, "2.1.241"), (7, "2.1.241")):
+            with self.subTest(payload=payload):
+                self.update(dict(self.event, version=payload))
+                self.assertEqual(json.loads(self.cache_path.read_text())["version"], expected)
+                self.cache_path.unlink()
+        event = dict(self.event)
+        del event["version"]
+        self.update(event)
+        self.assertEqual(json.loads(self.cache_path.read_text())["version"], "2.1.241")
+
+    def test_fallback_without_any_valid_version_writes_nothing(self):
+        for payload, version in (("", ""), (None, None), (7, 7)):
+            with self.subTest(payload=payload, version=version):
+                with self.assertRaises(ValueError):
+                    self.update(dict(self.event, version=payload), version=version)
+                self.assertFalse(self.cache_path.parent.exists())
+                self.assertEqual(list(self.registry.iterdir()), [])
+
+    def test_native_registry_success_keeps_exact_cache_and_never_walks_ancestors(self):
+        registry_path = self.registry / "321.json"
+        for registry_version, expected in (("2.1.261", "2.1.261"), ("", "2.1.241")):
+            with self.subTest(registry_version=registry_version):
+                raw = json.dumps({
+                    "pid": 321, "procStart": "00444", "sessionId": self.session_id,
+                    "tmux": "name:@2.%9", "version": registry_version,
+                })
+                registry_path.write_text(raw, encoding="utf-8")
+                reader = mock.Mock(side_effect=AssertionError("native match must not walk ancestors"))
+                self.update(dict(self.event, version="payload-ignored"), claude_process=reader)
+                reader.assert_not_called()
+                expected_cache = {
+                    "schema": 1, "provider": "claude", "paneId": "%9",
+                    "sessionId": self.session_id, "transcriptPath": str(self.path),
+                    "pid": 321, "procStart": "444", "generation": 1,
+                    "eventTimeNs": 100, "active": True, "terminalEvent": "",
+                    "version": expected,
+                }
+                self.assertEqual(self.cache_path.read_text(), json.dumps(
+                    expected_cache, separators=(",", ":"), sort_keys=True,
+                ) + "\n")
+                self.assertEqual(registry_path.read_text(), raw)
+                self.cache_path.unlink()
+
+    def test_native_registry_ambiguity_remains_no_write(self):
+        original = {}
+        for pid in (321, 322):
+            path = self.registry / f"{pid}.json"
+            raw = json.dumps({"pid": pid, "procStart": "444", "sessionId": self.session_id,
+                              "tmux": "name:@2.%9", "version": "2.1.241"})
+            path.write_text(raw, encoding="utf-8")
+            original[path] = raw
+        reader = mock.Mock(side_effect=AssertionError("ambiguous native registry must not fall back"))
+        with self.assertRaises(ValueError):
+            self.update(claude_process=reader)
+        reader.assert_not_called()
+        self.assertFalse(self.cache_path.parent.exists())
+        self.assertEqual({path: path.read_text() for path in self.registry.iterdir()}, original)
+
+    def test_ambiguous_claude_ancestors_write_nothing(self):
+        self.process(99, 98, "500", "/opt/claude", "claude")
+        self.assert_no_write()
+
+    def test_shell_python_and_cmdline_claude_substrings_are_not_identity(self):
+        self.process(98, 1, "00444", "/usr/bin/node", "node")
+        self.assert_no_write()
+
+    def test_claude_identity_accepts_exact_executable_or_comm_only(self):
+        for executable, command in (("/opt/claude", "renamed"), ("/opt/versions/2.1.261", "claude")):
+            with self.subTest(executable=executable, command=command):
+                self.process(98, 1, "00444", executable, command)
+                self.update()
+                self.assertEqual(self.bind().pid, 98)
+                self.cache_path.unlink()
+        self.process(98, 1, "00444", "/opt/claude-wrapper", "claude-helper")
+        with self.assertRaises(ValueError):
+            self.update()
+        self.assertFalse(self.cache_path.exists())
+
+    def test_missing_wrong_duplicate_and_undecodable_pane_write_nothing(self):
+        for pane in (b"", b"TMUX_PANE=%8\0", b"TMUX_PANE=%9\0TMUX_PANE=%9\0",
+                     b"TMUX_PANE=%8\0TMUX_PANE=%9\0", b"TMUX_PANE=\xff\0"):
+            with self.subTest(pane=pane):
+                (self.proc / "98" / "environ").write_bytes(pane)
+                self.assert_no_write()
+
+    def test_unreadable_candidate_pane_or_identity_writes_nothing(self):
+        environment = self.proc / "98" / "environ"
+        environment.unlink()
+        self.assert_no_write()
+        environment.write_bytes(b"TMUX_PANE=%9\0")
+        (self.proc / "98" / "comm").unlink()
+        (self.proc / "98" / "exe").unlink()
+        self.assert_no_write()
+
+    def test_incomplete_or_malformed_ancestry_writes_nothing(self):
+        self.process(98, 97, "00444", "/opt/claude", "claude")
+        self.assert_no_write()
+        self.process(97, 1, "400", "/bin/sh", "sh")
+        stat = self.proc / "97" / "stat"
+        for value in ("97 missing delimiters", "97 (sh) S 1", "97 (sh) S invalid " + "0 " * 18):
+            with self.subTest(value=value):
+                stat.write_text(value, encoding="utf-8")
+                self.assert_no_write()
+
+    def test_cyclic_and_overlong_ancestry_write_nothing(self):
+        self.process(98, 99, "00444", "/opt/claude", "claude")
+        self.assert_no_write()
+        self.process(98, 98, "00444", "/opt/claude", "claude")
+        self.assert_no_write()
+        self.process(98, 97, "00444", "/opt/claude", "claude")
+        for pid in range(97, 65, -1):
+            self.process(pid, pid - 1, "400", "/bin/sh", "sh")
+        self.assert_no_write()
+
+    def test_fallback_session_end_closes_cache_and_blocks_reactivation(self):
+        self.update()
+        self.update(dict(self.event, hook_event_name="SessionEnd", event_time_ns=101))
+        closed = self.cache_path.read_bytes()
+        self.assertFalse(json.loads(closed)["active"])
+        with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, "claude-binding-unavailable"):
+            self.bind()
+        self.update(dict(self.event, event_time_ns=102))
+        self.assertEqual(self.cache_path.read_bytes(), closed)
+        self.assertEqual(list(self.registry.iterdir()), [])
 
 
 class CommandProvenanceSelectionTest(unittest.TestCase):
