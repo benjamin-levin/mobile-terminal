@@ -243,7 +243,7 @@ class ProfileClientWiringTest(unittest.TestCase):
 
     def test_proxy_shell_and_message_router_load_passkey_helper(self):
         self.assertIn('<script defer src="/static/passkey.js"></script>', PROXY_PY)
-        self.assertIn('const CACHE = "mobile-terminal-v22";', PROXY_PY)
+        self.assertIn('const CACHE = "mobile-terminal-v23";', PROXY_PY)
         self.assertIn('const CACHE = "mobile-terminal-proxy-v16";', PROXY_PY)
         self.assertIn("startPasskeyCeremony(payload, messageSocket, generation);", APP_JS)
         self.assertIn("sendAuthenticationMessage,", APP_JS)
@@ -297,7 +297,7 @@ class ProfileClientWiringTest(unittest.TestCase):
         retry = APP_JS[retry_start:retry_end]
         self.assertIn("reconnectSocket();", retry)
         self.assertIn('authenticationSocket.close(4000, "passkey retry");', APP_JS)
-        self.assertIn('const CACHE = "mobile-terminal-v22";', SW_JS)
+        self.assertIn('const CACHE = "mobile-terminal-v23";', SW_JS)
 
     def test_passkey_ceremony_is_cancelled_and_bound_to_its_socket(self):
         self.assertIn("cancelPasskeyCeremony();", APP_JS)

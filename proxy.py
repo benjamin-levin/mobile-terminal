@@ -690,7 +690,7 @@ class ProxyServer:
     def _proxy_service_worker_response(self, request: Request) -> Response:
         source = (self.static_root / "sw.js").read_text()
         source = source.replace(
-            'const CACHE = "mobile-terminal-v22";',
+            'const CACHE = "mobile-terminal-v23";',
             'const CACHE = "mobile-terminal-proxy-v16";',
         )
         body = source.encode("utf-8")
