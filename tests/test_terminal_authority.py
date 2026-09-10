@@ -4101,6 +4101,144 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
         }
         return bridge, payload
 
+    async def test_degraded_alternate_selection_uses_fresh_capture_without_quiet(self):
+        seed = replace(snapshot(cols=8, authored_lines=["old"], rows=1), alternate=True)
+        current = replace(seed, physical_rows=["repaint"],
+                          plain_physical_rows=["repaint"], authored_lines=["repaint"])
+        for owned in (False, True):
+            with self.subTest(owned=owned):
+                bridge, payload = self.make_bridge(seed)
+                with (
+                    mock.patch.object(bridge, "quiet", side_effect=RuntimeError("busy")),
+                    mock.patch.object(bridge, "_schedule_stabilize_reseed") as schedule,
+                    mock.patch("server.capture_pane_snapshot", return_value=seed) as capture,
+                ):
+                    await bridge.reseed("history")
+                capture.assert_called_once_with(
+                    "session", "%1", server.CONNECT_HISTORY_LINES, require_stable=False,
+                )
+                schedule.assert_called_once_with()
+                self.assertTrue(bridge.seed_degraded)
+                self.assertIsNone(bridge.selection_row_identity)
+                self.assertEqual(bridge.phase, "forward")
+
+                with (
+                    mock.patch.object(bridge, "quiet", side_effect=[
+                        RuntimeError("busy"), RuntimeError("busy"), asyncio.CancelledError(),
+                    ]) as quiet,
+                    mock.patch.object(bridge, "reseed") as reseed,
+                ):
+                    await bridge._stabilize_when_quiet()
+                self.assertEqual(quiet.await_count, 3)
+                reseed.assert_not_called()
+                self.assertTrue(bridge.seed_degraded)
+
+                payload.update({
+                    "epoch": bridge.epoch_state["epoch"],
+                    "revision": bridge.offset,
+                    "cutoff": bridge.cutoff,
+                    "layoutGeneration": bridge.epoch_state["layout"],
+                    "bufferType": "alternate",
+                    "clientRows": [
+                        {"y": 0, "text": "KEEP    ", "styles": [[0, 8, "plain"]]},
+                    ],
+                })
+                bridge.offset += 1
+                provider = mock.Mock(
+                    owned=owned, text="exact source" if owned else None,
+                    authority="provider-exact" if owned else "terminal-raw",
+                )
+                with (
+                    mock.patch("server.capture_pane_snapshot", return_value=current) as capture,
+                    mock.patch("server.provider_selection", return_value=provider) as select,
+                    mock.patch.object(bridge, "quiet", side_effect=AssertionError("waited for quiet")),
+                    mock.patch.object(bridge.provenance_state.row_tracker, "observe") as observe,
+                    mock.patch("server._record_authoritative_selection_rejection") as rejected,
+                ):
+                    result = await bridge.authoritative_selection_result(payload)
+                self.assertEqual(result, AuthoritativeSelectionResult(
+                    text="exact source" if owned else "KEEP",
+                    authority="provider-exact" if owned else "terminal-raw",
+                ))
+                capture.assert_called_once_with("session", "%1", server.CONNECT_HISTORY_LINES)
+                select.assert_called_once_with(
+                    current, 0, 0, 4, 0,
+                    client_rows=((0, "KEEP    ", ((0, 8, "plain"),)),),
+                )
+                observe.assert_not_called()
+                rejected.assert_not_called()
+                self.assertTrue(bridge.seed_degraded)
+                self.assertIsNone(bridge.selection_row_identity)
+                self.assertEqual(bridge.phase, "forward")
+                self.assertFalse(bridge.selection_acks)
+
+    async def test_degraded_alternate_selection_keeps_downstream_validations(self):
+        pane = replace(snapshot(cols=8, authored_lines=["KEEP"], rows=1), alternate=True)
+        cases = (
+            ("columns", replace(pane, cols=9), None, "geometry-buffer-base-mismatch"),
+            ("rows", replace(pane, rows=2), None, "geometry-buffer-base-mismatch"),
+            ("buffer", replace(pane, alternate=False), None, "geometry-buffer-base-mismatch"),
+            ("pane", replace(pane, pane_id="%2"), None, "stability-recheck"),
+            ("epoch", pane, "epoch", "stability-recheck"),
+            ("layout", pane, "layout", "stability-recheck"),
+            ("capture", RuntimeError("tmux pane changed during capture"), None, "snapshot-capture"),
+            ("provider", pane, None, "provider-tmux-exception"),
+        )
+        for name, current, changed_state, reason in cases:
+            with self.subTest(name=name):
+                bridge, payload = self.make_bridge(pane)
+                bridge.seed_degraded = True
+                bridge.selection_row_identity = None
+                bridge.provenance_state.row_tracker.invalidate()
+                payload.update({
+                    "bufferType": "alternate",
+                    "clientRows": [
+                        {"y": 0, "text": "KEEP    ", "styles": [[0, 8, "plain"]]},
+                    ],
+                })
+
+                def capture(*_args, **_kwargs):
+                    if changed_state is not None:
+                        bridge.epoch_state[changed_state] += 1
+                    if isinstance(current, RuntimeError):
+                        raise current
+                    return current
+
+                with (
+                    mock.patch("server.capture_pane_snapshot", side_effect=capture) as captured,
+                    mock.patch("server.provider_selection", side_effect=
+                               provider_authority.ProviderAuthorityError("binding-changed")) as select,
+                    mock.patch("server._record_authoritative_selection_rejection") as rejected,
+                ):
+                    text, error = await bridge.authoritative_selection(payload)
+                self.assertEqual((text, error), (None, "Terminal changed; select again."))
+                captured.assert_called_once_with("session", "%1", server.CONNECT_HISTORY_LINES)
+                rejected.assert_called_once_with(reason)
+                if name == "provider":
+                    select.assert_called_once()
+                else:
+                    select.assert_not_called()
+                self.assertEqual(bridge.phase, "forward")
+                self.assertFalse(bridge.selection_acks)
+
+    async def test_degraded_normal_selection_stays_blocked_with_fresh_client_rows(self):
+        pane = snapshot(cols=8, authored_lines=["KEEP"], rows=1)
+        bridge, payload = self.make_bridge(pane)
+        bridge.seed_degraded = True
+        bridge.selection_row_identity = None
+        bridge.provenance_state.row_tracker.invalidate()
+        self.anchor(payload, pane)
+        with (
+            mock.patch("server.capture_pane_snapshot") as capture,
+            mock.patch("server.provider_selection") as select,
+            mock.patch("server._record_authoritative_selection_rejection") as rejected,
+        ):
+            text, error = await bridge.authoritative_selection(payload)
+        self.assertEqual((text, error), (None, "Terminal changed; select again."))
+        rejected.assert_called_once_with("unstable-seed")
+        capture.assert_not_called()
+        select.assert_not_called()
+
     async def test_fresh_browser_anchor_accepts_output_after_seed_first_attempt(self):
         seed = snapshot(cols=8, authored_lines=["old", ""], rows=2)
         current = snapshot(cols=8, authored_lines=["FRESH", ""], rows=2)

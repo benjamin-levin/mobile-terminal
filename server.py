@@ -4363,7 +4363,7 @@ class TmuxBridge:
 
         await self.settle_active_provenance_fence()
         async with self.seed_lock:
-            if self.seed_degraded:
+            if self.seed_degraded and buffer_type == "normal":
                 return reject("unstable-seed")
             async with self.write_lock:
                 async with self.send_lock:
