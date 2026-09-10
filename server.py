@@ -451,6 +451,9 @@ def current_path(session_name: str, fallback: str) -> str:
 # Lines of authoritative scrollback sent in the initial seed. Older normal
 # history is fetched by a larger reseed only when the local xterm reaches the
 # top of its current window.
+TERMINAL_MIN_COLS = 20
+TERMINAL_MIN_ROWS = 6
+SEED_CAPTURE_BUDGET_SECONDS = 0.35
 CONNECT_HISTORY_LINES = 2000
 MAX_HISTORY_SEED_LINES = 20000
 MAX_SELECTION_REQUEST_BYTES = 64 * 1024
@@ -1087,6 +1090,8 @@ class PaneSnapshot:
             "history": self.history,
             "historyLimit": self.history_limit,
             "seedHistory": self.seed_history,
+            "minCols": TERMINAL_MIN_COLS,
+            "minRows": TERMINAL_MIN_ROWS,
             "bracketedPaste": self.bracketed_paste,
             "cols": self.cols,
             "rows": self.rows,
@@ -3831,15 +3836,15 @@ class TmuxBridge:
         *,
         degraded: bool = False,
     ) -> None:
-        if degraded:
-            async with self.send_lock:
-                pending = [record for record in self.held if record["start"] >= cutoff]
-                self.held = []
-                for record in pending:
-                    await self._send_output(record, "postseed")
-                event = asyncio.Event()
-                self.flush_acks[(epoch, 1)] = event
-                through = pending[-1]["end"] if pending else cutoff
+        async with self.send_lock:
+            pending = [record for record in self.held if record["start"] >= cutoff]
+            self.held = []
+            for record in pending:
+                await self._send_output(record, "postseed")
+            event = asyncio.Event()
+            self.flush_acks[(epoch, 1)] = event
+            through = pending[-1]["end"] if pending else cutoff
+            try:
                 await self._send_json(
                     {
                         "type": "post-flush",
@@ -3852,58 +3857,20 @@ class TmuxBridge:
                     }
                 )
                 await asyncio.wait_for(event.wait(), timeout=5)
+            finally:
                 self.flush_acks.pop((epoch, 1), None)
-                self.phase = "forward"
-                await self._send_json(
-                    {
-                        "type": "seed-open",
-                        "epoch": epoch,
-                        "session": self.session_name,
-                        "paneId": self.pane_id,
-                        "cutoff": cutoff,
-                        "layoutGeneration": self.epoch_state["layout"],
-                    }
-                )
-            return
-
-        cycle = 0
-        while True:
-            pending = [record for record in self.held if record["start"] >= cutoff]
-            self.held = [record for record in self.held if record["start"] < cutoff]
-            for record in pending:
-                await self._send_output(record, "postseed")
-            cycle += 1
-            event = asyncio.Event()
-            self.flush_acks[(epoch, cycle)] = event
-            through = pending[-1]["end"] if pending else cutoff
+            self.phase = "forward"
             await self._send_json(
                 {
-                    "type": "post-flush",
+                    "type": "seed-open",
                     "epoch": epoch,
-                    "cycle": cycle,
-                    "through": through,
-                    "bytes": sum(record["end"] - record["start"] for record in pending),
+                    "session": self.session_name,
+                    "paneId": self.pane_id,
+                    "cutoff": cutoff,
+                    "layoutGeneration": self.epoch_state["layout"],
                 }
             )
-            await asyncio.wait_for(event.wait(), timeout=5)
-            self.flush_acks.pop((epoch, cycle), None)
-            self.last_output_at = time.monotonic()
-            await self.quiet(0.1)
-            async with self.send_lock:
-                if not any(record["start"] >= cutoff for record in self.held):
-                    self.held.clear()
-                    self.phase = "forward"
-                    break
-        await self._send_json(
-            {
-                "type": "seed-open",
-                "epoch": epoch,
-                "session": self.session_name,
-                "paneId": self.pane_id,
-                "cutoff": cutoff,
-                "layoutGeneration": self.epoch_state["layout"],
-            }
-        )
+        return
 
     def _schedule_stabilize_reseed(self) -> None:
         if self.closing or self.closed:
@@ -3968,15 +3935,18 @@ class TmuxBridge:
             if reason == "stabilize":
                 _record_seed_forensics_diagnostic("stabilize-reseed")
             async with self.send_lock:
+                resume_held = (self.held if reason in ("resize", "activity")
+                               and self.selection_hold_request_id is not None else [])
                 self.selection_hold_request_id = None
                 self.phase = "hold"
-                self.held = []
+                self.held = resume_held
                 if next_pane_id:
                     self._forget_pane_modes()
                     self.pane_id = next_pane_id
                 self.epoch_state["epoch"] += 1
                 self.epoch_state["layout"] += 1
                 epoch = self.epoch_state["epoch"]
+                resume_cutoff = self.held[0]["start"] if self.held else self.offset
                 start_event = asyncio.Event()
                 start_payload: dict[str, Any] = {}
                 self.seed_start_acks[epoch] = (start_event, start_payload)
@@ -4030,14 +4000,17 @@ class TmuxBridge:
                 except (TypeError, ValueError):
                     cols, rows = 0, 0
                 if cols > 0 and rows > 0:
-                    await self.set_size(max(20, cols), max(6, rows))
+                    await self.set_size(max(TERMINAL_MIN_COLS, cols), max(TERMINAL_MIN_ROWS, rows))
             requested_history = history_lines if history_lines is not None else CONNECT_HISTORY_LINES
             snapshot: PaneSnapshot | None = None
             cutoff = self.offset
+            capture_deadline = time.monotonic() + SEED_CAPTURE_BUDGET_SECONDS
             for _attempt in range(3):
+                if time.monotonic() >= capture_deadline:
+                    break
                 try:
                     self.last_output_at = time.monotonic()
-                    await self.quiet()
+                    await self.quiet(timeout=max(0, capture_deadline - time.monotonic()))
                     candidate_cutoff = self.offset
                     candidate = await asyncio.to_thread(
                         capture_pane_snapshot,
@@ -4046,7 +4019,7 @@ class TmuxBridge:
                         requested_history,
                     )
                     self.last_output_at = time.monotonic()
-                    await self.quiet(0.05)
+                    await self.quiet(0.05, timeout=max(0, capture_deadline - time.monotonic()))
                 except (RuntimeError, asyncio.TimeoutError):
                     continue
                 if self.offset == candidate_cutoff:
@@ -4054,6 +4027,23 @@ class TmuxBridge:
                     cutoff = candidate_cutoff
                     break
             degraded = snapshot is None
+            if degraded and reason in ("resize", "activity"):
+                # Keep the browser buffer when a racing snapshot cannot establish an
+                # exact cutoff. Replay every held byte, including resize redraws.
+                metadata = await asyncio.to_thread(pane_metadata, self.session_name, self.pane_id)
+                self.cutoff = resume_cutoff
+                self.seed_degraded = True
+                self.selection_row_identity = None
+                self.provenance_state.row_tracker.invalidate()
+                self.provenance_state.invalidate_active()
+                await self._send_json({
+                    "type": "seed-resume", "epoch": epoch, "paneId": self.pane_id,
+                    "cutoff": resume_cutoff, "layoutGeneration": self.epoch_state["layout"],
+                    "cols": metadata[2], "rows": metadata[3],
+                })
+                await self._flush_seed_output(epoch, resume_cutoff, degraded=True)
+                self._schedule_stabilize_reseed()
+                return
             if degraded:
                 snapshot = await asyncio.to_thread(
                     capture_pane_snapshot,
@@ -4081,6 +4071,12 @@ class TmuxBridge:
                 )
                 self.seed_degraded = False
             self.held = [record for record in self.held if record["start"] >= cutoff]
+            try:
+                row_mapping = _authored_physical_map(snapshot)
+                wrapped_rows = [index > 0 and row_mapping[index - 1][0] == logical
+                                for index, (logical, _text) in enumerate(row_mapping)]
+            except RuntimeError:
+                wrapped_rows = None
             await self._send_json(
                 {
                     "type": "seed-data",
@@ -4091,14 +4087,17 @@ class TmuxBridge:
                     "layoutGeneration": self.epoch_state["layout"],
                     "meta": snapshot.metadata(),
                     "physicalRows": snapshot.physical_rows,
+                    "wrappedRows": wrapped_rows,
                     "scrollTarget": scroll_target,
                 }
             )
             seed_event = asyncio.Event()
             self.seed_acks[epoch] = seed_event
             await self._send_json({"type": "seed-end", "epoch": epoch, "cutoff": cutoff})
-            await asyncio.wait_for(seed_event.wait(), timeout=5)
-            self.seed_acks.pop(epoch, None)
+            try:
+                await asyncio.wait_for(seed_event.wait(), timeout=5)
+            finally:
+                self.seed_acks.pop(epoch, None)
             await self._flush_seed_output(epoch, cutoff, degraded=degraded)
             if degraded:
                 self._schedule_stabilize_reseed()
@@ -6291,7 +6290,8 @@ class AppServer:
                     CONNECT_HISTORY_LINES,
                     min(MAX_HISTORY_SEED_LINES, int(payload.get("historyLines", CONNECT_HISTORY_LINES))),
                 )
-                scroll_target = int(payload.get("scrollTarget", 0))
+                scroll_target = payload.get("scrollTarget")
+                scroll_target = int(scroll_target) if scroll_target is not None else None
             except (TypeError, ValueError):
                 return
             await bridge.reseed(
@@ -6322,8 +6322,8 @@ class AppServer:
             return
 
         if message_type == "resize":
-            cols = max(20, int(payload.get("cols", 80)))
-            rows = max(6, int(payload.get("rows", 24)))
+            cols = max(TERMINAL_MIN_COLS, int(payload.get("cols", 80)))
+            rows = max(TERMINAL_MIN_ROWS, int(payload.get("rows", 24)))
             self.invalidate_command_provenance(session_name)
             self.terminal_sizes[session_name] = (cols, rows)
             await bridge.resize(cols, rows)

@@ -429,9 +429,24 @@ h2 {
 }
 
 .terminal-panel {
+  position: relative;
   height: 100%;
   min-height: 0;
   overflow: hidden;
+}
+
+.terminal-panel.terminal-constrained::after {
+  content: "Hide the keyboard or rotate for more terminal space.";
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 35;
+  padding: 3px 6px;
+  background: rgba(6, 17, 23, 0.96);
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.2;
+  text-align: center;
+  pointer-events: none;
 }
 
 #terminal {

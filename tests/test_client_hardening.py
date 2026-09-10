@@ -82,7 +82,8 @@ class ClientHardeningWiringTest(unittest.TestCase):
         close_handler = section(APP_JS, '    socket.addEventListener("close"', "  function setPasskeyRetryUi")
         self.assertIn("connectionGeneration += 1;", close_handler)
         seed = section(APP_JS, "  async function applyTerminalSeed", "  async function handleTerminalBinary")
-        self.assertEqual(seed.count("await writeTerminal("), 4)
+        # Four writes per replay, with alternative soft-wrap and legacy row paths.
+        self.assertEqual(seed.count("await writeTerminal("), 5)
         self.assertGreaterEqual(seed.count("connectionGenerationIsCurrent(generation)"), 5)
         binary = section(APP_JS, "  async function handleTerminalBinary", "  async function drainSocketMessageQueue")
         self.assertIn("chunk = await chunk.arrayBuffer();", binary)
@@ -216,7 +217,7 @@ class ClientHardeningWiringTest(unittest.TestCase):
                 "assert.equal(queue.reseedPending, true);",
                 "assert.equal(terminalAuthoritative, false);",
                 "assert.equal(historyReseedPending, true);",
-                "assert.deepEqual(sent, [{ type: 'history-reseed', historyLines: 2500, scrollTarget: 0 }]);",
+                "assert.deepEqual(sent, [{ type: 'history-reseed', historyLines: 2500, scrollTarget: null }]);",
                 "assert.equal(requestTerminalBacklogReseed(queue, 7, socket), false);",
                 "assert.equal(sent.length, 1);",
             )

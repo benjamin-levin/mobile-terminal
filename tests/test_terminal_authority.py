@@ -2783,7 +2783,7 @@ class ControlTransportTest(unittest.IsolatedAsyncioTestCase):
         bridge.held = [{"start": 0, "end": 1, "data": b"x"}]
 
         reseeding = asyncio.create_task(bridge.reseed("pane-change", next_pane_id="%2"))
-        seed_start = await connection.payloads.get()
+        seed_start = await asyncio.wait_for(connection.payloads.get(), timeout=1)
         self.assertEqual(seed_start["type"], "seed-start")
         self.assertEqual(bridge.phase, "hold")
         self.assertIsNone(bridge.selection_hold_request_id)
@@ -4688,12 +4688,14 @@ class ClientProtocolSourceTest(unittest.TestCase):
         seed_guard = "if (terminalSeedInFlight)"
         socket_guard = "if (!terminalSocketIsOpen())"
         send = 'sendMessage({ type: "resize", cols: desiredTerminalCols, rows: desiredTerminalRows })'
-        delivered = "deliveredTerminalCols = desiredTerminalCols;"
+        delivered = "sentTerminalSize = { cols: desiredTerminalCols"
         self.assertIn(seed_guard, flush)
         self.assertIn(socket_guard, flush)
         self.assertLess(flush.index(seed_guard), flush.index(send))
         self.assertLess(flush.index(socket_guard), flush.index(send))
         self.assertLess(flush.index(send), flush.index(delivered))
+        self.assertNotIn("deliveredTerminalCols = desiredTerminalCols", flush)
+        self.assertIn("acknowledgeTerminalSize(meta.cols, meta.rows);", self.source)
         self.assertNotIn("!terminalAuthoritative", flush)
         self.assertIn("!differsFromDelivered", flush)
         for reason in ("seed-in-flight", "socket-not-open", "duplicate"):

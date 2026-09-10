@@ -691,6 +691,9 @@
   let terminalAuthoritative = false;
   let historyReseedPending = false;
   let pendingSeedScrollTarget = null;
+  let pendingSeedViewport = null;
+  let terminalMinCols = 20;
+  let terminalMinRows = 6;
   let selectionRequestCounter = 0;
   const pendingSelectionRequests = new Map();
   let reconnectTimer = null;
@@ -707,6 +710,7 @@
   let desiredTerminalRows = 0;
   let deliveredTerminalCols = 0;
   let deliveredTerminalRows = 0;
+  let sentTerminalSize = null;
   let terminalResizeDirty = false;
   let terminalResizePending = false;
   let terminalSeedInFlight = false;
@@ -4875,8 +4879,8 @@
   }
 
   function setDesiredTerminalSize(cols, rows) {
-    const nextCols = Math.floor(Number(cols));
-    const nextRows = Math.floor(Number(rows));
+    const nextCols = Math.max(terminalMinCols, Math.floor(Number(cols)));
+    const nextRows = Math.max(terminalMinRows, Math.floor(Number(rows)));
     if (!Number.isFinite(nextCols) || !Number.isFinite(nextRows) || nextCols <= 0 || nextRows <= 0) {
       return false;
     }
@@ -4904,6 +4908,7 @@
     const previousRows = deliveredTerminalRows;
     deliveredTerminalCols = 0;
     deliveredTerminalRows = 0;
+    sentTerminalSize = null;
     recordViewportForensics("resize-delivered-reset", {
       fromCols: previousCols,
       fromRows: previousRows,
@@ -4953,25 +4958,39 @@
       clearTerminalResizeWatchdog();
       return false;
     }
+    if (sentTerminalSize && performance.now() - sentTerminalSize.at < TERMINAL_RESIZE_WATCHDOG_MS) {
+      terminalResizePending = true;
+      scheduleTerminalResizeWatchdog();
+      return false;
+    }
     if (!sendMessage({ type: "resize", cols: desiredTerminalCols, rows: desiredTerminalRows })) {
       terminalResizePending = true;
       recordTerminalResizeWithheld("socket-not-open");
       scheduleTerminalResizeWatchdog();
       return false;
     }
-    deliveredTerminalCols = desiredTerminalCols;
-    deliveredTerminalRows = desiredTerminalRows;
-    recordViewportForensics("resize-delivered", {
+    sentTerminalSize = { cols: desiredTerminalCols, rows: desiredTerminalRows, at: performance.now() };
+    recordViewportForensics("resize-sent", {
       reason: source,
-      cols: deliveredTerminalCols,
-      rows: deliveredTerminalRows,
+      cols: desiredTerminalCols,
+      rows: desiredTerminalRows,
       authoritative: terminalAuthoritative,
       seedInFlight: terminalSeedInFlight,
     });
     terminalResizeDirty = false;
-    terminalResizePending = false;
-    clearTerminalResizeWatchdog();
+    terminalResizePending = true;
+    scheduleTerminalResizeWatchdog();
     return true;
+  }
+
+  function acknowledgeTerminalSize(cols, rows) {
+    deliveredTerminalCols = Number(cols);
+    deliveredTerminalRows = Number(rows);
+    recordViewportForensics("resize-delivered", { cols: deliveredTerminalCols, rows: deliveredTerminalRows });
+    sentTerminalSize = null;
+    terminalResizePending = terminalResizeDiffersFromDelivered();
+    terminalResizeDirty = terminalResizePending;
+    scheduleTerminalResizeWatchdog();
   }
 
   function writeTerminal(data) {
@@ -5142,7 +5161,7 @@
       JSON.stringify({
         type: "history-reseed",
         historyLines: Math.max(2000, terminalSeedHistory),
-        scrollTarget: 0,
+        scrollTarget: null,
       }),
     );
     recordViewportForensics("authority-reseed", { reason });
@@ -5282,7 +5301,10 @@
     }
     if (!connectionGenerationIsCurrent(generation)) return false;
     decoder = new TextDecoder();
+    terminalMinCols = Number(meta.minCols) || 20;
+    terminalMinRows = Number(meta.minRows) || 6;
     term.resize(Number(meta.cols), Number(meta.rows));
+    acknowledgeTerminalSize(meta.cols, meta.rows);
     let reset = `\x1b[?1049l${terminalReplayBaselineSequence()}\x1b[3J\x1b[2J\x1b[H`;
     if (meta.alternate) {
       reset += `\x1b[?1049h${terminalReplayBaselineSequence()}\x1b[2J\x1b[H`;
@@ -5291,7 +5313,14 @@
     if (!connectionGenerationIsCurrent(generation)) return false;
     await writeTerminal(terminalTabStopsSequence(meta));
     if (!connectionGenerationIsCurrent(generation)) return false;
-    await writeTerminal(payload.physicalRows.join("\r\n"));
+    if (Array.isArray(payload.wrappedRows) && payload.wrappedRows.length === payload.physicalRows.length) {
+      // Replay genuine continuations through xterm's wrap path so selection and
+      // subsequent width changes retain the tmux logical-line boundaries.
+      await writeTerminal("\x1b[?7h" + payload.physicalRows.map((row, index) =>
+        `${index && !payload.wrappedRows[index] ? "\r\n" : ""}${row}`).join(""));
+    } else {
+      await writeTerminal(payload.physicalRows.join("\r\n"));
+    }
     if (!connectionGenerationIsCurrent(generation)) return false;
     await writeTerminal(terminalModeSequence(meta));
     if (!connectionGenerationIsCurrent(generation)) return false;
@@ -5302,8 +5331,8 @@
     terminalLayoutGeneration = Number(payload.layoutGeneration);
     terminalSeedHistory = Number(meta.seedHistory) || 0;
     terminalHistory = Number(meta.history) || 0;
-    pendingSeedScrollTarget = Number.isFinite(Number(payload.scrollTarget))
-      ? Number(payload.scrollTarget)
+    pendingSeedScrollTarget = typeof payload.scrollTarget === "number" && Number.isFinite(payload.scrollTarget)
+      ? payload.scrollTarget
       : null;
     return true;
   }
@@ -5443,6 +5472,7 @@
       followOutput = true;
       return;
     }
+    if (terminalSeedInFlight) return;
     const buffer = term.buffer.active;
     followOutput = buffer.viewportY >= buffer.baseY;
   }
@@ -5524,16 +5554,20 @@
         const proposed = fitAddon.proposeDimensions();
         if (proposed && Number.isFinite(proposed.rows) && proposed.rows > 0) {
           const proposedCols = Number.isFinite(proposed.cols) ? Math.floor(proposed.cols) : term.cols;
-          const guardedCols = Math.max(20, proposedCols - TERMINAL_COL_GUARD);
+          const guardedCols = Math.max(terminalMinCols, proposedCols - TERMINAL_COL_GUARD);
           const nextCols = shouldPreserveCols && desiredTerminalCols > 0 ? desiredTerminalCols : guardedCols;
-          term.resize(nextCols, proposed.rows);
+          term.resize(nextCols, Math.max(terminalMinRows, Math.floor(proposed.rows)));
         } else {
           fitAddon.fit();
         }
       } else {
         fitAddon.fit();
       }
+      if (term.cols < terminalMinCols || term.rows < terminalMinRows) {
+        term.resize(Math.max(terminalMinCols, term.cols), Math.max(terminalMinRows, term.rows));
+      }
       clampTerminalColumnsToVisibleWidth();
+      terminalPanel.classList.toggle("terminal-constrained", terminalHeight < term.rows * terminalCellSize().height - 1);
       const dimensionsChanged = term.cols !== previousCols || term.rows !== previousRows;
       lastTerminalLayoutWidth = terminalWidth;
       lastTerminalLayoutHeight = terminalHeight;
@@ -8613,6 +8647,12 @@
 
   async function handleServerMessage(payload, generation, messageSocket, queueState) {
     if (payload.type === "seed-start") {
+      pendingSeedViewport = {
+        paneId: terminalPaneId,
+        follow: followOutput,
+        absoluteRow: terminalHistory - terminalSeedHistory + term.buffer.active.viewportY,
+        anchorText: term.buffer.active.getLine(term.buffer.active.viewportY)?.translateToString(true) || "",
+      };
       beginTerminalSeed();
       setTerminalAuthoritative(false);
       queueState.reseedPending = false;
@@ -8627,6 +8667,18 @@
           rows: term.rows,
         }),
       );
+      return;
+    }
+    if (payload.type === "seed-resume") {
+      if (!terminalSeedInFlight || String(payload.paneId || "") !== terminalPaneId ||
+          Number(payload.cutoff) !== terminalRevision) {
+        throw new Error("Terminal resume ordering changed");
+      }
+      term.resize(Number(payload.cols), Number(payload.rows));
+      acknowledgeTerminalSize(payload.cols, payload.rows);
+      terminalEpoch = Number(payload.epoch);
+      terminalCutoff = Number(payload.cutoff);
+      terminalLayoutGeneration = Number(payload.layoutGeneration);
       return;
     }
     if (payload.type === "seed-data") {
@@ -8676,8 +8728,28 @@
       if (pendingSeedScrollTarget !== null && term.buffer.active.type === "normal") {
         term.scrollToLine(Math.max(0, pendingSeedScrollTarget + terminalSeedHistory));
         followOutput = false;
+      } else if (pendingSeedViewport?.paneId === terminalPaneId) {
+        followOutput = pendingSeedViewport.follow;
+        if (followOutput) {
+          term.scrollToBottom();
+        } else if (term.buffer.active.type === "normal") {
+          let target = Math.max(0, pendingSeedViewport.absoluteRow - (terminalHistory - terminalSeedHistory));
+          if (pendingSeedViewport.anchorText) {
+            let nearest = null;
+            for (let row = 0; row < term.buffer.active.length; row += 1) {
+              const text = term.buffer.active.getLine(row)?.translateToString(true) || "";
+              if (text && (text.startsWith(pendingSeedViewport.anchorText) || pendingSeedViewport.anchorText.startsWith(text)) &&
+                  (nearest === null || Math.abs(row - target) < Math.abs(nearest - target))) nearest = row;
+            }
+            if (nearest !== null) target = nearest;
+          }
+          term.scrollToLine(target);
+        }
+      } else if (followOutput) {
+        term.scrollToBottom();
       }
       pendingSeedScrollTarget = null;
+      pendingSeedViewport = null;
       flushTerminalResize("seed-open");
       return;
     }
@@ -11073,6 +11145,24 @@
     updateDisplayDraft(draftUiScale, Number.parseInt(event.target.value, 10));
   });
 
+  function installTmuxQueryOwnership() {
+    // tmux answers application queries. Intercept queries in the output parser,
+    // rather than filtering onData where pasted text and keystrokes are mixed.
+    const parser = term.parser;
+    for (const prefix of ["", "?", ">"]) {
+      parser.registerCsiHandler({ prefix, final: "c" }, () => true);
+      parser.registerCsiHandler({ prefix, final: "n" }, () => true);
+      parser.registerCsiHandler({ prefix, intermediates: "$", final: "p" }, () => true);
+    }
+    parser.registerCsiHandler({ final: "t" }, (params) => [14, 16, 18, 20, 21].includes(params[0]));
+    parser.registerCsiHandler({ prefix: ">", final: "q" }, () => true);
+    parser.registerDcsHandler({ intermediates: "$", final: "q" }, () => true);
+    for (const identifier of [4, 10, 11, 12]) {
+      parser.registerOscHandler(identifier, (data) => data.split(";").includes("?"));
+    }
+  }
+
+  installTmuxQueryOwnership();
   term.onKey(() => reportActivity());
 
   term.onData((data) => {
