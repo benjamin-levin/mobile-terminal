@@ -534,6 +534,10 @@ h2 {
   white-space: nowrap;
 }
 
+.term-select-chip[hidden] {
+  display: none;
+}
+
 .term-select-chip:active {
   background: #22394a;
 }

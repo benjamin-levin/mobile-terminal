@@ -7,6 +7,8 @@ import datetime
 import gzip
 import hashlib
 import hmac
+import http.client
+import io
 import ipaddress
 import json
 import mimetypes
@@ -30,7 +32,7 @@ from wcwidth import wcwidth, wcswidth
 
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidMessage
 from websockets.http11 import Request, Response
 
 from mobile_terminal_config import (
@@ -59,6 +61,10 @@ ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / "static"
 NODE_MODULES_ROOT = ROOT / "node_modules"
 WS_PATH = "/_ws"
+TTS_SOCKET = os.environ.get("MOBILE_TERMINAL_TTS_SOCKET", "/home/powerhouse/smart-board/logs/voice.sock")
+TTS_TIMEOUT_SECONDS = 10
+TTS_MAX_TEXT_CHARS = 2000
+TTS_MAX_REQUEST_BYTES = 32768
 SETTINGS_PATH = ROOT / "mobile-terminal-settings.json"
 OPEN_TABS_PATH = Path(
     os.environ.get(
@@ -3032,6 +3038,9 @@ def http_response(
     reason = {
         200: "OK",
         304: "Not Modified",
+        400: "Bad Request",
+        413: "Content Too Large",
+        503: "Service Unavailable",
         403: "Forbidden",
         401: "Unauthorized",
         404: "Not Found",
@@ -3039,6 +3048,148 @@ def http_response(
         500: "Internal Server Error",
     }.get(status, "OK")
     return Response(status, reason, Headers(fields), body)
+
+
+class TerminalHTTPConnection(ServerConnection):
+    """Accept only the bounded TTS POST beside websockets' GET-only parser."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.http_prefix: bytearray | None = bytearray()
+        self.tts_body = b""
+        self.tts_post = False
+        self.http_rejected = False
+        self.http_deadline: asyncio.TimerHandle | None = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        super().connection_made(transport)
+        self.http_deadline = self.loop.call_later(10, self.transport.close)
+
+    async def handshake(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            await super().handshake(*args, **kwargs)
+        except InvalidMessage:
+            if not self.http_rejected:
+                raise
+        finally:
+            if self.http_deadline is not None:
+                self.http_deadline.cancel()
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        if self.http_deadline is not None:
+            self.http_deadline.cancel()
+        super().connection_lost(exc)
+
+    def reject_http(self, status: int) -> None:
+        self.http_rejected = True
+        response = http_response(status, b'{"error":"Invalid request."}', "application/json")
+        self.transport.write(response.serialize())
+        self.transport.close()
+        self.http_prefix = None
+
+    def data_received(self, data: bytes) -> None:
+        if self.tts_post:
+            self.reject_http(400)
+            return
+        if self.http_prefix is None:
+            super().data_received(data)
+            return
+        self.http_prefix.extend(data)
+        if len(self.http_prefix) < 5:
+            return
+        if not self.http_prefix.startswith(b"POST "):
+            buffered = bytes(self.http_prefix)
+            self.http_prefix = None
+            super().data_received(buffered)
+            return
+        header_end = self.http_prefix.find(b"\r\n\r\n")
+        if header_end < 0:
+            if len(self.http_prefix) > TTS_MAX_REQUEST_BYTES:
+                self.reject_http(413)
+            return
+        if header_end > TTS_MAX_REQUEST_BYTES:
+            self.reject_http(413)
+            return
+        lines = bytes(self.http_prefix[:header_end]).split(b"\r\n")
+        if lines[0] != b"POST /tts HTTP/1.1":
+            self.reject_http(405)
+            return
+        headers: dict[bytes, list[bytes]] = {}
+        for line in lines[1:]:
+            name, separator, value = line.partition(b":")
+            if not separator or not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+                self.reject_http(400)
+                return
+            headers.setdefault(name.lower(), []).append(value.strip())
+        lengths = headers.get(b"content-length", [])
+        if (
+            len(lengths) != 1
+            or not re.fullmatch(rb"[0-9]{1,8}", lengths[0])
+            or b"transfer-encoding" in headers
+            or b"upgrade" in headers
+            or b"expect" in headers
+            or any(len(values) != 1 for values in headers.values())
+        ):
+            self.reject_http(400)
+            return
+        length = int(lengths[0])
+        if length > TTS_MAX_REQUEST_BYTES:
+            self.reject_http(413)
+            return
+        body_start = header_end + 4
+        if len(self.http_prefix) < body_start + length:
+            return
+        if len(self.http_prefix) != body_start + length:
+            self.reject_http(400)
+            return
+        self.tts_body = bytes(self.http_prefix[body_start:])
+        self.tts_post = True
+        if self.http_deadline is not None:
+            self.http_deadline.cancel()
+        self.http_prefix = None
+        # Let the existing parser validate headers and own response/connection
+        # handling. Method/body metadata stays on this connection, not the wire.
+        forwarded = [b"GET /tts HTTP/1.1"] + [
+            line for line in lines[1:] if line.partition(b":")[0].lower() != b"content-length"
+        ]
+        super().data_received(b"\r\n".join(forwarded) + b"\r\n\r\n")
+
+
+async def synthesize_terminal_speech(text: str) -> bytes:
+    async with asyncio.timeout(TTS_TIMEOUT_SECONDS):
+        reader, writer = await asyncio.open_unix_connection(TTS_SOCKET)
+        try:
+            body = json.dumps({"text": text}).encode("utf-8")
+            writer.write(
+                b"POST /synthesize HTTP/1.1\r\nHost: voice\r\n"
+                b"Content-Type: application/json\r\nConnection: close\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                + body
+            )
+            await writer.drain()
+            head = await reader.readuntil(b"\r\n\r\n")
+            status, _, raw_headers = head.partition(b"\r\n")
+            if status.split(b" ", 2)[:2] != [b"HTTP/1.1", b"200"]:
+                raise ValueError("Speech service unavailable")
+            headers = http.client.parse_headers(io.BytesIO(raw_headers))
+            lengths = headers.get_all("Content-Length", [])
+            if (
+                len(lengths) != 1
+                or not re.fullmatch(r"[0-9]{1,8}", lengths[0])
+                or headers.get("Transfer-Encoding")
+                or headers.get_content_type() != "audio/wav"
+            ):
+                raise ValueError("Invalid speech response")
+            length = int(lengths[0])
+            if not 44 <= length <= 32 * 1024 * 1024:
+                raise ValueError("Invalid speech response")
+            audio = await reader.readexactly(length)
+            if audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+                raise ValueError("Invalid speech response")
+            return audio
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
 
 _COMPRESSIBLE = ("text/", "application/javascript", "application/json", "application/manifest", "image/svg")
@@ -4799,6 +4950,7 @@ class AppServer:
         ] = {}
         self.usage = load_usage()
         self.active_sessions = 0
+        self.tts_capabilities: dict[ServerConnection, tuple[str, float]] = {}
         self.scroll_states: dict[str, dict[str, Any]] = {}
         self.terminal_sizes: dict[str, tuple[int, int]] = {}
         # Aliases of SSH hosts that answered the last ping sweep. Starts empty so
@@ -5289,10 +5441,41 @@ class AppServer:
         devices[device_id] = entry
         save_user_state(user, state)
 
+    async def handle_tts(self, connection: ServerConnection, request: Request) -> Response:
+        if not getattr(connection, "tts_post", False):
+            return http_response(405, b'{"error":"Method not allowed."}', "application/json")
+        authorization = request.headers.get("Authorization", "")
+        supplied = authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else ""
+        now = time.monotonic()
+        authorized = False
+        for owner, (capability, deadline) in list(self.tts_capabilities.items()):
+            if deadline <= now:
+                self.tts_capabilities.pop(owner, None)
+            elif supplied and secrets.compare_digest(supplied.encode("utf-8", "surrogateescape"), capability.encode("ascii")):
+                self.tts_capabilities.pop(owner, None)
+                authorized = True
+                break
+        if not authorized or not request_origin_matches_host(connection):
+            return http_response(401, b'{"error":"Authentication required."}', "application/json")
+        try:
+            payload = json.loads(connection.tts_body)
+        except (ValueError, UnicodeError):
+            return http_response(400, b'{"error":"Invalid text."}', "application/json")
+        text = payload.get("text") if isinstance(payload, dict) else None
+        if not isinstance(text, str) or not text.strip() or len(text) > TTS_MAX_TEXT_CHARS:
+            return http_response(400, b'{"error":"Invalid text."}', "application/json")
+        try:
+            audio = await synthesize_terminal_speech(text)
+        except (OSError, ValueError, TimeoutError, EOFError, asyncio.LimitOverrunError, http.client.HTTPException):
+            return http_response(503, b'{"error":"Speech service unavailable."}', "application/json")
+        return http_response(200, audio, "audio/wav", {"Cache-Control": "no-store"})
+
     async def process_request(self, connection: ServerConnection, request: Request) -> Response | None:
         path = urlsplit(request.path).path
         if not self.client_is_allowed(connection.remote_address):
             return http_response(403, b"Forbidden\n", "text/plain; charset=utf-8")
+        if path == "/tts":
+            return await self.handle_tts(connection, request)
         if path == "/config":
             trusted_client = self.client_is_trusted(connection.remote_address)
             # Auto-login by Tailscale identity behind `tailscale serve`: when the
@@ -6098,6 +6281,16 @@ class AppServer:
         session_name = state["session"]
         user = state.get("user", "")
         message_type = payload.get("type")
+        if message_type == "tts-auth":
+            request_id = payload.get("requestId")
+            if not isinstance(request_id, str) or len(request_id) > 80:
+                return
+            capability = secrets.token_urlsafe(32)
+            self.tts_capabilities[connection] = (capability, time.monotonic() + 30)
+            await self.send_json(connection, {
+                "type": "tts-auth", "requestId": request_id, "capability": capability,
+            })
+            return
         if str(message_type).startswith("composer-") and payload.get("session", session_name) != session_name:
             await self.send_json(connection, {
                 "type": "composer-rejected", "session": payload.get("session"),
@@ -7154,6 +7347,7 @@ class AppServer:
         except ConnectionClosed:
             pass
         finally:
+            self.tts_capabilities.pop(connection, None)
             receive_task.cancel()
             tab_task.cancel()
             for task in (receive_task, tab_task):
@@ -7183,6 +7377,10 @@ class AppServer:
             self.host,
             self.port,
             process_request=self.process_request,
+            create_connection=TerminalHTTPConnection,
+            # The adapter keeps GET/WS and POST upload deadlines at 10 seconds;
+            # a completed TTS upload then gets its own 10-second Unix deadline.
+            open_timeout=21,
             ping_interval=20,
             ping_timeout=20,
             max_size=2**20,

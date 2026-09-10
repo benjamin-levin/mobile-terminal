@@ -1865,6 +1865,184 @@
     }
   }
 
+  let terminalSpeechAudio = null;
+  let terminalSpeechUnlocked = false;
+  let terminalSpeechUnlockPromise = null;
+  let terminalSpeechRequest = null;
+  let terminalSpeechUrl = null;
+  let terminalSpeechGeneration = 0;
+  let pendingSpeechAuth = null;
+  const TERMINAL_SILENT_WAV =
+    "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
+
+  function unlockTerminalSpeech() {
+    if (terminalSpeechUnlocked) {
+      return Promise.resolve(true);
+    }
+    if (terminalSpeechUnlockPromise) {
+      return terminalSpeechUnlockPromise;
+    }
+    try {
+      if (!terminalSpeechAudio) {
+        terminalSpeechAudio = new Audio();
+        terminalSpeechAudio.preload = "auto";
+      }
+      terminalSpeechAudio.src = TERMINAL_SILENT_WAV;
+      terminalSpeechUnlockPromise = Promise.resolve(terminalSpeechAudio.play()).then(() => {
+        terminalSpeechUnlocked = true;
+        if (terminalSpeechAudio.src === TERMINAL_SILENT_WAV) {
+          terminalSpeechAudio.pause();
+        }
+        return true;
+      }).catch(() => false).finally(() => {
+        terminalSpeechUnlockPromise = null;
+      });
+      return terminalSpeechUnlockPromise;
+    } catch (_error) {
+      return Promise.resolve(false);
+    }
+  }
+
+  function initializeTerminalSpeech() {
+    const unlock = () => {
+      // Capture runs before chip handlers; later gestures must not replace a WAV.
+      if (!terminalSpeechRequest && !terminalSpeechUrl) {
+        unlockTerminalSpeech();
+      }
+    };
+    document.addEventListener("touchend", unlock, { capture: true, passive: true });
+    document.addEventListener("click", unlock, { capture: true, passive: true });
+    document.addEventListener("keydown", unlock, { capture: true, passive: true });
+  }
+
+  function clearTerminalSpeechAudio() {
+    if (terminalSpeechAudio) {
+      terminalSpeechAudio.onended = null;
+      terminalSpeechAudio.onerror = null;
+      if (!terminalSpeechUnlockPromise || terminalSpeechUrl) {
+        terminalSpeechAudio.pause();
+      }
+    }
+    if (terminalSpeechUrl) {
+      terminalSpeechAudio.removeAttribute("src");
+      URL.revokeObjectURL(terminalSpeechUrl);
+      terminalSpeechUrl = null;
+    }
+  }
+
+  function requestTerminalSpeechAuth() {
+    if (pendingSpeechAuth) {
+      pendingSpeechAuth.finish("");
+    }
+    const requestId = `tts-${Date.now()}-${terminalSpeechGeneration}`;
+    return new Promise((resolve) => {
+      const timer = window.setTimeout(() => finish(""), 6000);
+      const finish = (capability) => {
+        window.clearTimeout(timer);
+        pendingSpeechAuth = null;
+        resolve(capability);
+      };
+      pendingSpeechAuth = { requestId, finish };
+      if (!sendMessage({ type: "tts-auth", requestId })) {
+        finish("");
+      }
+    });
+  }
+
+  async function speakTerminalSelection() {
+    const generation = ++terminalSpeechGeneration;
+    terminalSpeechRequest?.abort();
+    clearTerminalSpeechAudio();
+    const controller = new AbortController();
+    terminalSpeechRequest = controller;
+    // Prime the audio element inside the tap gesture, before any await, so iOS
+    // permits programmatic playback once the synthesized WAV arrives.
+    const unlocked = unlockTerminalSpeech();
+    let failed = false;
+    const fail = (message) => {
+      if (generation === terminalSpeechGeneration && !failed) {
+        failed = true;
+        terminalSpeechUnlocked = false;
+        clearTerminalSpeechAudio();
+        showToast(message);
+      }
+      return false;
+    };
+    try {
+      // term.getSelection() is empty on mobile Safari; ask the server for the
+      // authoritative selection, the same source Copy and To-tab already use.
+      const selection = await requestAuthoritativeSelection();
+      if (generation !== terminalSpeechGeneration) {
+        return false;
+      }
+      if (selection.error) {
+        return fail(selection.error);
+      }
+      const text = normalizeTerminalCopyText(selection.text);
+      if (!text.trim()) {
+        return fail("Select terminal text first.");
+      }
+      const capability = await requestTerminalSpeechAuth();
+      if (generation !== terminalSpeechGeneration) {
+        return false;
+      }
+      if (!capability) {
+        return fail("Speech failed: no auth token.");
+      }
+      const response = await fetch("/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${capability}` },
+        credentials: "same-origin",
+        cache: "no-store",
+        body: JSON.stringify({ text }),
+        signal: controller.signal,
+      });
+      if (generation !== terminalSpeechGeneration) {
+        return false;
+      }
+      if (!response.ok) {
+        return fail(response.status === 503 ? "Speech service unavailable." : `Speech failed: HTTP ${response.status}.`);
+      }
+      if (response.headers.get("Content-Type")?.split(";")[0] !== "audio/wav") {
+        return fail("Speech failed: reply not audio.");
+      }
+      const audio = await response.blob();
+      await unlocked;
+      if (generation !== terminalSpeechGeneration) {
+        return false;
+      }
+      terminalSpeechUrl = URL.createObjectURL(audio);
+      terminalSpeechAudio.src = terminalSpeechUrl;
+      terminalSpeechAudio.onended = () => {
+        if (generation === terminalSpeechGeneration) {
+          clearTerminalSpeechAudio();
+        }
+      };
+      terminalSpeechAudio.onerror = () => fail("Speech failed: audio element error.");
+      await terminalSpeechAudio.play();
+      if (generation !== terminalSpeechGeneration || failed) {
+        return false;
+      }
+      terminalSpeechUnlocked = true;
+      showToast("Speaking terminal selection.");
+      return true;
+    } catch (_error) {
+      return fail("Speech failed: playback blocked.");
+    } finally {
+      if (generation === terminalSpeechGeneration) {
+        terminalSpeechRequest = null;
+      }
+    }
+  }
+
+  async function speakTerminalSelectionAndDismiss() {
+    const speech = speakTerminalSelection();
+    const generation = terminalSpeechGeneration;
+    if (await speech && generation === terminalSpeechGeneration) {
+      dismissTerminalSelection();
+    }
+  }
+
   // The most recent tab other than the current one. Prefers the tab the user
   // last came from (previousSessionName); falls back to the nearest other open
   // tab so the "To tab" chip always has a target when >1 tab is open.
@@ -2752,7 +2930,7 @@
       );
       btn.addEventListener(
         "touchend",
-        async (event) => {
+        (event) => {
           event.preventDefault();
           event.stopPropagation();
           const moved = touchStartPoint && touchStartPoint.moved;
@@ -2761,7 +2939,7 @@
             return;
           }
           touchHandledAt = performance.now();
-          await onActivate();
+          return onActivate();
         },
         { passive: false },
       );
@@ -2769,14 +2947,14 @@
         touchStartPoint = null;
         dismissTerminalSelection();
       });
-      btn.addEventListener("click", async (event) => {
+      btn.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
         // Ignore the click that some browsers still synthesize after touchend.
         if (performance.now() - touchHandledAt < 700) {
           return;
         }
-        await onActivate();
+        return onActivate();
       });
       return btn;
     };
@@ -2786,12 +2964,15 @@
     const paste = makeChip("To tab", async () => {
       await pasteSelectionToRecentTabAndDismiss();
     });
+    const speak = makeChip("Speak", () => {
+      speakTerminalSelectionAndDismiss();
+    });
     const chips = document.createElement("div");
     chips.className = "term-select-chips";
     ["touchstart", "touchmove", "touchend", "touchcancel"].forEach((type) => {
       chips.addEventListener(type, (event) => event.stopPropagation(), { passive: true });
     });
-    chips.append(copy, paste);
+    chips.append(copy, paste, speak);
     const magnifier = document.createElement("div");
     magnifier.className = "term-select-magnifier";
     magnifier.setAttribute("aria-hidden", "true");
@@ -2809,6 +2990,7 @@
       end,
       copy,
       paste,
+      speak,
       chips,
       magnifier,
       magnifierContent,
@@ -8836,6 +9018,12 @@
       enrollDeviceKey(payload, socket);
       return;
     }
+    if (payload.type === "tts-auth") {
+      if (pendingSpeechAuth?.requestId === payload.requestId) {
+        pendingSpeechAuth.finish(typeof payload.capability === "string" ? payload.capability : "");
+      }
+      return;
+    }
     if (payload.type === "ready") {
       applicationProtocolReady = true;
       if (payload.copyForensics === true) {
@@ -11298,6 +11486,7 @@
   applyUiScale(uiScale, false);
   applyTerminalFontSize(terminalFontSize, false);
   guardTerminalHelperTextarea();
+  initializeTerminalSpeech();
   installTerminalScrollHandlers();
   installTabStripScrollHandlers();
   installShortcutBarScrollHandlers();

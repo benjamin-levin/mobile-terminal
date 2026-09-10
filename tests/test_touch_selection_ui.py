@@ -11,7 +11,7 @@ STYLES_CSS = (ROOT / "static" / "styles.css").read_text()
 
 def extract_function(name):
     match = re.search(
-        rf"^  function {re.escape(name)}\([^)]*\) \{{.*?^  \}}$",
+        rf"^  (?:async )?function {re.escape(name)}\([^)]*\) \{{.*?^  \}}$",
         APP_JS,
         re.MULTILINE | re.DOTALL,
     )
@@ -320,6 +320,229 @@ assert.deepEqual(empty, { left: 20, top: 20, right: 20, bottom: 20, width: 0, he
 ''',
         )
 
+    def test_speak_snapshots_selection_then_fetches_authenticated_wav(self):
+        speech = app_section(
+            "  let terminalSpeechAudio = null;",
+            "  // The most recent tab other than the current one.",
+        )
+        self.assertNotIn("requestAuthoritativeSelection", speech)
+        self.assertNotIn("speechSynthesis", APP_JS)
+        self.assertNotIn("SpeechSynthesisUtterance", APP_JS)
+        self.run_node_source("\n".join([
+            'const assert = require("node:assert/strict");',
+            extract_function("normalizeTerminalCopyText"),
+            speech,
+            r'''
+const events = [], requests = [], revoked = [], listeners = {};
+let selection = "first\r\n  second\tline", dismissals = 0, audioCount = 0;
+let failPlay = false, failUnlock = false, inGesture = false;
+let fetchResponse = () => Promise.resolve(wav());
+const window = { setTimeout, clearTimeout };
+const document = { addEventListener(type, callback, options) {
+  assert.equal(options.capture, true); listeners[type] = callback;
+} };
+const term = { getSelection() { events.push("selection"); assert.equal(inGesture, true); return selection; } };
+function showToast(message) { events.push(message); }
+function dismissTerminalSelection() { dismissals += 1; }
+function sendMessage(payload) {
+  assert.equal(payload.type, "tts-auth");
+  events.push("auth");
+  queueMicrotask(() => {
+    if (pendingSpeechAuth?.requestId === payload.requestId) pendingSpeechAuth.finish("test-capability");
+  });
+  return true;
+}
+class Audio {
+  constructor() { audioCount += 1; this.src = ""; }
+  play() {
+    if (this.src.startsWith("data:")) {
+      assert.equal(inGesture, true, "silent unlock stays on gesture stack");
+      events.push("unlock");
+      return failUnlock ? Promise.reject(Error("blocked")) : Promise.resolve();
+    }
+    events.push("play");
+    return failPlay ? Promise.reject(Error("blocked")) : Promise.resolve();
+  }
+  pause() { events.push("pause"); }
+  removeAttribute(name) { assert.equal(name, "src"); this.src = ""; }
+}
+let urlCounter = 0;
+const URL = {
+  createObjectURL() { return `blob:${++urlCounter}`; },
+  revokeObjectURL(url) { revoked.push(url); },
+};
+function wav(status = 200, type = "audio/wav") {
+  return { ok: status === 200, status, headers: { get: () => type }, blob: async () => ({}) };
+}
+function fetch(url, options) {
+  assert.equal(url, "/tts");
+  assert.equal(options.method, "POST");
+  assert.equal(options.headers.Authorization, "Bearer test-capability");
+  assert.equal(options.headers["Content-Type"], "application/json");
+  assert.equal(options.credentials, "same-origin");
+  assert.equal(options.cache, "no-store");
+  requests.push(options); events.push("fetch");
+  return fetchResponse();
+}
+function tap() {
+  inGesture = true;
+  try { return speakTerminalSelectionAndDismiss(); } finally { inGesture = false; }
+}
+const flush = () => new Promise(setImmediate);
+(async () => {
+  initializeTerminalSpeech();
+  inGesture = true; listeners.touchend(); inGesture = false;
+  const first = tap(); // Capture unlock may still be pending when chip activates.
+  assert.equal(events.includes("fetch"), false);
+  assert.ok(events.indexOf("selection") < events.indexOf("auth"));
+  selection = "changed after tap";
+  await first;
+  assert.deepEqual(JSON.parse(requests[0].body), { text: "first\n  second\tline" });
+  assert.equal(dismissals, 1);
+  assert.equal(audioCount, 1);
+  const firstUrl = terminalSpeechUrl;
+  inGesture = true; listeners.click(); inGesture = false;
+  assert.equal(terminalSpeechUrl, firstUrl); // Document gesture must not overwrite speech.
+  await tap();
+  assert.equal(requests[0].signal.aborted, false); // Completed fetch no longer needs abort.
+  assert.ok(revoked.includes(firstUrl));
+  assert.equal(audioCount, 1);
+  const endedUrl = terminalSpeechUrl;
+  terminalSpeechAudio.onended();
+  assert.ok(revoked.includes(endedUrl));
+  assert.equal(terminalSpeechUrl, null);
+
+  for (const [response, message] of [[wav(503), "Speech service unavailable."],
+      [wav(401), "Speech failed."], [wav(500), "Speech failed."],
+      [wav(200, "application/json"), "Speech failed."]]) {
+    fetchResponse = () => Promise.resolve(response);
+    const before = dismissals;
+    await tap();
+    assert.equal(events.at(-1), message);
+    assert.equal(dismissals, before);
+    assert.equal(selection, "changed after tap");
+  }
+  fetchResponse = () => Promise.reject(Error("offline"));
+  await tap();
+  assert.equal(events.at(-1), "Speech failed.");
+  fetchResponse = () => Promise.resolve(wav());
+  failPlay = true;
+  const beforeFailure = dismissals;
+  await tap();
+  assert.equal(events.at(-1), "Speech failed.");
+  assert.equal(dismissals, beforeFailure);
+  assert.equal(terminalSpeechUrl, null);
+  failPlay = false;
+  failUnlock = true;
+  await tap(); // Rejected silent unlock is handled; real playback may still succeed.
+  assert.equal(dismissals, beforeFailure + 1);
+  failUnlock = false;
+
+  let releaseOld;
+  fetchResponse = () => new Promise(resolve => { releaseOld = resolve; });
+  const old = tap();
+  await flush();
+  const oldRequest = requests.at(-1);
+  fetchResponse = () => Promise.resolve(wav());
+  const beforeReplacement = dismissals;
+  await tap();
+  const currentUrl = terminalSpeechUrl;
+  assert.equal(oldRequest.signal.aborted, true);
+  releaseOld(wav(503));
+  await old;
+  assert.equal(terminalSpeechUrl, currentUrl);
+  assert.equal(dismissals, beforeReplacement + 1);
+  assert.equal(events.at(-1), "Speaking terminal selection.");
+
+  let releaseBlob;
+  fetchResponse = () => Promise.resolve({ ...wav(), blob: () => new Promise(resolve => { releaseBlob = resolve; }) });
+  const delayedBlob = tap();
+  await flush();
+  fetchResponse = () => Promise.resolve(wav());
+  await tap();
+  const replacementUrl = terminalSpeechUrl;
+  const replacementDismissals = dismissals;
+  releaseBlob({});
+  await delayedBlob;
+  assert.equal(terminalSpeechUrl, replacementUrl);
+  assert.equal(dismissals, replacementDismissals);
+
+  let rejectOldPlay;
+  const play = terminalSpeechAudio.play;
+  terminalSpeechAudio.play = function() { return new Promise((_resolve, reject) => { rejectOldPlay = reject; }); };
+  const delayedPlay = tap();
+  await flush();
+  terminalSpeechAudio.play = play;
+  await tap();
+  const playingUrl = terminalSpeechUrl;
+  const playingDismissals = dismissals;
+  rejectOldPlay(Error("interrupted"));
+  await delayedPlay;
+  assert.equal(terminalSpeechUrl, playingUrl);
+  assert.equal(dismissals, playingDismissals);
+  assert.equal(events.at(-1), "Speaking terminal selection.");
+
+  const beforeEmpty = requests.length;
+  selection = " \t\n";
+  await tap();
+  assert.equal(requests.length, beforeEmpty);
+  assert.equal(terminalSpeechUrl, playingUrl);
+  const beforeError = dismissals;
+  terminalSpeechAudio.onerror();
+  assert.equal(terminalSpeechUrl, null);
+  assert.equal(dismissals, beforeError);
+  assert.equal(events.at(-1), "Speech failed.");
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''',
+        ]))
+
+    def test_speak_chip_is_always_visible_and_preserves_tap_deduplication(self):
+        self.run_node_source("\n".join([
+            'const assert = require("node:assert/strict");',
+            extract_function("ensureSelectionHandles"),
+            r'''
+const document = { createElement() { return {
+  children: [], dataset: {}, listeners: {}, hidden: false,
+  append(...children) { this.children.push(...children); },
+  appendChild(child) { this.append(child); },
+  setAttribute() {},
+  addEventListener(type, callback) { this.listeners[type] = callback; },
+}; } };
+const terminalElement = document.createElement();
+let termSelHandles = null, inTap = false, speeches = 0, copies = 0, pastes = 0;
+const TERM_LONGPRESS_SLOP = 12;
+const performance = { now: () => 1000 };
+function attachHandleDrag() {}
+function dismissTerminalSelection() {}
+async function speakTerminalSelectionAndDismiss() { assert.equal(inTap, true); speeches += 1; }
+async function copyTerminalSelectionAndDismiss() { copies += 1; }
+async function pasteSelectionToRecentTabAndDismiss() { pastes += 1; }
+const handles = ensureSelectionHandles();
+assert.deepEqual(handles.chips.children.map(chip => chip.textContent), ["Copy", "To tab", "Speak"]);
+assert.equal(handles.speak.hidden, false); // No Web Speech API exists in this harness.
+const event = { preventDefault() {}, stopPropagation() {}, touches: [{ clientX: 10, clientY: 20 }] };
+function tap(type) {
+  inTap = true;
+  try { handles.speak.listeners[type](event); } finally { inTap = false; }
+}
+tap("click");
+handles.speak.listeners.touchstart(event);
+tap("touchend");
+tap("click");
+assert.equal(speeches, 2);
+handles.speak.listeners.touchstart(event);
+handles.speak.listeners.touchmove({ ...event, touches: [{ clientX: 40, clientY: 20 }] });
+tap("touchend");
+assert.equal(speeches, 2);
+handles.copy.listeners.click(event);
+handles.paste.listeners.click(event);
+assert.deepEqual([copies, pastes], [1, 1]);
+''',
+        ]))
+        self.assertIn("initializeTerminalSpeech();", APP_JS)
+        self.assertNotIn("speak.hidden", extract_function("ensureSelectionHandles"))
+
+
     def test_toolbar_prefers_above_flips_below_and_clamps_all_edges(self):
         self.run_node(
             ["clampSelectionValue", "computeSelectionToolbarPlacement"],
@@ -364,6 +587,17 @@ const placement = computeSelectionToolbarPlacement(
 assert.deepEqual(placement, {
   left: 12, top: 38, side: "above", maxWidth: 80, overflowX: true,
 });
+// Three sibling chips still fit a phone, or scroll inside its safe bounds.
+for (const width of [260, 390]) {
+  const bounds = { left: 12, top: 10, right: width - 12, bottom: 500, width: width - 24, height: 490 };
+  const threeChips = computeSelectionToolbarPlacement(
+    { left: width - 40, top: 90, right: width - 12, bottom: 110 },
+    { width: 250, height: 44 }, bounds, 8,
+  );
+  assert.ok(threeChips.left >= bounds.left);
+  assert.ok(threeChips.left + Math.min(250, threeChips.maxWidth) <= bounds.right);
+  assert.equal(threeChips.overflowX, 250 > bounds.width);
+}
 ''',
         )
 
@@ -1257,7 +1491,7 @@ assert.deepEqual(
             "  function ensureSelectionHandles()",
             "  // Reposition the handles",
         )
-        self.assertIn("chips.append(copy, paste);", handles)
+        self.assertIn("chips.append(copy, paste, speak);", handles)
         self.assertIn('magnifier.setAttribute("aria-hidden", "true");', handles)
         self.assertIn("layer.append(start, end, chips, magnifier);", handles)
         self.assertIn('btn.addEventListener(\n        "touchend"', handles)
