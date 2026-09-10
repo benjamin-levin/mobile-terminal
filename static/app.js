@@ -4603,6 +4603,16 @@
     return false;
   }
 
+  function authenticationOriginError(location = window.location, secureContext = window.isSecureContext) {
+    if (!secureContext) {
+      return "Use an HTTPS hostname to connect. Passkeys are unavailable over plain HTTP; on this computer, use http://localhost.";
+    }
+    if (/^[0-9.]+$/.test(location.hostname) || location.hostname.includes(":")) {
+      return "Use an HTTPS hostname instead of an IP address. On this computer, use http://localhost.";
+    }
+    return "";
+  }
+
   async function startAuthenticationClient() {
     if (!(await loadServerConfig())) {
       showAuthConfigRetrying();
@@ -4610,8 +4620,23 @@
       return false;
     }
     stopAuthConfigPolling();
+    const originError =
+      (serverConfig.passkeyAuth || profiles.some((profile) => profile.deviceKeyAuth))
+        ? authenticationOriginError()
+        : "";
+    if (originError) {
+      closeBootSocket();
+      setPasskeyLocked(true);
+      setPasskeyRetryUi(false);
+      loginOverlay.classList.remove("hidden");
+      tokenFieldLabel.classList.add("hidden");
+      tokenInput.classList.add("hidden");
+      loginSubmitButton.classList.add("hidden");
+      loginMessage.textContent = originError;
+      return false;
+    }
     const authenticationReady = await prepareAuthenticationClient();
-    if (!serverConfig.requireToken) {
+    if (authenticationReady && !serverConfig.requireToken) {
       loginOverlay.classList.add("hidden");
     }
     if (authenticationReady) {

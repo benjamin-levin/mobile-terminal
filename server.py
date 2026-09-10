@@ -4803,6 +4803,19 @@ class AppServer:
         if override:
             return override
         host = connection.request.headers.get("Host", "") or self.host
+        # HTTP localhost is a secure browser context. Keep remote origins HTTPS
+        # and require a same-host, loopback request for this development case.
+        try:
+            local_request = ipaddress.ip_address(connection.remote_address[0]).is_loopback
+            localhost = urlsplit(f"//{host}").hostname == "localhost"
+        except (ValueError, TypeError, IndexError, AttributeError):
+            local_request = localhost = False
+        if (
+            local_request
+            and localhost
+            and connection.request.headers.get("Origin") == f"http://{host}"
+        ):
+            return f"http://{host}"
         return f"https://{host}"
 
     def passkey_auth(self, connection: ServerConnection) -> PasskeyAuth:

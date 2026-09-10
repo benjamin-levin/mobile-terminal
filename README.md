@@ -31,7 +31,7 @@ cd /path/to/mobile-terminal
 ./run.sh --host 0.0.0.0 --port 8085 --session mobile-terminal
 ```
 
-The server reports whether access-token authentication is configured but never prints the token value. Configure `MOBILE_TERMINAL_TOKEN` in the owner-only `mobile-terminal.env` file before starting; `run.sh` loads that file and refuses to use any interpreter except this checkout's `.venv/bin/python`. Then open `http://<this-computer-ip>:8085` on your phone. Use `--no-token` only with the documented Tailscale, allowlist, or loopback safeguards.
+The server reports whether access-token authentication is configured but never prints the token value. Configure `MOBILE_TERMINAL_TOKEN` in the owner-only `mobile-terminal.env` file before starting; `run.sh` loads that file and refuses to use any interpreter except this checkout's `.venv/bin/python`. Open the application's HTTPS hostname on your phone. Fresh browsers enroll a passkey, which requires a secure origin and a hostname rather than an IP address. For local development on this computer, use `http://localhost:8085`. Use `--no-token` only with the documented Tailscale, allowlist, or loopback safeguards; it does not bypass passkey enrollment.
 
 ## Useful options
 
@@ -182,7 +182,7 @@ That setup enables tmux copy-mode on scroll and matches the scroll direction exp
 - Session switches do not preload tmux history anymore. The browser reconnects to the new session first, then streams live output, which avoids large-history freezes on heavy sessions.
 - Mobile composer sync is trigger-based. It updates on explicit recall and edit actions instead of scanning terminal output continuously, which keeps full-screen apps from stalling the UI.
 - The UI stores the access token and shortcut layout in browser local storage.
-- Traffic is plain HTTP and WebSocket. That is fine on a trusted LAN, but use a VPN, Tailscale, or HTTPS reverse proxy if you want to access it across untrusted networks.
+- The backend speaks HTTP and WebSocket. Put it behind HTTPS with a hostname for browser passkey authentication; a VPN alone does not make an HTTP LAN origin eligible for WebAuthn. HTTP localhost works for development on the same computer.
 
 ## Install
 
