@@ -1677,7 +1677,7 @@ def _validated_client_selection_rows(
     rows: int,
     start_y: int,
     end_y: int,
-) -> tuple[tuple[int, str, tuple[tuple[int, int, str], ...]], ...]:
+) -> tuple[tuple[int, str, tuple[tuple[int, int, str], ...], bool], ...]:
     if (
         not isinstance(value, list)
         or not value
@@ -1701,8 +1701,10 @@ def _validated_client_selection_rows(
         y = row.get("y")
         text = row.get("text")
         styles = row.get("styles")
+        is_wrapped = row.get("isWrapped", False)
         if (
-            isinstance(y, bool)
+            type(is_wrapped) is not bool
+            or isinstance(y, bool)
             or not isinstance(y, int)
             or y != start_y + index
             or not 0 <= y < rows
@@ -1735,21 +1737,23 @@ def _validated_client_selection_rows(
             previous_end = style_end
         if previous_end != cols:
             raise ValueError("invalid client selection style")
-        validated.append((y, text, tuple(validated_styles)))
+        validated.append((y, text, tuple(validated_styles), is_wrapped))
     return tuple(validated)
 
 
 def _extract_client_selection_rows(
-    client_rows: tuple[tuple[int, str, tuple[tuple[int, int, str], ...]], ...],
+    client_rows: tuple[tuple[int, str, tuple[tuple[int, int, str], ...], bool], ...],
     start_x: int,
     end_x: int,
 ) -> str:
     pieces = []
-    for index, (_, text, _) in enumerate(client_rows):
+    for index, (_, text, _, is_wrapped) in enumerate(client_rows):
         row_start = start_x if index == 0 else 0
         row_end = end_x if index + 1 == len(client_rows) else 0x7FFFFFFF
+        if index > 0 and not is_wrapped:
+            pieces.append("\n")
         pieces.append(_slice_client_row_display_cells(text, row_start, row_end))
-    return "\n".join(pieces)
+    return "".join(pieces)
 
 
 def unwrap_selected_url(text: str) -> str:
@@ -4320,7 +4324,7 @@ class TmuxBridge:
         ):
             return reject("geometry-buffer-base-mismatch")
         client_selection_rows: tuple[
-            tuple[int, str, tuple[tuple[int, int, str], ...]], ...
+            tuple[int, str, tuple[tuple[int, int, str], ...], bool], ...
         ] = ()
         normal_client_wraps: tuple[bool, ...] = ()
         if buffer_type == "normal" and "clientRows" in payload:
@@ -4487,7 +4491,7 @@ class TmuxBridge:
                             relative_start_row,
                             end_x,
                             relative_end_row,
-                            client_rows=client_selection_rows,
+                            client_rows=tuple(row[:3] for row in client_selection_rows),
                         )
                         observe_provider_result(provider)
                         if provider.owned:

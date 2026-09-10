@@ -176,7 +176,7 @@ class AuthoritativeSelectionTest(unittest.TestCase):
         )
 
     def test_client_row_slicing_clamps_wide_grapheme_boundaries(self):
-        client_rows = ((0, "😀界X", ((0, 5, "plain"),)),)
+        client_rows = ((0, "😀界X", ((0, 5, "plain"),), False),)
 
         cases = (
             (0, 1, "😀"),
@@ -190,6 +190,17 @@ class AuthoritativeSelectionTest(unittest.TestCase):
                     server._extract_client_selection_rows(client_rows, start, end),
                     expected,
                 )
+
+    def test_client_row_validation_retains_wrap_flags_and_defaults_to_hard_line(self):
+        for wrap_field, expected in (({}, False), ({"isWrapped": False}, False),
+                                     ({"isWrapped": True}, True)):
+            with self.subTest(wrap_field=wrap_field):
+                rows = server._validated_client_selection_rows(
+                    [{"y": 0, "text": "KEEP    ", "styles": [[0, 8, "plain"]],
+                      **wrap_field}],
+                    8, 1, 0, 0,
+                )
+                self.assertEqual(rows, ((0, "KEEP    ", ((0, 8, "plain"),), expected),))
 
     def test_exact_tmux_views_define_soft_rows_and_hard_boundaries(self):
         pane = snapshot(
@@ -3873,6 +3884,11 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
             [{"y": 1, "text": "KEEP    ", "styles": [[0, 8, "plain"]]}],
             [{"y": 0, "text": "KEEP    ", "styles": [[0, 9, "plain"]]}],
             [{"y": 0, "text": "KEEP    ", "styles": [[0, 4, "private"]]}],
+            *(
+                [{"y": 0, "text": "KEEP    ", "styles": [[0, 8, "plain"]],
+                  "isWrapped": value}]
+                for value in (None, 0, 1, "true", "false", [], {})
+            ),
         )
         for index, client_rows in enumerate(invalid_rows):
             with self.subTest(index=index), mock.patch(
@@ -4011,6 +4027,69 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.authority, "terminal-raw")
         self.assertIsNone(result.error)
+
+    async def test_alternate_terminal_raw_fallback_uses_client_wrap_boundaries(self):
+        cases = (
+            ("two wrapped rows", ("Copy thi", "s text  "), (False, True),
+             0, 6, "Copy this text"),
+            ("three wrapped rows", ("abcdefgh", "ijklmnop", "qrst    "),
+             (False, True, True), 0, 4, "abcdefghijklmnopqrst"),
+            ("hard lines", ("first   ", "second  "), (False, False),
+             0, 6, "first   \nsecond"),
+            ("mixed boundaries", ("abcdefgh", "ijklmnop", "hard    ", "tail    "),
+             (False, True, False, True), 0, 4, "abcdefghijklmnop\nhard    tail"),
+            ("missing flags", ("first   ", "second  "), (None, None),
+             0, 6, "first   \nsecond"),
+            ("starts on continuation", ("abcdefgh", "ijklmnop"), (True, True),
+             2, 4, "cdefghijkl"),
+            ("wrap boundary spaces", ("a word  ", " next   "), (False, True),
+             0, 5, "a word   next"),
+        )
+        for name, pieces, wraps, start_x, end_x, expected in cases:
+            with self.subTest(name=name):
+                pane = replace(
+                    snapshot(cols=8, authored_lines=["changed"] * len(pieces),
+                             rows=len(pieces)),
+                    alternate=True,
+                    seed_history=0,
+                    history=0,
+                )
+                bridge, payload = self.make_bridge(pane)
+                payload.update(
+                    {
+                        "bufferType": "alternate",
+                        "baseY": 0,
+                        "selection": {
+                            "start": {"x": start_x, "y": 0},
+                            "end": {"x": end_x, "y": len(pieces) - 1},
+                        },
+                        "clientRows": [
+                            {
+                                "y": index,
+                                "text": text,
+                                "styles": [[0, 8, "plain"]],
+                                **({"isWrapped": wraps[index]}
+                                   if wraps[index] is not None else {}),
+                            }
+                            for index, text in enumerate(pieces)
+                        ],
+                    }
+                )
+                provider = mock.Mock(owned=False, text=None, authority="terminal-raw")
+                with (
+                    mock.patch("server.capture_pane_snapshot", return_value=pane),
+                    mock.patch("server.provider_selection", return_value=provider) as select,
+                ):
+                    result = await bridge.authoritative_selection_result(payload)
+
+                self.assertEqual(result.text, expected)
+                self.assertEqual(result.authority, "terminal-raw")
+                self.assertIsNone(result.error)
+                self.assertEqual(
+                    select.call_args.kwargs["client_rows"],
+                    tuple((index, text, ((0, 8, "plain"),))
+                          for index, text in enumerate(pieces)),
+                )
 
     async def test_alternate_provider_exact_accepts_client_emoji_rows(self):
         pane = replace(
