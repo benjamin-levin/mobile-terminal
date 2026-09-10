@@ -59,14 +59,22 @@ assert.equal(normalizeTerminalCopyText("crlf\r\nlone-cr\rfinal\r\n"),
         self.assertNotIn("staleVisualContinuationText", APP_JS)
         self.assertNotIn("extractTerminalSelectionText", APP_JS)
         self.assertNotIn("terminalSelectionText", APP_JS)
-        # Only Speak snapshots client text before awaiting authenticated TTS.
+        # Speak normalizes authoritative server text before authenticated TTS.
         speech = extract_function("speakTerminalSelection")
         self.assertIn("async function speakTerminalSelection", speech)
-        self.assertIn("normalizeTerminalCopyText(term.getSelection())", speech)
-        self.assertLess(speech.index("term.getSelection()"), speech.index("await "))
+        self.assertIn("const selection = await requestAuthoritativeSelection();", speech)
+        self.assertIn("const text = normalizeTerminalCopyText(selection.text);", speech)
+        self.assertLess(
+            speech.index("await requestAuthoritativeSelection()"),
+            speech.index("normalizeTerminalCopyText(selection.text)"),
+        )
+        self.assertLess(
+            speech.index("normalizeTerminalCopyText(selection.text)"),
+            speech.index("await requestTerminalSpeechAuth()"),
+        )
         self.assertIn('fetch("/tts", {', speech)
         self.assertIn("body: JSON.stringify({ text })", speech)
-        self.assertNotIn("requestAuthoritativeSelection", speech)
+        self.assertNotIn("normalizeTerminalCopyText(term.getSelection())", speech)
         self.assertNotIn(
             "term.getSelection()", APP_JS.replace(extract_function("speakTerminalSelection"), "")
         )
