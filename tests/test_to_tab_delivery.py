@@ -34,8 +34,15 @@ class ToTabDeliveryTest(unittest.TestCase):
                 extract_function("sendDirectPtyPaste"),
                 extract_function("handlePendingPasteReady"),
                 extract_function("nextComposerRevision"),
+                extract_function("composerDraftKey"),
+                extract_function("syncComposerState"),
                 extract_function("deliverPendingPasteToComposer"),
                 r'''
+const term = { modes: { bracketedPasteMode: true } };
+const stagedComposerDrafts = new Map();
+const currentUser = "test";
+const activeProfileId = "test";
+let suppressComposerSync = false;
 function isBtopSession(name) { return String(name || "").startsWith("btop-"); }
 function makeComposer(value = "", cursor = value.length, disabled = false) {
   return {
@@ -43,6 +50,7 @@ function makeComposer(value = "", cursor = value.length, disabled = false) {
     disabled,
     selectionStart: cursor,
     selectionEnd: cursor,
+    setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; },
     setRangeText(text, start, end) {
       this.value = this.value.slice(0, start) + text + this.value.slice(end);
       this.selectionStart = start + text.length;
@@ -89,7 +97,7 @@ composerInput = makeComposer("", 0);
 assert.equal(deliverPendingPasteToComposer(4), true);
 assert.equal(composerInput.value, "selected");
 assert.deepEqual(sent, [{
-  type: "composer-sync", value: "selected", cursor: 8, revision: 5,
+  type: "composer-sync", session: "destination", value: "selected", cursor: 8, revision: 5,
 }]);
 assert.equal(pendingPasteAfterSwitch, null);
 assert.deepEqual(toasts, ["Pasted into this tab."]);
@@ -121,7 +129,25 @@ assert.deepEqual(toasts, ["Pasted into this tab."]);
 '''
         )
 
-    def test_matching_direct_pty_ready_uses_single_line_boundary(self):
+    def test_failed_delivery_preserves_snapshot_and_retry_does_not_duplicate_text(self):
+        self.run_node(r'''
+let activeSessionName = "destination";
+let mobileComposerMode = true;
+let composerInput = makeComposer("existing ", 9);
+let composerRevision = 0;
+let pendingPasteAfterSwitch = { session: "destination", text: "a  b\n  c", ready: true };
+let queueMessages = false;
+let sent = [], toasts = [], speechResets = 0;
+assert.equal(deliverPendingPasteToComposer(4), false);
+assert.equal(composerInput.value, "existing ");
+assert.equal(pendingPasteAfterSwitch.text, "a  b\n  c");
+queueMessages = true;
+assert.equal(deliverPendingPasteToComposer(5), true);
+assert.equal(composerInput.value, "existing a  b\n  c");
+assert.equal(pendingPasteAfterSwitch, null);
+''')
+
+    def test_matching_direct_pty_ready_preserves_whitespace_in_brackets(self):
         self.run_node(
             r'''
 let activeSessionName = "destination";
@@ -137,7 +163,7 @@ let toasts = [];
 let speechResets = 0;
 
 assert.equal(handlePendingPasteReady(), true);
-assert.deepEqual(sent, [{ type: "input", data: "alpha beta gamma" }]);
+assert.deepEqual(sent, [{ type: "input", data: "\x1b[200~ alpha \n  beta\n gamma \x1b[201~" }]);
 assert.equal(speechResets, 1);
 assert.equal(pendingPasteAfterSwitch, null);
 assert.deepEqual(toasts, ["Pasted into this tab."]);
@@ -233,14 +259,14 @@ assert.deepEqual(toasts, ["This tab doesn't accept pasted text."]);
 '''
         )
 
-    def test_normalized_empty_direct_paste_is_not_sent_or_toasted(self):
+    def test_empty_direct_paste_is_not_sent_or_toasted(self):
         self.run_node(
             r'''
 let activeSessionName = "destination";
 let mobileComposerMode = false;
 let composerInput = makeComposer();
 let composerRevision = 0;
-let pendingPasteAfterSwitch = { session: "destination", text: " \t\r\n \t ", ready: false };
+let pendingPasteAfterSwitch = { session: "destination", text: "", ready: false };
 let queueMessages = true;
 let sent = [];
 let toasts = [];

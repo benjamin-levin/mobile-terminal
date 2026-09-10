@@ -1034,6 +1034,12 @@ button:disabled {
   transition: transform 160ms ease, opacity 160ms ease;
 }
 
+.composer-draft-status {
+  padding: 4px 10px;
+  font-size: var(--body-font);
+  color: var(--text-main);
+}
+
 .composer-input {
   display: block;
   width: 100%;

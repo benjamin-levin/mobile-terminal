@@ -120,6 +120,7 @@
   const shortcutsPanel = document.getElementById("shortcutsPanel");
   const composerPanel = document.getElementById("composerPanel");
   const composerInput = document.getElementById("composerInput");
+  const composerDraftStatus = document.getElementById("composerDraftStatus");
   const clearComposerButton = document.getElementById("clearComposerButton");
   const loginOverlay = document.getElementById("loginOverlay");
   const loginForm = document.getElementById("loginForm");
@@ -794,6 +795,8 @@
   let suppressComposerSync = false;
   let composerRevision = 0;
   let latestAppliedComposerRevision = 0;
+  // Unsynchronized multiline drafts belong to their tab, including reconnects.
+  const stagedComposerDrafts = new Map();
   let semanticPromptState = {
     seenMarker: false,
     commandActive: false,
@@ -1497,7 +1500,7 @@
     openComposer(focus);
     composerInput.setRangeText(text, composerInput.selectionStart, composerInput.selectionEnd, "end");
     autoSizeComposer();
-    syncComposerState();
+    syncComposerState(false, true);
   }
 
   function composerHasKeyboardFocus() {
@@ -1788,13 +1791,9 @@
     }
   }
 
-  // Direct PTY paste remains deliberately single-line so a multi-line paste does
-  // not submit each line early. Composer paste keeps the normalized line breaks.
+  // Paste preserves authored whitespace. Only platform line endings normalize.
   function normalizeDirectPtyPasteText(text) {
-    return normalizeTerminalCopyText(text)
-      .replace(/[ \t]*\n[ \t]*/g, " ")
-      .replace(/ {2,}/g, " ")
-      .trim();
+    return normalizeTerminalCopyText(text);
   }
 
   function sendDirectPtyPaste(text) {
@@ -1802,7 +1801,16 @@
     if (!normalizedText) {
       return false;
     }
-    return sendMessage({ type: "input", data: normalizedText });
+    const bracketed = term.modes.bracketedPasteMode;
+    if (!bracketed && /\n/.test(normalizedText) && !window.confirm(
+      `This terminal cannot safely stage multiple lines. Paste may execute each line. Paste this text?\n\n${normalizedText}`,
+    )) {
+      return false;
+    }
+    return sendMessage({
+      type: "input",
+      data: bracketed ? `\x1b[200~${normalizedText}\x1b[201~` : normalizedText,
+    });
   }
 
   async function copyTerminalSelection() {
@@ -1961,6 +1969,9 @@
       return false;
     }
     composerRevision = Math.max(composerRevision, revision);
+    const previousValue = composerInput.value;
+    const previousStart = composerInput.selectionStart;
+    const previousEnd = composerInput.selectionEnd;
     openComposer(true);
     composerInput.setRangeText(
       pending.text,
@@ -1969,13 +1980,11 @@
       "end",
     );
     autoSizeComposer();
-    const queued = sendMessage({
-      type: "composer-sync",
-      value: composerInput.value,
-      cursor: composerInput.selectionEnd ?? composerInput.value.length,
-      revision: nextComposerRevision(),
-    });
+    const queued = syncComposerState(false, true);
     if (!queued) {
+      composerInput.value = previousValue;
+      composerInput.setSelectionRange(previousStart, previousEnd);
+      autoSizeComposer();
       return false;
     }
     pendingPasteAfterSwitch = null;
@@ -3501,8 +3510,15 @@
     if (!mobileComposerMode) {
       return;
     }
+    const staged = stagedComposerDrafts.get(composerDraftKey());
+    composerDraftStatus.classList.toggle("hidden", !staged);
+    if (staged) {
+      value = staged.value;
+      cursor = staged.cursor;
+    }
     const nextValue = String(value || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const numericCursor = Number.isFinite(Number(cursor)) ? Number(cursor) : nextValue.length;
+    const numericCursor = cursor !== null && cursor !== undefined && Number.isFinite(Number(cursor))
+      ? Number(cursor) : nextValue.length;
     const nextCursor = Math.max(0, Math.min(nextValue.length, numericCursor));
     suppressComposerSync = true;
     composerInput.value = nextValue;
@@ -3517,13 +3533,32 @@
     });
   }
 
-  function syncComposerState() {
-    if (!mobileComposerMode || suppressComposerSync) {
-      return;
+  function composerDraftKey(sessionName = activeSessionName) {
+    return JSON.stringify([currentUser, activeProfileId, sessionName]);
+  }
+
+  function syncComposerState(submit = false, explicit = false) {
+    if (!mobileComposerMode || (suppressComposerSync && !submit && !explicit)) {
+      return false;
     }
-    sendMessage({
+    const key = composerDraftKey();
+    if (!submit && (stagedComposerDrafts.has(key) || (/\n/.test(composerInput.value) && !term.modes.bracketedPasteMode))) {
+      if (!stagedComposerDrafts.has(key)) {
+        showToast("Multiline draft saved in this tab. Press Enter to send it.");
+      }
+      stagedComposerDrafts.set(key, {
+        ...stagedComposerDrafts.get(key),
+        value: composerInput.value,
+        cursor: composerInput.selectionEnd ?? composerInput.value.length,
+      });
+      composerDraftStatus.classList.remove("hidden");
+      return true;
+    }
+    return sendMessage({
       type: "composer-sync",
+      session: activeSessionName,
       value: composerInput.value,
+      // Textarea and wire cursors are UTF-16; the server converts at its boundary.
       cursor: composerInput.selectionEnd ?? composerInput.value.length,
       revision: nextComposerRevision(),
     });
@@ -3533,6 +3568,7 @@
     if (!mobileComposerMode) {
       return;
     }
+    stagedComposerDrafts.delete(composerDraftKey());
     setComposerValue("", 0);
     composerInput.style.height = "";
     resetSpeechInputState();
@@ -3563,13 +3599,45 @@
       sendMessage({ type: "input", data: "\r" });
       return;
     }
-    sendMessage({ type: "composer-enter", revision: nextComposerRevision() });
+    const draft = stagedComposerDrafts.get(composerDraftKey());
+    if (draft) {
+      if (selectedSessionName && selectedSessionName !== activeSessionName) {
+        showToast("Wait for this tab to connect before sending.");
+        return;
+      }
+      // Keep the draft until the server acknowledges this one submit request.
+      // Retries reuse its ID. The running server remembers its last 64 submits
+      // per tab; this does not guarantee deduplication after a server restart.
+      if (!draft.submission) {
+        const unbracketed = !term.modes.bracketedPasteMode;
+        if (unbracketed && /\n/.test(composerInput.value) && !window.confirm(
+          `This terminal cannot safely stage multiple lines. Sending may execute each line. Send this text?\n\n${composerInput.value}`,
+        )) {
+          return;
+        }
+        draft.submission = {
+          requestId: crypto.randomUUID(),
+          value: composerInput.value,
+          cursor: composerInput.value.length,
+          allowUnbracketedMultiline: unbracketed,
+        };
+      }
+      sendMessage({ type: "composer-enter", session: activeSessionName,
+        ...draft.submission, revision: nextComposerRevision() });
+      return;
+    }
+    if (!sendMessage({ type: "composer-enter", revision: nextComposerRevision() })) {
+      return;
+    }
     clearComposer(false);
     openComposer(true);
   }
 
   function resetComposerTracking(clearValue = false) {
     if (!mobileComposerMode) {
+      return;
+    }
+    if (stagedComposerDrafts.has(composerDraftKey())) {
       return;
     }
     sendMessage({ type: "composer-reset", revision: nextComposerRevision() });
@@ -3581,6 +3649,10 @@
   function navigateComposerHistory(direction, focus = true) {
     if (!mobileComposerMode) {
       sendMessage({ type: "input", data: direction === "down" ? specialMap.DOWN : specialMap.UP });
+      return;
+    }
+    if (stagedComposerDrafts.has(composerDraftKey())) {
+      showToast("Send or clear this draft before browsing terminal history.");
       return;
     }
     openComposer(focus);
@@ -4195,7 +4267,7 @@
   }
 
   function flushSemanticComposerState(force = false) {
-    if (!mobileComposerMode) {
+    if (!mobileComposerMode || stagedComposerDrafts.has(composerDraftKey())) {
       return;
     }
 
@@ -4260,7 +4332,7 @@
   }
 
   function flushTerminalBufferComposerState(force = false) {
-    if (!mobileComposerMode || semanticPromptState.seenMarker) {
+    if (!mobileComposerMode || semanticPromptState.seenMarker || stagedComposerDrafts.has(composerDraftKey())) {
       return;
     }
 
@@ -4703,6 +4775,9 @@
     if (!applicationProtocolReady || !socket || socket.readyState !== WebSocket.OPEN) {
       return false;
     }
+    if (String(payload?.type || "").startsWith("composer-")) {
+      payload = { session: activeSessionName, ...payload };
+    }
     if (
       payload &&
       [
@@ -4912,7 +4987,7 @@
   }
 
   function terminalReplayBaselineSequence() {
-    return "\x1b[0m\x0f\x1b(B\x1b[?1l\x1b[?6l\x1b[?7l\x1b[4l\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b>\x1b[r\x1b[H";
+    return "\x1b[0m\x0f\x1b(B\x1b[?1l\x1b[?6l\x1b[?7l\x1b[4l\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b>\x1b[r\x1b[H";
   }
 
   function terminalTabStopsSequence(meta) {
@@ -4940,6 +5015,7 @@
     if (meta.mouseButton) sequence += "\x1b[?1002h";
     if (meta.mouseAny) sequence += "\x1b[?1003h";
     if (meta.mouseSgr) sequence += "\x1b[?1006h";
+    if (meta.bracketedPaste === true) sequence += "\x1b[?2004h";
     if (meta.origin) sequence += "\x1b[?6h";
     if (meta.cursorFlag) sequence += "\x1b[?25h";
     sequence += `\x1b[${terminalCursorStyle(meta)} q`;
@@ -6827,8 +6903,7 @@
           return;
         }
         if (mobileComposerMode && normalizedSequence === "{ENTER}") {
-          sendMessage({ type: "composer-enter", revision: nextComposerRevision() });
-          clearComposer(false);
+          commitComposerLine();
           restoreShortcutKeyboardState(shortcutKeyboardWasFocused);
           return;
         }
@@ -8842,7 +8917,44 @@
       }
       return;
     }
+    if (payload.type === "composer-submitted") {
+      const key = composerDraftKey(payload.session);
+      const draft = stagedComposerDrafts.get(key);
+      if (draft?.submission?.requestId === payload.requestId) {
+        if (draft.value === draft.submission.value) {
+          stagedComposerDrafts.delete(key);
+          if (payload.session === activeSessionName) {
+            setComposerValue("", 0);
+          }
+        } else {
+          delete draft.submission;
+        }
+      }
+      return;
+    }
+    if (payload.type === "composer-rejected") {
+      const key = composerDraftKey(payload.session);
+      const draft = stagedComposerDrafts.get(key);
+      if (draft) {
+        if (draft.submission && payload.requestId !== draft.submission.requestId) {
+          return;
+        }
+        delete draft.submission;
+      } else if (typeof payload.value === "string") {
+        stagedComposerDrafts.set(key, payload.session === activeSessionName
+          ? { value: composerInput.value, cursor: composerInput.selectionEnd }
+          : { value: payload.value, cursor: payload.cursor });
+      }
+      if (payload.session === activeSessionName) {
+        setComposerValue(composerInput.value, composerInput.selectionEnd);
+        showToast(payload.error || "Draft retained. Try again when the terminal is ready.");
+      }
+      return;
+    }
     if (payload.type === "composer-state") {
+      if (payload.session && payload.session !== activeSessionName) {
+        return;
+      }
       if (mobileComposerMode && !isBtopSession(activeSessionName) && !composerInput.disabled) {
         if (
           semanticTrackingActive() &&
@@ -8958,6 +9070,12 @@
     if (payload.type === "session-renamed") {
       const previousName = payload.oldSession || "";
       const nextName = payload.session || previousName;
+      const oldDraftKey = composerDraftKey(previousName);
+      const draft = stagedComposerDrafts.get(oldDraftKey);
+      if (draft && nextName !== previousName) {
+        stagedComposerDrafts.set(composerDraftKey(nextName), draft);
+        stagedComposerDrafts.delete(oldDraftKey);
+      }
       replaceOpenTabName(previousName, nextName);
       currentSessions = currentSessions.map((session) =>
         session.name === previousName ? { ...session, name: nextName } : session,
@@ -10265,12 +10383,7 @@
       const text = await navigator.clipboard.readText();
       if (text) {
         if (mobileComposerMode) {
-          if (wasKeyboardFocused) {
-            insertComposerText(text, true);
-          } else {
-            resetComposerTracking(true);
-            sendDirectPtyPaste(text);
-          }
+          insertComposerText(text, wasKeyboardFocused);
           if (preserveKeyboardState) {
             restoreShortcutKeyboardState(wasKeyboardFocused);
           }
@@ -10351,9 +10464,15 @@
   }
 
   document.addEventListener("paste", (event) => {
+    // Capture before xterm's hidden textarea listener consumes the event.
+    // Other editors own their clipboard, including unsupported image pastes.
+    if (event.target !== composerInput && !isTerminalCopyTarget(event.target)) {
+      return;
+    }
     const imageFile = imageFileFromClipboard(event.clipboardData);
     if (imageFile) {
       event.preventDefault();
+      event.stopPropagation();
       handleImagePaste(imageFile);
       return;
     }
@@ -10362,16 +10481,13 @@
       return;
     }
     if (event.target === composerInput) {
-      window.setTimeout(() => {
-        autoSizeComposer();
-        syncComposerState();
-      }, 0);
-      return;
-    }
-    if (isEditableTarget(event.target)) {
+      event.preventDefault();
+      event.stopPropagation();
+      insertComposerText(text, true);
       return;
     }
     event.preventDefault();
+    event.stopPropagation();
     if (mobileComposerMode) {
       insertComposerText(text);
       return;
@@ -10379,7 +10495,7 @@
     resetSpeechInputState();
     sendDirectPtyPaste(text);
     focusTerminal();
-  });
+  }, true);
 
   passkeyLoginButton.addEventListener("click", () => {
     if (!passkeyRequiredScope) {
@@ -10791,6 +10907,9 @@
     syncComposerState();
   });
   composerInput.addEventListener("keydown", (event) => {
+    if (stagedComposerDrafts.has(composerDraftKey()) && event.key !== "Enter" && event.key !== "Escape") {
+      return; // Arrow keys and Tab edit the local draft until explicit submission.
+    }
     if (event.key === "Tab" && !event.altKey && !event.metaKey && !event.ctrlKey) {
       event.preventDefault();
       resetComposerTracking(true);

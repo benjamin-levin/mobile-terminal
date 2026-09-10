@@ -1079,6 +1079,7 @@ class PaneSnapshot:
     plain_physical_rows: list[str]
     authored_lines: list[str]
     history_limit: int = 0
+    bracketed_paste: bool | None = None
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -1086,6 +1087,7 @@ class PaneSnapshot:
             "history": self.history,
             "historyLimit": self.history_limit,
             "seedHistory": self.seed_history,
+            "bracketedPaste": self.bracketed_paste,
             "cols": self.cols,
             "rows": self.rows,
             "alternate": self.alternate,
@@ -1134,6 +1136,20 @@ def window_dimensions(session_name: str, pane_id: str | None = None) -> tuple[in
         raise RuntimeError("tmux returned invalid window dimensions") from exc
 
 
+# Only continuously observed modes can fill gaps in older tmux metadata. Keys
+# include both server and pane process identity, since pane IDs are reusable.
+_PANE_BRACKETED_PASTE: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def pane_mode_identity(session_name: str, pane_id: str) -> str:
+    result = tmux_capture("display-message", "-p", "-t", pane_id or session_name,
+                          "#{pid}:#{pane_pid}:#{pane_tty}", check=False)
+    identity = result.stdout.strip()
+    if result.returncode != 0 or not identity:
+        raise RuntimeError("active tmux pane identity is unavailable")
+    return identity
+
+
 def pane_metadata(session_name: str, pane_id: str | None = None) -> tuple[Any, ...]:
     target = pane_id or session_name
     result = tmux_capture(
@@ -1145,11 +1161,12 @@ def pane_metadata(session_name: str, pane_id: str | None = None) -> tuple[Any, .
         "\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_blinking}\t#{cursor_shape}"
         "\t#{insert_flag}\t#{keypad_cursor_flag}\t#{keypad_flag}\t#{origin_flag}\t#{wrap_flag}"
         "\t#{mouse_standard_flag}\t#{mouse_button_flag}\t#{mouse_any_flag}\t#{mouse_sgr_flag}"
-        "\t#{scroll_region_upper}\t#{scroll_region_lower}\t#{pane_tabs}\t#{history_limit}",
+        "\t#{scroll_region_upper}\t#{scroll_region_lower}\t#{pane_tabs}\t#{history_limit}"
+        "\t#{pane_private_modes}\t#{pid}:#{pane_pid}:#{pane_tty}",
         check=False,
     )
     fields = result.stdout.rstrip("\n").split("\t")
-    if result.returncode != 0 or len(fields) != 23 or not fields[0].startswith("%"):
+    if result.returncode != 0 or len(fields) != 25 or not fields[0].startswith("%"):
         raise RuntimeError("active tmux pane is unavailable")
     try:
         numeric = {
@@ -1166,6 +1183,8 @@ def pane_metadata(session_name: str, pane_id: str | None = None) -> tuple[Any, .
         *(numeric[index] for index in range(10, 21)),
         tab_stops,
         numeric[22],
+        ("2004" in fields[23].split(",")
+         if fields[23] else _PANE_BRACKETED_PASTE.get((fields[0], fields[24]), {}).get("enabled")),
     )
 
 
@@ -1201,6 +1220,7 @@ def capture_pane_snapshot(
         scroll_lower,
         tab_stops,
         history_limit,
+        bracketed_paste,
     ) = before
     seed_history = 0 if alternate else min(history, max(0, history_lines))
     start = str(-seed_history)
@@ -1262,6 +1282,7 @@ def capture_pane_snapshot(
         plain_physical_rows=plain_physical_rows,
         authored_lines=authored_lines,
         history_limit=history_limit,
+        bracketed_paste=bracketed_paste,
     )
 
 
@@ -2191,7 +2212,12 @@ def default_mobile_composer_state() -> dict[str, Any]:
         "revision": 0,
         "source": "reset",
         "provenanceStartAllowed": True,
+        "submittedRequests": [],
     }
+
+
+class ComposerPasteUnavailable(RuntimeError):
+    pass
 
 
 def clamp_cursor(value: str, cursor: Any) -> int:
@@ -2202,16 +2228,50 @@ def clamp_cursor(value: str, cursor: Any) -> int:
     return max(0, min(len(value), position))
 
 
+def utf16_cursor_to_codepoint(value: str, cursor: Any) -> int:
+    """Decode textarea wire offsets, snapping a split surrogate to its start."""
+    try:
+        remaining = max(0, int(cursor))
+    except (TypeError, ValueError):
+        return len(value)
+    for index, character in enumerate(value):
+        remaining -= 2 if ord(character) > 0xFFFF else 1
+        if remaining < 0:
+            return index
+    return len(value)
+
+
+def codepoint_cursor_to_utf16(value: str, cursor: Any) -> int:
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in value[:clamp_cursor(value, cursor)])
+
+
 def build_composer_sync_sequence(
     previous_value: str,
     previous_cursor: int,
     next_value: str,
     next_cursor: int,
+    *,
+    bracketed_paste: bool = True,
 ) -> tuple[str, int]:
-    current_value = previous_value or ""
-    target_value = next_value or ""
-    current_cursor = clamp_cursor(current_value, previous_cursor)
-    target_cursor = clamp_cursor(target_value, next_cursor)
+    # Editing keys move over graphemes, not UTF-16 units or Python code points.
+    # Snap a cursor inside a cluster to its leading boundary.
+    current_text = previous_value or ""
+    target_text = next_value or ""
+    current_value = regex.findall(r"\X", current_text)
+    target_value = regex.findall(r"\X", target_text)
+    def cluster_cursor(clusters: list[str], offset: int) -> int:
+        consumed = 0
+        for index, cluster in enumerate(clusters):
+            consumed += len(cluster)
+            if consumed > offset:
+                return index
+        return len(clusters)
+    current_cursor = cluster_cursor(current_value, clamp_cursor(current_text, previous_cursor))
+    target_cursor = cluster_cursor(target_value, clamp_cursor(target_text, next_cursor))
+    if current_value == target_value:
+        movement = target_cursor - current_cursor
+        sequence = RIGHT_ARROW * movement if movement > 0 else LEFT_ARROW * -movement
+        return sequence, sum(len(cluster) for cluster in target_value[:target_cursor])
 
     common_prefix = 0
     max_prefix = min(len(current_value), len(target_value))
@@ -2229,8 +2289,9 @@ def build_composer_sync_sequence(
 
     delete_start = common_prefix
     delete_end = len(current_value) - common_suffix
-    insert_text = target_value[delete_start : len(target_value) - common_suffix]
-    edit_cursor = delete_start + len(insert_text)
+    insert_clusters = target_value[delete_start : len(target_value) - common_suffix]
+    insert_text = "".join(insert_clusters)
+    edit_cursor = delete_start + len(insert_clusters)
 
     sequence = ""
     move_to_delete_end = delete_end - current_cursor
@@ -2243,7 +2304,7 @@ def build_composer_sync_sequence(
     if delete_count > 0:
         sequence += "\u007f" * delete_count
     if insert_text:
-        if "\n" in insert_text:
+        if "\n" in insert_text and bracketed_paste:
             sequence += BRACKETED_PASTE_START + insert_text + BRACKETED_PASTE_END
         else:
             sequence += insert_text
@@ -2253,7 +2314,7 @@ def build_composer_sync_sequence(
         sequence += RIGHT_ARROW * move_to_target
     elif move_to_target < 0:
         sequence += LEFT_ARROW * abs(move_to_target)
-    return sequence, target_cursor
+    return sequence, sum(len(cluster) for cluster in target_value[:target_cursor])
 
 
 def unique_non_empty(values: list[str]) -> list[str]:
@@ -3076,6 +3137,9 @@ class TmuxBridge:
         self.selection_acks: dict[str, tuple[asyncio.Event, dict[str, Any]]] = {}
         self.selection_hold_request_id: str | None = None
         self.selection_row_identity: SnapshotRowIdentity | None = None
+        self.mode_identity: str | None = None
+        self.mode_sequence_tail = b""
+        self.mode_control_string = ""
         self.seed_degraded = False
         self.last_stabilize_attempt_at: float | None = None
         self.stabilize_task: asyncio.Task[None] | None = None
@@ -3115,6 +3179,7 @@ class TmuxBridge:
             self.read_task = asyncio.create_task(self.read_loop())
             await asyncio.wait_for(self.initial_block_seen.wait(), timeout=3)
             self.pane_id = str(pane_metadata(self.session_name)[0])
+            self._observe_pane_modes(self.pane_id)
             cols, rows = self.initial_size or (140, 40)
             await self.set_size(cols, rows)
             self.last_output_at = time.monotonic()
@@ -3122,6 +3187,27 @@ class TmuxBridge:
         except BaseException:
             await self.close()
             raise
+
+    def _forget_pane_modes(self) -> None:
+        key = (self.pane_id, self.mode_identity)
+        state = _PANE_BRACKETED_PASTE.get(key)
+        if state is not None:
+            state["observers"].discard(id(self))
+            if not state["observers"]:
+                _PANE_BRACKETED_PASTE.pop(key, None)
+        self.mode_identity = None
+        self.mode_sequence_tail = b""
+        self.mode_control_string = ""
+
+    def _observe_pane_modes(self, pane_id: str) -> None:
+        self._forget_pane_modes()
+        identity = pane_mode_identity(self.session_name, pane_id)
+        key = (pane_id, identity)
+        if key not in _PANE_BRACKETED_PASTE and len(_PANE_BRACKETED_PASTE) >= 512:
+            _PANE_BRACKETED_PASTE.pop(next(iter(_PANE_BRACKETED_PASTE)))
+        state = _PANE_BRACKETED_PASTE.setdefault(key, {"enabled": None, "observers": set()})
+        state["observers"].add(id(self))
+        self.mode_identity = identity
 
     async def command(self, command: str) -> list[bytes]:
         if not self.process or self.process.poll() is not None or self.process.stdin is None:
@@ -3220,6 +3306,46 @@ class TmuxBridge:
         if not data or pane_id != self.pane_id:
             return
         async with self.send_lock:
+            # Match only terminal control sequences, never mode-looking bytes inside
+            # OSC/DCS strings. Carry partial sequences across control output records.
+            mode_state = _PANE_BRACKETED_PASTE.get((pane_id, self.mode_identity))
+            mode_data = self.mode_sequence_tail + data
+            self.mode_sequence_tail = b""
+            index = 0
+            while index < len(mode_data):
+                if self.mode_control_string:
+                    end = mode_data.find(b"\x1b\\", index)
+                    bell = mode_data.find(b"\x07", index) if self.mode_control_string == "osc" else -1
+                    if bell >= 0 and (end < 0 or bell < end):
+                        index = bell + 1
+                    elif end >= 0:
+                        index = end + 2
+                    else:
+                        self.mode_sequence_tail = b"\x1b" if mode_data.endswith(b"\x1b") else b""
+                        break
+                    self.mode_control_string = ""
+                    continue
+                index = mode_data.find(b"\x1b", index)
+                if index < 0:
+                    break
+                sequence = mode_data[index:]
+                if len(sequence) == 1:
+                    self.mode_sequence_tail = sequence
+                    break
+                if sequence[1:2] in (b"]", b"P", b"_", b"^"):
+                    self.mode_control_string = "osc" if sequence[1:2] == b"]" else "dcs"
+                    index += 2
+                    continue
+                match = re.match(rb"\x1b\[\?([0-9;]+)([hl])|\x1bc", sequence)
+                if match is not None and mode_state is not None:
+                    if match.group(1) is None:
+                        mode_state["enabled"] = False
+                    elif b"2004" in match.group(1).split(b";"):
+                        mode_state["enabled"] = match.group(2) == b"h"
+                if len(sequence) <= 128 and re.fullmatch(rb"\x1b(?:\[(?:\?[0-9;]*)?)?", sequence):
+                    self.mode_sequence_tail = sequence
+                    break
+                index += len(match[0]) if match else 2
             record = {"start": self.offset, "end": self.offset + len(data), "data": data}
             self.offset = record["end"]
             self.last_output_at = time.monotonic()
@@ -3846,6 +3972,7 @@ class TmuxBridge:
                 self.phase = "hold"
                 self.held = []
                 if next_pane_id:
+                    self._forget_pane_modes()
                     self.pane_id = next_pane_id
                 self.epoch_state["epoch"] += 1
                 self.epoch_state["layout"] += 1
@@ -3892,6 +4019,8 @@ class TmuxBridge:
                 return
             finally:
                 self.seed_start_acks.pop(epoch, None)
+            if next_pane_id:
+                await asyncio.to_thread(self._observe_pane_modes, next_pane_id)
             if mutate is not None:
                 await mutate()
             elif reason == "initial":
@@ -4570,6 +4699,7 @@ class TmuxBridge:
 
     async def close(self) -> None:
         self.closing = True
+        self._forget_pane_modes()
         stabilize_task = self.stabilize_task
         self.stabilize_task = None
         if stabilize_task is not None and stabilize_task is not asyncio.current_task():
@@ -4594,6 +4724,7 @@ class TmuxBridge:
                 if self.closed:
                     return
                 self.closed = True
+                self._forget_pane_modes()
                 process = self.process
                 owner_pid = process.pid if process else None
                 try:
@@ -5445,8 +5576,9 @@ class AppServer:
             connection,
             {
                 "type": "composer-state",
+                "session": session_name,
                 "value": state["draft"],
-                "cursor": state["cursor"],
+                "cursor": codepoint_cursor_to_utf16(state["draft"], state["cursor"]),
                 "tracked": state["tracked"],
                 "revision": state["revision"],
                 "source": state["source"],
@@ -5496,6 +5628,7 @@ class AppServer:
         revision: int | None = None,
         reset_history_index: bool = True,
         direct_provenance: bool = True,
+        allow_unbracketed_multiline: bool = False,
     ) -> dict[str, Any]:
         state = self.mobile_composer_state(session_name)
         provenance_state = self.command_provenance_state(session_name)
@@ -5506,6 +5639,17 @@ class AppServer:
             next_value,
             cursor,
         )
+        if BRACKETED_PASTE_START in sequence:
+            try:
+                bracketed = pane_metadata(session_name, bridge.pane_id)[-1] is True
+            except RuntimeError:
+                bracketed = False
+            if not bracketed:
+                if not allow_unbracketed_multiline:
+                    raise ComposerPasteUnavailable("Multiline paste mode is unavailable; draft retained.")
+                sequence, next_cursor = build_composer_sync_sequence(
+                    state["draft"], state["cursor"], next_value, cursor, bracketed_paste=False,
+                )
         active = provenance_state.active
         unavailable = provenance_state.unavailable
         can_continue = bool(
@@ -5955,6 +6099,14 @@ class AppServer:
         session_name = state["session"]
         user = state.get("user", "")
         message_type = payload.get("type")
+        if str(message_type).startswith("composer-") and payload.get("session", session_name) != session_name:
+            await self.send_json(connection, {
+                "type": "composer-rejected", "session": payload.get("session"),
+                "value": payload.get("value"), "cursor": payload.get("cursor"),
+                "requestId": payload.get("requestId"),
+                "error": "Tab changed; draft retained in its original tab.",
+            })
+            return
         input_data = ""
         if message_type == "input":
             candidate = payload.get("data", "")
@@ -5983,13 +6135,19 @@ class AppServer:
                 await self.settle_scroll_history(session_name)
             session_name = state["session"]
         if message_type == "composer-sync":
-            await self.sync_mobile_composer(
-                bridge,
-                session_name,
-                str(payload.get("value", "")),
-                payload.get("cursor"),
-                revision=revision,
-            )
+            value = str(payload.get("value", "")).replace("\r\n", "\n").replace("\r", "\n")
+            try:
+                await self.sync_mobile_composer(
+                    bridge, session_name, value,
+                    utf16_cursor_to_codepoint(value, payload.get("cursor")),
+                    revision=revision,
+                )
+            except ComposerPasteUnavailable:
+                await self.send_json(connection, {
+                    "type": "composer-rejected", "session": session_name,
+                    "value": value, "cursor": payload.get("cursor"),
+                    "error": "Multiline paste mode is unavailable; draft retained. Press Enter to review sending.",
+                })
             return
 
         if message_type == "composer-semantic-sync":
@@ -6008,7 +6166,7 @@ class AppServer:
 
             next_value = str(payload.get("value", "")).replace("\r\n", "\n").replace("\r", "\n")
             composer_state["draft"] = next_value
-            composer_state["cursor"] = clamp_cursor(next_value, payload.get("cursor"))
+            composer_state["cursor"] = utf16_cursor_to_codepoint(next_value, payload.get("cursor"))
             composer_state["historyIndex"] = None
             composer_state["pendingDraft"] = next_value
             composer_state["tracked"] = True
@@ -6018,6 +6176,35 @@ class AppServer:
             return
 
         if message_type == "composer-enter":
+            request_id = payload.get("requestId")
+            if isinstance(payload.get("value"), str) and isinstance(request_id, str) and 0 < len(request_id) <= 128:
+                composer_state = self.mobile_composer_state(session_name)
+                submitted = composer_state["submittedRequests"]
+                async with composer_state.setdefault("submissionLock", asyncio.Lock()):
+                    if request_id not in submitted:
+                        value = payload["value"].replace("\r\n", "\n").replace("\r", "\n")
+                        try:
+                            await self.sync_mobile_composer(
+                                bridge, session_name, value, len(value),
+                                revision=revision,
+                                direct_provenance=False,
+                                allow_unbracketed_multiline=payload.get("allowUnbracketedMultiline") is True,
+                            )
+                        except ComposerPasteUnavailable:
+                            await self.send_json(connection, {
+                                "type": "composer-rejected", "session": session_name,
+                                "requestId": request_id, "value": value, "cursor": payload.get("cursor"),
+                                "error": "Paste mode changed; draft retained. Press Enter to review sending.",
+                            })
+                            return
+                        await self.commit_mobile_composer(bridge, session_name, revision=revision)
+                        submitted.append(request_id)
+                        del submitted[:-64]
+                await self.send_json(connection, {
+                    "type": "composer-submitted", "session": session_name, "requestId": request_id,
+                })
+                await self.send_composer_state(connection, session_name)
+                return
             await self.commit_mobile_composer(bridge, session_name, revision=revision)
             await self.send_composer_state(connection, session_name)
             return

@@ -311,6 +311,7 @@ class AuthoritativeSelectionTest(unittest.TestCase):
             1,
             (),
             2000,
+            None,
         )
         captures = [
             subprocess.CompletedProcess([], 0, "styled-one\nstyled-two\n", ""),

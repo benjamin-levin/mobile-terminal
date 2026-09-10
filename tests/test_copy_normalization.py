@@ -568,20 +568,20 @@ assert.equal(copyCalls, 1);
 ''',
         )
 
-    def test_direct_pty_normalization_preserves_legacy_one_line_policy(self):
+    def test_direct_pty_normalization_preserves_whitespace(self):
         self.run_node(
             ["normalizeTerminalCopyText", "normalizeDirectPtyPasteText"],
             r'''
 assert.equal(normalizeDirectPtyPasteText("  alpha  beta \t\r\n \t gamma\r\r delta  \t "),
-  "alpha beta gamma delta");
+  "  alpha  beta \t\n \t gamma\n\n delta  \t ");
 assert.equal(normalizeDirectPtyPasteText("one\n  two\t three\n\nfour"),
-  "one two\t three four");
+  "one\n  two\t three\n\nfour");
 assert.equal(normalizeDirectPtyPasteText("\t keep\tinside  spaces \t"),
-  "keep\tinside spaces");
+  "\t keep\tinside  spaces \t");
 assert.equal(normalizeDirectPtyPasteText("soft-wrap-equivalent text"),
   "soft-wrap-equivalent text");
 for (const value of ["a\nb", "a\r\nb", "a\rb", "\r\n\r", "  a  \n  b  "]) {
-  assert.doesNotMatch(normalizeDirectPtyPasteText(value), /[\r\n]/);
+  assert.equal(normalizeDirectPtyPasteText(value), normalizeTerminalCopyText(value));
 }
 ''',
         )
@@ -595,9 +595,10 @@ for (const value of ["a\nb", "a\r\nb", "a\rb", "\r\n\r", "  a  \n  b  "]) {
             ],
             r'''
 const sent = [];
+const term = { modes: { bracketedPasteMode: true } };
 function sendMessage(message) { sent.push(message); }
 sendDirectPtyPaste(" \r\n foo  bar\r baz \n ");
-assert.deepEqual(sent, [{ type: "input", data: "foo bar baz" }]);
+assert.deepEqual(sent, [{ type: "input", data: "\x1b[200~ \n foo  bar\n baz \n \x1b[201~" }]);
 ''',
         )
         helper = extract_function("sendDirectPtyPaste")
@@ -614,15 +615,14 @@ assert.deepEqual(sent, [{ type: "input", data: "foo bar baz" }]);
         direct_delivery = extract_function("handlePendingPasteReady")
         self.assertIn("resetSpeechInputState();\n    if (!sendDirectPtyPaste(normalizedText))", direct_delivery)
         composer_delivery = extract_function("deliverPendingPasteToComposer")
-        self.assertIn('type: "composer-sync",', composer_delivery)
-        self.assertIn("revision: nextComposerRevision(),", composer_delivery)
+        self.assertIn("syncComposerState(false, true)", composer_delivery)
 
         clipboard_api = app_section(
             "  async function pasteFromClipboard(",
             "  function isTerminalCopyTarget(target)",
         )
-        self.assertIn("insertComposerText(text, true);", clipboard_api)
-        self.assertIn("resetComposerTracking(true);\n            sendDirectPtyPaste(text);", clipboard_api)
+        self.assertIn("insertComposerText(text, wasKeyboardFocused);", clipboard_api)
+        self.assertNotIn("resetComposerTracking", clipboard_api)
         self.assertIn("resetSpeechInputState();\n        sendDirectPtyPaste(text);", clipboard_api)
         self.assertNotIn('sendMessage({ type: "input", data: text });', clipboard_api)
 
@@ -633,7 +633,7 @@ assert.deepEqual(sent, [{ type: "input", data: "foo bar baz" }]);
         self.assertIn("if (event.target === composerInput)", native_paste)
         self.assertIn("insertComposerText(text);", native_paste)
         self.assertIn("resetSpeechInputState();\n    sendDirectPtyPaste(text);", native_paste)
-        self.assertEqual(APP_JS.count("sendDirectPtyPaste("), 5)
+        self.assertEqual(APP_JS.count("sendDirectPtyPaste("), 4)
 
         ordinary_input = app_section(
             "  term.onData((data) => {",
