@@ -7,7 +7,7 @@ import unittest
 import server
 
 
-DEFAULT_SOCKET = "/home/powerhouse/tts-server/run/tts.sock"
+DEFAULT_SOCKET = "/home/powerhouse/voice/run/voice.sock"
 
 
 class TtsSocketConfigurationTest(unittest.TestCase):
