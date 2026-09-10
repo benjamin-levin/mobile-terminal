@@ -184,6 +184,19 @@ That setup enables tmux copy-mode on scroll and matches the scroll direction exp
 - The UI stores the access token and shortcut layout in browser local storage.
 - The backend speaks HTTP and WebSocket. Put it behind HTTPS with a hostname for browser passkey authentication; a VPN alone does not make an HTTP LAN origin eligible for WebAuthn. HTTP localhost works for development on the same computer.
 
+## Regression tests
+
+Run `npm test` for the isolated Python, JavaScript, and private-tmux tests, or
+`npm run check` for syntax checks. Tests never use the live tmux server.
+
+Browser regressions exercise the real app and backend with disposable state,
+a private tmux socket, and a virtual passkey. Install development dependencies
+with `npm ci`, install Chromium once with `npx playwright install chromium`,
+then run `npm run test:browser`. To use an existing Chrome installation, set
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE` to its executable path. The suite requires the
+checkout's `.venv/bin/python`, Node.js 20+, and tmux. It does not require provider
+credentials or send prompts to paid models.
+
 ## Install
 
 The repo includes a cross-platform installer:
