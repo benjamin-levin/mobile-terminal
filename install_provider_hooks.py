@@ -200,8 +200,17 @@ def install_provider_hooks(
         codex_command = (
             f"{python} {hook_command} --provider codex --version {shlex.quote(codex_version)}"
         )
-        codex_path = home / ".codex" / "hooks" / "hooks.json"
+        # User hooks live beside config.toml. hooks/hooks.json is the default
+        # inside a plugin, and is not discovered as a user configuration file.
+        codex_path = home / ".codex" / "hooks.json"
         _install_hooks(codex_path, CODEX_EVENTS, codex_command)
+        legacy_path = home / ".codex" / "hooks" / "hooks.json"
+        if legacy_path.is_file():
+            legacy = _read_json(legacy_path)
+            cleaned = _remove_tagged_hooks(copy.deepcopy(legacy), CODEX_EVENTS)
+            if cleaned != legacy:
+                _backup_existing(legacy_path)
+                _atomic_json(legacy_path, cleaned)
 
 
 def main() -> int:

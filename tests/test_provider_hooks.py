@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,8 @@ from unittest.mock import patch
 
 from install_provider_hooks import BACKUP_SUFFIX, SOURCE_TAG, install_provider_hooks
 from provider_binding_hook import _pane_coordinates, _provider_process, update_binding
+from provider_authority import ProviderAuthorityError, resolve_provider_binding
+from tests.tmux_harness import TmuxHarness
 
 
 SESSION_ID = "12345678-1234-4123-8123-123456789abc"
@@ -53,8 +56,7 @@ class ProviderHookInstallerTest(unittest.TestCase):
         codex_config.parent.mkdir()
         original_toml = 'model = "gpt"\n[projects."/work"]\ntrust_level = "trusted"\n'
         codex_config.write_text(original_toml)
-        codex_hooks = self.home / ".codex" / "hooks" / "hooks.json"
-        codex_hooks.parent.mkdir()
+        codex_hooks = self.home / ".codex" / "hooks.json"
         foreign = {
             "hooks": {
                 "Stop": [{"hooks": [{"type": "command", "command": "foreign"}]}],
@@ -106,7 +108,7 @@ class ProviderHookInstallerTest(unittest.TestCase):
     def test_new_hook_files_do_not_create_backups(self):
         install_provider_hooks(self.home, self.root, "2.1.241", "0.147.0")
         claude = self.home / ".claude" / "settings.json"
-        codex = self.home / ".codex" / "hooks" / "hooks.json"
+        codex = self.home / ".codex" / "hooks.json"
         self.assertTrue(claude.exists())
         self.assertTrue(codex.exists())
         self.assertFalse(claude.with_name(f"{claude.name}{BACKUP_SUFFIX}").exists())
@@ -115,7 +117,23 @@ class ProviderHookInstallerTest(unittest.TestCase):
     def test_missing_provider_clis_are_fail_open(self):
         install_provider_hooks(self.home, self.root, None, None)
         self.assertFalse((self.home / ".claude" / "settings.json").exists())
-        self.assertFalse((self.home / ".codex" / "hooks" / "hooks.json").exists())
+        self.assertFalse((self.home / ".codex" / "hooks.json").exists())
+
+    def test_migrates_only_owned_legacy_hooks_to_discoverable_user_path(self):
+        legacy = self.home / ".codex" / "hooks" / "hooks.json"
+        legacy.parent.mkdir(parents=True)
+        foreign = {"hooks": [{"type": "command", "command": "foreign"}]}
+        original = {"hooks": {"SessionStart": [foreign, {
+            "_mobile_terminal_source": SOURCE_TAG,
+            "hooks": [{"type": "command", "command": "old"}],
+        }]}}
+        legacy.write_text(json.dumps(original))
+        install_provider_hooks(self.home, self.root, None, "0.153.3")
+        self.assertEqual(json.loads(legacy.read_text()), {"hooks": {"SessionStart": [foreign]}})
+        self.assertEqual(json.loads(legacy.with_name(legacy.name + BACKUP_SUFFIX).read_text()), original)
+        configured = json.loads((self.home / ".codex" / "hooks.json").read_text())
+        self.assertEqual(set(configured["hooks"]), {"SessionStart", "SessionEnd", "PreCompact", "PostCompact"})
+        self.assertNotIn("trusted_hash", json.dumps(configured))
 
     def test_rejects_missing_or_unsafe_installation_root(self):
         missing = Path(self.temporary.name) / "missing"
@@ -197,6 +215,56 @@ class InstallScriptProviderHooksTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("Invalid --provider-hooks mode: sometimes", result.stderr)
         self.assertFalse((self.home / "provider-hook-calls").exists())
+
+
+class ProviderHookLifecycleIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_installed_command_creates_valid_live_binding_and_closes_it(self):
+        tmux = TmuxHarness(self, prefix="mt-hook-")
+        home = Path(tmux.temporary.name) / "home"
+        home.mkdir()
+        root = Path(__file__).resolve().parents[1]
+        install_provider_hooks(home, root, None, "0.153.3")
+        transcript = home / ".codex" / "sessions" / f"rollout-{SESSION_ID}.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": SESSION_ID}}) + "\n")
+        # A copied interpreter gives the fixture an actual /proc executable
+        # named codex; process discovery and validation are not mocked.
+        executable = home / "codex"
+        shutil.copy2(Path(sys.executable).resolve(), executable)
+        driver = home / "lifecycle.py"
+        driver.write_text(
+            "import json, os, subprocess, time\n"
+            "from pathlib import Path\n"
+            "home = Path.home()\n"
+            "config = json.loads((home / '.codex/hooks.json').read_text())\n"
+            f"event = {{'session_id': {SESSION_ID!r}, 'transcript_path': {str(transcript)!r}}}\n"
+            "for name in ('SessionStart', 'SessionEnd'):\n"
+            " if name == 'SessionEnd':\n"
+            "  while not (home / 'end').exists(): time.sleep(.01)\n"
+            " event['hook_event_name'] = name\n"
+            " command = config['hooks'][name][0]['hooks'][0]['command']\n"
+            " subprocess.run(command, shell=True, input=json.dumps(event), text=True, check=True)\n"
+            " (home / name).touch()\n"
+            "while not (home / 'exit').exists(): time.sleep(.01)\n"
+        )
+        tmux.environment["HOME"] = str(home)
+        pane_id = tmux.run("new-session", "-d", "-P", "-F", "#{pane_id}",
+                           "-s", "hook-lifecycle", shlex.join([str(executable), str(driver)]))
+        await tmux.wait_for(lambda: (home / "SessionStart").exists(), True, description="start hook")
+        binding, cache = resolve_provider_binding(pane_id, home=home)
+        self.assertEqual(binding.session_id, SESSION_ID)
+        self.assertEqual(binding.version, "0.153.3")
+        self.assertTrue(cache["active"])
+        self.assertFalse(cache.get("ownershipUnavailable", False))
+        self.assertIsNone(cache["ownershipRanges"][-1]["endRow"])
+        (home / "end").touch()
+        await tmux.wait_for(lambda: (home / "SessionEnd").exists(), True, description="end hook")
+        with self.assertRaises(ProviderAuthorityError):
+            resolve_provider_binding(pane_id, home=home)
+        ended = json.loads((home / ".mobile-terminal/provider-bindings" / f"{pane_id[1:]}.json").read_text())
+        self.assertFalse(ended["active"])
+        self.assertIsNotNone(ended["ownershipRanges"][-1]["endRow"])
+        (home / "exit").touch()
 
 
 class ProviderBindingHookTest(unittest.TestCase):

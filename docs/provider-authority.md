@@ -47,6 +47,25 @@ In `prefer`, every provider-side rejection falls back to rendered cell extractio
 
 ## Rollout gate
 
+Codex user lifecycle hooks belong in `~/.codex/hooks.json`, beside `config.toml`.
+The installer removes only its tagged entries from the former
+`~/.codex/hooks/hooks.json` location, retaining a backup and foreign entries.
+That nested location is a plugin convention and was not a discovered user hook
+file. Codex also requires review and trust of the exact hook definition before
+execution; installing or counting hooks does not establish event delivery. The
+installer does not grant trust. Review the installed commands in Codex and then
+verify a new session's binding, live PID/start identity, and ownership boundaries.
+See the [official hook discovery and trust documentation](https://learn.chatgpt.com/docs/hooks).
+
+An isolated `0.153.3` probe confirmed discovery of the corrected user-hook file
+and persisted trust through Codex's normal review UI. Relaunching a synthetic
+legacy saved session did not produce an observed lifecycle callback, even with
+the effective `hooks` feature enabled, four trusted states, no disabled hook
+states, and an executable interpreter. An immediate wrapper marker confirmed
+that the command was not invoked in that probe. That probe
+does not establish lifecycle behavior for a fresh real provider turn. Verify
+actual event delivery and binding validation separately after installation.
+
 1. Deploy code and hooks to ph with mode `shadow`.
 2. Verify bindings, transcript fences, candidate counts, reason counters, service health, and actual Claude/Codex output at the current terminal width.
 3. Confirm on iPhone that source hard breaks remain, visual wraps disappear, and provider gutters are omitted.
