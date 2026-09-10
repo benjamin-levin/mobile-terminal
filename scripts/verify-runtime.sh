@@ -101,7 +101,7 @@ def count(path):
     )
 
 home = Path.home()
-print(count(home / ".claude/settings.json"), count(home / ".codex/hooks/hooks.json"))
+print(count(home / ".claude/settings.json"), count(home / ".codex/hooks.json"))
 PY
 )
 

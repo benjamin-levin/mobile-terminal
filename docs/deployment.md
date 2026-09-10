@@ -78,7 +78,7 @@ install_provider_hooks.py
 server.py
 ```
 
-Copying runtime files does not itself prove hooks are installed for every OS user. Install hooks as the target user with the repository virtualenv and the installer's explicit `--apply` flag, then verify only tagged hook counts—never hook payload credentials or provider auth files.
+Copying runtime files does not itself prove hooks are installed for every OS user. Install hooks as the target user with the repository virtualenv and the installer's explicit `--apply` flag. Codex user hooks are written to `~/.codex/hooks.json` and require review and trust in Codex before they execute. Verify tagged hook counts and a new session's sanitized binding/process metadata; counts alone do not prove event delivery. Never print hook payload credentials or provider auth files.
 
 Use `scripts/provider-mode.sh` locally for provider state changes. On fleet users, apply the same `off -> shadow -> prefer -> enforce` validation sequence within that user's env/service boundary. Direct `off -> prefer` activation is supported when shadow validation was completed separately; `enforce` is accepted only from `prefer`.
 

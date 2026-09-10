@@ -735,7 +735,7 @@ printf 'INFO never-print-this-bootstrap-token\n'
             env = os.environ.copy()
             home = root / "home"
             (home / ".claude").mkdir(parents=True)
-            (home / ".codex/hooks").mkdir(parents=True)
+            (home / ".codex").mkdir(parents=True)
             (home / ".claude/settings.json").write_text(
                 json.dumps(
                     {
@@ -765,7 +765,7 @@ printf 'INFO never-print-this-bootstrap-token\n'
                     }
                 )
             )
-            (home / ".codex/hooks/hooks.json").write_text(
+            (home / ".codex/hooks.json").write_text(
                 json.dumps(
                     {
                         "hooks": {
