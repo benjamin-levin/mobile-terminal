@@ -1888,43 +1888,36 @@
         terminalSpeechAudio.preload = "auto";
       }
       terminalSpeechAudio.src = TERMINAL_SILENT_WAV;
-      terminalSpeechUnlockPromise = Promise.resolve(terminalSpeechAudio.play()).then(() => {
+      const unlockPromise = Promise.resolve(terminalSpeechAudio.play()).then(() => {
+        if (terminalSpeechUnlockPromise !== unlockPromise) {
+          return false;
+        }
         terminalSpeechUnlocked = true;
         if (terminalSpeechAudio.src === TERMINAL_SILENT_WAV) {
           terminalSpeechAudio.pause();
         }
         return true;
       }).catch(() => false).finally(() => {
-        terminalSpeechUnlockPromise = null;
+        if (terminalSpeechUnlockPromise === unlockPromise) {
+          terminalSpeechUnlockPromise = null;
+        }
       });
-      return terminalSpeechUnlockPromise;
+      terminalSpeechUnlockPromise = unlockPromise;
+      return unlockPromise;
     } catch (_error) {
       return Promise.resolve(false);
     }
   }
 
-  function initializeTerminalSpeech() {
-    const unlock = () => {
-      // Capture runs before chip handlers; later gestures must not replace a WAV.
-      if (!terminalSpeechRequest && !terminalSpeechUrl) {
-        unlockTerminalSpeech();
-      }
-    };
-    document.addEventListener("touchend", unlock, { capture: true, passive: true });
-    document.addEventListener("click", unlock, { capture: true, passive: true });
-    document.addEventListener("keydown", unlock, { capture: true, passive: true });
-  }
-
   function clearTerminalSpeechAudio() {
+    terminalSpeechUnlockPromise = null;
     if (terminalSpeechAudio) {
       terminalSpeechAudio.onended = null;
       terminalSpeechAudio.onerror = null;
-      if (!terminalSpeechUnlockPromise || terminalSpeechUrl) {
-        terminalSpeechAudio.pause();
-      }
+      terminalSpeechAudio.pause();
+      terminalSpeechAudio.removeAttribute("src");
     }
     if (terminalSpeechUrl) {
-      terminalSpeechAudio.removeAttribute("src");
       URL.revokeObjectURL(terminalSpeechUrl);
       terminalSpeechUrl = null;
     }
@@ -11486,7 +11479,6 @@
   applyUiScale(uiScale, false);
   applyTerminalFontSize(terminalFontSize, false);
   guardTerminalHelperTextarea();
-  initializeTerminalSpeech();
   installTerminalScrollHandlers();
   installTabStripScrollHandlers();
   installShortcutBarScrollHandlers();

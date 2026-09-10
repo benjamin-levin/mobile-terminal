@@ -329,6 +329,8 @@ assert.deepEqual(empty, { left: 20, top: 20, right: 20, bottom: 20, width: 0, he
         self.assertIn("const text = normalizeTerminalCopyText(selection.text);", speech)
         self.assertNotIn("speechSynthesis", APP_JS)
         self.assertNotIn("SpeechSynthesisUtterance", APP_JS)
+        self.assertNotIn("initializeTerminalSpeech", APP_JS)
+        self.assertEqual(APP_JS.count("unlockTerminalSpeech()"), 2)
         self.run_node_source("\n".join([
             'const assert = require("node:assert/strict");',
             extract_function("normalizeTerminalCopyText"),
@@ -337,6 +339,8 @@ assert.deepEqual(empty, { left: 20, top: 20, right: 20, bottom: 20, width: 0, he
 const events = [], requests = [], revoked = [], listeners = {};
 let selection = "first\r\n  second\tline", dismissals = 0, audioCount = 0;
 let failPlay = false, failUnlock = false, inGesture = false;
+let unlockResponse = () => failUnlock ? Promise.reject(Error("blocked")) : Promise.resolve();
+let authAvailable = true, authCapability = "test-capability";
 let fetchResponse = () => Promise.resolve(wav());
 const window = { setTimeout, clearTimeout };
 const document = { addEventListener(type, callback, options) {
@@ -354,23 +358,26 @@ function dismissTerminalSelection() { dismissals += 1; }
 function sendMessage(payload) {
   assert.equal(payload.type, "tts-auth");
   events.push("auth");
+  if (!authAvailable) return false;
   queueMicrotask(() => {
-    if (pendingSpeechAuth?.requestId === payload.requestId) pendingSpeechAuth.finish("test-capability");
+    if (pendingSpeechAuth?.requestId === payload.requestId) pendingSpeechAuth.finish(authCapability);
   });
   return true;
 }
 class Audio {
-  constructor() { audioCount += 1; this.src = ""; }
+  constructor() { audioCount += 1; this.src = ""; this.paused = true; }
   play() {
+    this.paused = false;
     if (this.src.startsWith("data:")) {
       assert.equal(inGesture, true, "silent unlock stays on gesture stack");
       events.push("unlock");
-      return failUnlock ? Promise.reject(Error("blocked")) : Promise.resolve();
+      return unlockResponse();
     }
+    assert.match(this.src, /^blob:/, "real WAV must replace silent unlock");
     events.push("play");
     return failPlay ? Promise.reject(Error("blocked")) : Promise.resolve();
   }
-  pause() { events.push("pause"); }
+  pause() { events.push("pause"); this.paused = true; }
   removeAttribute(name) { assert.equal(name, "src"); this.src = ""; }
 }
 let urlCounter = 0;
@@ -395,14 +402,34 @@ function tap() {
   inGesture = true;
   try { return speakTerminalSelectionAndDismiss(); } finally { inGesture = false; }
 }
+function ordinaryGestures() {
+  const beforeEvents = events.length;
+  const beforeAudio = audioCount;
+  for (const type of ["touchend", "click", "keydown"]) {
+    inGesture = true;
+    try { listeners[type]?.(); } finally { inGesture = false; }
+  }
+  assert.equal(audioCount, beforeAudio);
+  assert.equal(events.length, beforeEvents);
+}
+function assertAudioReleased() {
+  assert.equal(terminalSpeechAudio.paused, true);
+  assert.equal(terminalSpeechAudio.src, "");
+  assert.equal(terminalSpeechAudio.onended, null);
+  assert.equal(terminalSpeechAudio.onerror, null);
+  assert.equal(terminalSpeechUrl, null);
+  assert.equal(new Set(revoked).size, urlCounter);
+}
 const flush = () => new Promise(setImmediate);
 (async () => {
-  initializeTerminalSpeech();
-  inGesture = true; listeners.touchend(); inGesture = false;
+  ordinaryGestures();
+  assert.equal(audioCount, 0);
   let releaseSelection;
   const selected = { text: selection };
   selectionResponse = () => new Promise(resolve => { releaseSelection = resolve; });
-  const first = tap(); // Capture unlock may still be pending when chip activates.
+  const first = tap();
+  assert.deepEqual(events, ["unlock", "selection"]);
+  assert.equal(audioCount, 1);
   await flush();
   assert.equal(events.includes("fetch"), false);
   assert.equal(events.includes("auth"), false);
@@ -417,7 +444,11 @@ const flush = () => new Promise(setImmediate);
   assert.equal(dismissals, 1);
   assert.equal(audioCount, 1);
   const firstUrl = terminalSpeechUrl;
-  inGesture = true; listeners.click(); inGesture = false;
+  assert.match(firstUrl, /^blob:/);
+  assert.equal(terminalSpeechAudio.src, firstUrl);
+  assert.equal(terminalSpeechAudio.paused, false);
+  assert.ok(events.indexOf("unlock") < events.indexOf("play"));
+  ordinaryGestures();
   assert.equal(terminalSpeechUrl, firstUrl); // Document gesture must not overwrite speech.
   await tap();
   assert.equal(requests[0].signal.aborted, false); // Completed fetch no longer needs abort.
@@ -426,7 +457,8 @@ const flush = () => new Promise(setImmediate);
   const endedUrl = terminalSpeechUrl;
   terminalSpeechAudio.onended();
   assert.ok(revoked.includes(endedUrl));
-  assert.equal(terminalSpeechUrl, null);
+  assertAudioReleased();
+  ordinaryGestures();
 
   for (const [response, message] of [[wav(503), "Speech service unavailable."],
       [wav(401), "Speech failed: HTTP 401."], [wav(500), "Speech failed: HTTP 500."],
@@ -437,10 +469,13 @@ const flush = () => new Promise(setImmediate);
     assert.equal(events.at(-1), message);
     assert.equal(dismissals, before);
     assert.equal(selection, "changed after tap");
+    assertAudioReleased();
+    ordinaryGestures();
   }
   fetchResponse = () => Promise.reject(Error("offline"));
   await tap();
   assert.equal(events.at(-1), "Speech failed: playback blocked.");
+  assertAudioReleased();
   fetchResponse = () => Promise.resolve(wav());
   failPlay = true;
   const beforeFailure = dismissals;
@@ -448,6 +483,7 @@ const flush = () => new Promise(setImmediate);
   assert.equal(events.at(-1), "Speech failed: playback blocked.");
   assert.equal(dismissals, beforeFailure);
   assert.equal(terminalSpeechUrl, null);
+  assertAudioReleased();
   failPlay = false;
   failUnlock = true;
   await tap(); // Rejected silent unlock is handled; real playback may still succeed.
@@ -501,6 +537,7 @@ const flush = () => new Promise(setImmediate);
   const beforeError = dismissals;
   terminalSpeechAudio.onerror();
   assert.equal(terminalSpeechUrl, null);
+  assertAudioReleased();
   assert.equal(dismissals, beforeError);
   assert.equal(events.at(-1), "Speech failed: audio element error.");
 
@@ -515,6 +552,58 @@ const flush = () => new Promise(setImmediate);
   assert.ok(revoked.includes(beforeEmptyUrl));
   assert.equal(dismissals, beforeEmptyDismissals);
   assert.equal(events.at(-1), "Select terminal text first.");
+  assertAudioReleased();
+
+  for (const result of [{ text: "" }, { error: "Selection unavailable." }]) {
+    selectionResponse = () => Promise.resolve(result);
+    await tap();
+    assertAudioReleased();
+  }
+  selectionResponse = () => Promise.reject(Error("selection disconnected"));
+  await tap();
+  assertAudioReleased();
+  selection = "speak again";
+  selectionResponse = () => Promise.resolve({ text: selection });
+  for (const available of [false, true]) {
+    authAvailable = available;
+    authCapability = "";
+    const beforeAuthFailure = requests.length;
+    await tap();
+    assert.equal(events.at(-1), "Speech failed: no auth token.");
+    assert.equal(requests.length, beforeAuthFailure);
+    assertAudioReleased();
+  }
+  authCapability = "test-capability";
+  fetchResponse = () => Promise.reject(Object.assign(Error("aborted"), { name: "AbortError" }));
+  await tap();
+  assertAudioReleased();
+  fetchResponse = () => Promise.resolve({ ...wav(), blob: () => Promise.reject(Error("body failed")) });
+  await tap();
+  assertAudioReleased();
+  fetchResponse = () => Promise.resolve(wav());
+
+  let releaseUnlock;
+  unlockResponse = () => new Promise(resolve => { releaseUnlock = resolve; });
+  selection = "";
+  await tap(); // Empty selection must stop even a still-pending silent play().
+  assertAudioReleased();
+  ordinaryGestures();
+  const releaseFailedUnlock = releaseUnlock;
+  selection = "replacement";
+  const beforeUnlocks = events.filter(event => event === "unlock").length;
+  const pendingReplacement = tap();
+  assert.equal(events.filter(event => event === "unlock").length, beforeUnlocks + 1);
+  const replacementUnlock = terminalSpeechUnlockPromise;
+  releaseFailedUnlock();
+  await flush();
+  assert.equal(terminalSpeechUnlockPromise, replacementUnlock);
+  assert.equal(terminalSpeechUnlocked, false);
+  assert.equal(terminalSpeechAudio.paused, false);
+  releaseUnlock();
+  await pendingReplacement;
+  assert.match(terminalSpeechAudio.src, /^blob:/);
+  terminalSpeechAudio.onended();
+  assertAudioReleased();
 })().catch(error => { console.error(error); process.exitCode = 1; });
 ''',
         ]))
@@ -562,7 +651,7 @@ handles.paste.listeners.click(event);
 assert.deepEqual([copies, pastes], [1, 1]);
 ''',
         ]))
-        self.assertIn("initializeTerminalSpeech();", APP_JS)
+        self.assertNotIn("initializeTerminalSpeech", APP_JS)
         self.assertNotIn("speak.hidden", extract_function("ensureSelectionHandles"))
 
 
