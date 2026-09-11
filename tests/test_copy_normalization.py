@@ -3,6 +3,8 @@ import re
 import subprocess
 import unittest
 
+from tests.test_touch_selection_ui import speech_dom_harness
+
 
 ROOT = Path(__file__).parents[1]
 APP_JS = (ROOT / "static" / "app.js").read_text()
@@ -189,7 +191,7 @@ function reset() {
             ["requestAuthoritativeSelection", "requestSelectionWithFallback", "handleServerMessage",
              "normalizeTerminalCopyText", "beginAuthoritativeClipboardWrite",
              "copyClipboardTextWithFallback", "copyTerminalSelection", "pasteSelectionToRecentTab"],
-            self.fallback_harness() + speech + r'''
+            self.fallback_harness() + speech + speech_dom_harness() + r'''
 const toasts = [], writes = [], speechTexts = [], switched = [];
 let pendingPasteAfterSwitch = null;
 function showToast(message) { toasts.push(message); }
@@ -202,6 +204,7 @@ Object.defineProperty(global, "navigator", { value: {
 class Audio {
   play() { return Promise.resolve(); }
   pause() {}
+  load() {}
   removeAttribute() {}
 }
 const URL = { createObjectURL() { return "blob:test"; }, revokeObjectURL() {} };
@@ -222,7 +225,7 @@ async function fetch(url, options) {
     replies = [{ error: stale }, { error: stale }, rawReply];
     assert.equal(await speakTerminalSelection(), true);
     assert.equal(speechTexts.at(-1), raw.text);
-    assert.equal(toasts.at(-1), "Speaking terminal selection.");
+    assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
     reset();
     replies = [{ error: stale }, { error: stale }, rawReply];
     assert.equal(await pasteSelectionToRecentTab(), true);

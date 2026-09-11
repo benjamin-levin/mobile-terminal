@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests.tmux_harness import TmuxHarness
+from tests.test_touch_selection_ui import speech_player_harness
 
 from server import (
     AppServer,
@@ -157,6 +158,212 @@ class ClipboardClientTest(unittest.TestCase):
             *(function(name) for name in names), script,
         ])], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_speech_autoplay_rejection_is_ready_and_manual_play_is_synchronous(self):
+        self.run_node([], speech_player_harness() + r'''
+(async () => {
+  playResponse = () => Promise.reject(Error("NotAllowedError"));
+  await tap();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Ready — tap ▶");
+  assert.equal(terminalSpeechPlayer.play.disabled, false);
+  assert.equal(events.filter(event => event.type === "play" && event.src.startsWith("blob:")).length, 1);
+  assert.equal(events.at(-1).inGesture, false);
+  assert.equal(dismissals, 1);
+  const readyUrl = terminalSpeechUrl;
+  playResponse = () => Promise.resolve();
+  const manual = clickPlay();
+  assert.equal(events.at(-1).type, "play", "manual play must not wait for a microtask");
+  assert.equal(events.at(-1).inGesture, true);
+  await manual;
+  assert.equal(terminalSpeechUrl, readyUrl);
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+  clickPlay();
+  assert.equal(terminalSpeechAudio.paused, true);
+  assert.equal(terminalSpeechPlayer.status.textContent, "Paused");
+  playResponse = () => { throw Error("manual play blocked"); };
+  await clickPlay();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Speech failed: playback blocked.");
+  assert.equal(terminalSpeechPlayer.play.disabled, true);
+  assert.equal(terminalSpeechAudio.src, "");
+  assert.equal(terminalSpeechUrl, null);
+  assert.ok(revoked.includes(readyUrl));
+
+  for (const response of [() => Promise.reject(Error("unlock denied")), () => { throw Error("unlock denied"); }]) {
+    unlockResponse = response;
+    playResponse = () => Promise.resolve();
+    const before = events.filter(event => event.type === "play" && event.src.startsWith("blob:")).length;
+    await tap();
+    assert.equal(terminalSpeechPlayer.status.textContent, "Ready — tap ▶");
+    assert.equal(events.filter(event => event.type === "play" && event.src.startsWith("blob:")).length, before);
+    await clickPlay();
+    assert.equal(events.at(-1).inGesture, true);
+    assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+  }
+
+  let releaseUnlock;
+  unlockResponse = () => new Promise(resolve => { releaseUnlock = resolve; });
+  await tap(); // A hung unlock cannot strand a synthesized WAV in Preparing.
+  assert.equal(terminalSpeechPlayer.status.textContent, "Ready — tap ▶");
+  assert.equal(terminalSpeechUnlocked, false);
+  await clickPlay();
+  const beforeLateUnlock = events.length;
+  releaseUnlock();
+  await flush();
+  assert.equal(events.length, beforeLateUnlock);
+  assert.equal(terminalSpeechAudio.paused, false);
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+  dismiss();
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''')
+
+    def test_speech_progress_metadata_seek_and_drag_release(self):
+        self.run_node([], speech_player_harness() + r'''
+(async () => {
+  await tap();
+  const { seek, time, status } = terminalSpeechPlayer;
+  const audio = terminalSpeechAudio;
+  assert.equal(seek.disabled, true);
+  assert.equal(time.textContent, "0:00 / --:--");
+  for (const duration of [NaN, Infinity, 0]) {
+    audio.duration = duration;
+    audio.onloadedmetadata();
+    assert.equal(seek.disabled, true);
+  }
+  audio.duration = 125;
+  audio.onloadedmetadata();
+  assert.equal(seek.disabled, false);
+  assert.equal(seek.max, "125");
+  audio.currentTime = 32.5;
+  audio.ontimeupdate();
+  assert.equal(seek.value, "32.5");
+  assert.equal(time.textContent, "0:32 / 2:05");
+  assert.equal(status.textContent, "Playing");
+  seek.value = "64";
+  seek.listeners.input();
+  assert.equal(audio.currentTime, 64);
+  assert.equal(seek.attributes["aria-valuetext"], "1:04 of 2:05");
+  for (const [start, end] of [["pointerdown", "pointerup"], ["pointerdown", "pointercancel"],
+      ["pointerdown", "lostpointercapture"], ["touchstart", "touchend"], ["touchstart", "touchcancel"], ["pointerdown", "blur"]]) {
+    seek.listeners[start]({ pointerId: start === "pointerdown" ? 4 : undefined });
+    if (start === "pointerdown") assert.equal(seek.pointerCapture, 4);
+    seek.value = "70";
+    seek.listeners.input();
+    assert.equal(audio.currentTime, 70);
+    audio.currentTime = 71;
+    audio.ontimeupdate();
+    assert.equal(seek.value, "70", `${start} holds thumb position`);
+    seek.listeners[end]();
+    assert.equal(terminalSpeechSeeking, false, end);
+    assert.equal(seek.value, "71", `${end} resumes progress`);
+  }
+  clickPlay();
+  seek.value = "90";
+  seek.listeners.input();
+  assert.equal(audio.currentTime, 90);
+  assert.equal(status.textContent, "Paused");
+  await clickPlay();
+  assert.equal(audio.currentTime, 90);
+  assert.equal(status.textContent, "Playing");
+  audio.duration = 130;
+  audio.ondurationchange();
+  assert.equal(seek.max, "130");
+  dismiss();
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''')
+
+    def test_speech_done_releases_audio_and_replay_ignores_old_events(self):
+        self.run_node([], speech_player_harness() + r'''
+(async () => {
+  assert.equal(audioCount, 0);
+  assert.equal(document.body.children.length, 0);
+  await tap();
+  const audio = terminalSpeechAudio;
+  audio.duration = 80;
+  audio.currentTime = 80;
+  const oldEvents = [audio.onended, audio.onerror, audio.onplay, audio.onpause, audio.ontimeupdate];
+  const firstUrl = terminalSpeechUrl;
+  audio.ended = true;
+  audio.onended();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Done");
+  assert.equal(terminalSpeechPlayer.time.textContent, "1:20 / 1:20");
+  assert.equal(terminalSpeechPlayer.player.hidden, false);
+  assert.equal(terminalSpeechPlayer.play.disabled, false);
+  assert.equal(terminalSpeechPlayer.seek.disabled, true);
+  assert.equal(audio.src, "");
+  assert.equal(audio.paused, true);
+  assert.equal(audio.onended, null);
+  assert.equal(audio.onerror, null);
+  assert.equal(terminalSpeechUnlocked, false);
+  assert.equal(events.at(-1).type, "load");
+  assert.ok(revoked.includes(firstUrl));
+  const plays = events.filter(event => event.type === "play").length;
+  await flush();
+  assert.equal(events.filter(event => event.type === "play").length, plays);
+  assert.equal(requests.length, 1);
+  const replay = clickPlay();
+  assert.equal(events.at(-1).inGesture, true);
+  assert.equal(audio.currentTime, 0);
+  await replay;
+  assert.notEqual(terminalSpeechUrl, firstUrl);
+  const replayUrl = terminalSpeechUrl;
+  oldEvents.forEach(callback => callback());
+  // Queued events can also dispatch the newly installed same-element handler.
+  assert.equal(audio.ended, false);
+  assert.equal(audio.error, null);
+  audio.onended();
+  audio.onerror();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+  assert.equal(terminalSpeechUrl, replayUrl);
+  assert.equal(requests.length, 1, "replay uses retained WAV, not another request");
+  const replayEvents = [audio.onended, audio.onerror, audio.onplay, audio.onpause, audio.ontimeupdate];
+  dismiss();
+  replayEvents.forEach(callback => callback());
+  assert.equal(terminalSpeechPlayer.player.hidden, true);
+  assert.equal(terminalSpeechUrl, null);
+  assert.equal(terminalSpeechBlob, null);
+  assert.equal(audio.paused, true);
+  assert.equal(audio.src, "");
+  assert.ok(revoked.includes(replayUrl));
+  assert.equal(new Set(revoked).size, urlCounter);
+  assert.equal(revoked.length, urlCounter);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''')
+
+    def test_speech_rapid_pause_resume_ignores_stale_promises_and_queued_events(self):
+        self.run_node([], speech_player_harness() + r'''
+(async () => {
+  let rejectPlay;
+  playResponse = () => new Promise((_resolve, reject) => { rejectPlay = reject; });
+  const speaking = tap();
+  await flush();
+  const audio = terminalSpeechAudio;
+  clickPlay();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Paused");
+  audio.onplay(); // Queued play event arrives after Pause.
+  assert.equal(terminalSpeechPlayer.status.textContent, "Paused");
+  rejectPlay(Object.assign(Error("paused"), { name: "AbortError" }));
+  await speaking;
+  assert.equal(terminalSpeechPlayer.status.textContent, "Paused");
+  playResponse = () => Promise.resolve();
+  const resumed = clickPlay();
+  audio.onpause(); // Queued pause arrives after Play.
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+  await resumed;
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+
+  clickPlay();
+  playResponse = () => new Promise((_resolve, reject) => { rejectPlay = reject; });
+  const manual = clickPlay();
+  clickPlay();
+  rejectPlay(Object.assign(Error("paused"), { name: "AbortError" }));
+  await manual;
+  assert.equal(terminalSpeechPlayer.status.textContent, "Paused");
+  playResponse = () => Promise.reject(Error("manual denied"));
+  await clickPlay();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Speech failed: playback blocked.");
+  dismiss();
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''')
 
     def test_word_hit_testing_uses_cells_for_wide_and_combining_characters(self):
         self.run_node(["selectWordAt"], r'''

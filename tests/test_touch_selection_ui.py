@@ -32,6 +32,100 @@ def css_rule(selector):
     return match.group(0)
 
 
+def speech_dom_harness():
+    return r'''
+const document = {
+  createElement(tag) {
+    return {
+      tag, children: [], listeners: {}, attributes: {}, hidden: false, disabled: false,
+      append(...children) { this.children.push(...children); },
+      appendChild(child) { this.append(child); },
+      setAttribute(name, value) { this.attributes[name] = value; },
+      addEventListener(type, callback) { this.listeners[type] = callback; },
+      setPointerCapture(id) { this.pointerCapture = id; },
+    };
+  },
+  addEventListener() {},
+};
+document.body = document.createElement("body");
+'''
+
+
+def speech_player_harness():
+    return "\n".join([
+        extract_function("normalizeTerminalCopyText"),
+        app_section("  let terminalSpeechAudio = null;", "  // The most recent tab other than the current one."),
+        speech_dom_harness(),
+        r'''
+const events = [], requests = [], revoked = [];
+let inGesture = false, dismissals = 0, audioCount = 0, urlCounter = 0;
+let selectionResponse = () => Promise.resolve({ text: "selected text" });
+let authResponse = () => Promise.resolve("test-capability");
+let fetchResponse = () => Promise.resolve(wav());
+let unlockResponse = () => Promise.resolve();
+let playResponse = () => Promise.resolve();
+const window = { setTimeout, clearTimeout };
+const URL = {
+  createObjectURL() { return `blob:${++urlCounter}`; },
+  revokeObjectURL(url) { revoked.push(url); },
+};
+class Audio {
+  constructor() { audioCount += 1; this.src = ""; this.paused = true; this.currentTime = 0; this.duration = NaN; this.ended = false; this.error = null; }
+  play() {
+    this.paused = false;
+    events.push({ type: "play", src: this.src, inGesture });
+    if (this.src.startsWith("data:")) {
+      assert.equal(inGesture, true, "silent unlock must be on Speak's gesture stack");
+      return unlockResponse();
+    }
+    assert.match(this.src, /^blob:/);
+    return playResponse();
+  }
+  pause() { this.paused = true; events.push({ type: "pause" }); }
+  removeAttribute(name) { assert.equal(name, "src"); this.src = ""; }
+  load() { this.currentTime = 0; this.duration = NaN; this.ended = false; this.error = null; events.push({ type: "load" }); }
+}
+function requestSelectionWithFallback() {
+  assert.equal(terminalSpeechPlayer.status.textContent, "Preparing…");
+  events.push({ type: "selection" });
+  return selectionResponse();
+}
+function sendMessage(payload) {
+  assert.equal(payload.type, "tts-auth");
+  assert.equal(terminalSpeechPlayer.status.textContent, "Preparing…");
+  events.push({ type: "auth" });
+  authResponse().then(capability => {
+    if (pendingSpeechAuth?.requestId === payload.requestId) pendingSpeechAuth.finish(capability);
+  });
+  return true;
+}
+function wav(status = 200, type = "audio/wav") {
+  return { ok: status === 200, status, headers: { get: () => type }, blob: async () => ({}) };
+}
+function fetch(url, options) {
+  assert.equal(url, "/tts");
+  assert.equal(terminalSpeechPlayer.status.textContent, "Preparing…");
+  assert.equal(options.headers.Authorization, "Bearer test-capability");
+  requests.push(options);
+  events.push({ type: "fetch" });
+  return fetchResponse();
+}
+function dismissTerminalSelection() { dismissals += 1; }
+function showToast(message) { assert.fail(`Speech feedback belongs in the player: ${message}`); }
+function tap() {
+  inGesture = true;
+  try { return speakTerminalSelectionAndDismiss(); } finally { inGesture = false; }
+}
+function clickPlay() {
+  inGesture = true;
+  try { return terminalSpeechPlayer.play.listeners.click(); } finally { inGesture = false; }
+}
+function dismiss() { terminalSpeechPlayer.player.children.at(-1).listeners.click(); }
+const flush = () => new Promise(setImmediate);
+''',
+    ])
+
+
 class TouchSelectionUITest(unittest.TestCase):
     def run_node_source(self, script):
         result = subprocess.run(
@@ -335,17 +429,18 @@ assert.deepEqual(empty, { left: 20, top: 20, right: 20, bottom: 20, width: 0, he
             'const assert = require("node:assert/strict");',
             extract_function("normalizeTerminalCopyText"),
             speech,
+            speech_dom_harness(),
             r'''
 const events = [], requests = [], revoked = [], listeners = {};
+document.addEventListener = (type, callback, options) => {
+  assert.equal(options.capture, true); listeners[type] = callback;
+};
 let selection = "first\r\n  second\tline", dismissals = 0, audioCount = 0;
 let failPlay = false, failUnlock = false, inGesture = false;
 let unlockResponse = () => failUnlock ? Promise.reject(Error("blocked")) : Promise.resolve();
 let authAvailable = true, authCapability = "test-capability";
 let fetchResponse = () => Promise.resolve(wav());
 const window = { setTimeout, clearTimeout };
-const document = { addEventListener(type, callback, options) {
-  assert.equal(options.capture, true); listeners[type] = callback;
-} };
 const term = { getSelection() { events.push("client-selection"); return ""; } };
 let selectionResponse = () => Promise.resolve({ text: selection });
 function requestSelectionWithFallback() {
@@ -365,7 +460,8 @@ function sendMessage(payload) {
   return true;
 }
 class Audio {
-  constructor() { audioCount += 1; this.src = ""; this.paused = true; }
+  constructor() { audioCount += 1; this.src = ""; this.paused = true; this.currentTime = 0; this.duration = NaN; this.ended = false; this.error = null; }
+  load() { this.currentTime = 0; this.duration = NaN; this.ended = false; this.error = null; }
   play() {
     this.paused = false;
     if (this.src.startsWith("data:")) {
@@ -428,6 +524,10 @@ const flush = () => new Promise(setImmediate);
   const selected = { text: selection };
   selectionResponse = () => new Promise(resolve => { releaseSelection = resolve; });
   const first = tap();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Preparing…");
+  assert.equal(terminalSpeechPlayer.player.hidden, false);
+  assert.equal(terminalSpeechPlayer.play.disabled, true);
+  assert.equal(terminalSpeechPlayer.seek.disabled, true);
   assert.deepEqual(events, ["unlock", "selection"]);
   assert.equal(audioCount, 1);
   await flush();
@@ -455,6 +555,7 @@ const flush = () => new Promise(setImmediate);
   assert.ok(revoked.includes(firstUrl));
   assert.equal(audioCount, 1);
   const endedUrl = terminalSpeechUrl;
+  terminalSpeechAudio.ended = true;
   terminalSpeechAudio.onended();
   assert.ok(revoked.includes(endedUrl));
   assertAudioReleased();
@@ -466,7 +567,8 @@ const flush = () => new Promise(setImmediate);
     fetchResponse = () => Promise.resolve(response);
     const before = dismissals;
     await tap();
-    assert.equal(events.at(-1), message);
+    assert.equal(terminalSpeechPlayer.status.textContent, message);
+    assert.equal(terminalSpeechPlayer.player.hidden, false);
     assert.equal(dismissals, before);
     assert.equal(selection, "changed after tap");
     assertAudioReleased();
@@ -474,20 +576,26 @@ const flush = () => new Promise(setImmediate);
   }
   fetchResponse = () => Promise.reject(Error("offline"));
   await tap();
-  assert.equal(events.at(-1), "Speech failed: playback blocked.");
+  assert.equal(terminalSpeechPlayer.status.textContent, "Speech failed: playback blocked.");
   assertAudioReleased();
   fetchResponse = () => Promise.resolve(wav());
   failPlay = true;
   const beforeFailure = dismissals;
   await tap();
-  assert.equal(events.at(-1), "Speech failed: playback blocked.");
-  assert.equal(dismissals, beforeFailure);
-  assert.equal(terminalSpeechUrl, null);
+  assert.equal(terminalSpeechPlayer.status.textContent, "Ready — tap ▶");
+  assert.equal(dismissals, beforeFailure + 1);
+  assert.match(terminalSpeechUrl, /^blob:/);
+  assert.equal(terminalSpeechPlayer.play.disabled, false);
+  await toggleTerminalSpeech();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Speech failed: playback blocked.");
   assertAudioReleased();
   failPlay = false;
   failUnlock = true;
-  await tap(); // Rejected silent unlock is handled; real playback may still succeed.
-  assert.equal(dismissals, beforeFailure + 1);
+  const beforeBlockedUnlock = events.filter(event => event === "play").length;
+  await tap(); // Rejected silent unlock waits for a direct Play tap.
+  assert.equal(dismissals, beforeFailure + 2);
+  assert.equal(terminalSpeechPlayer.status.textContent, "Ready — tap ▶");
+  assert.equal(events.filter(event => event === "play").length, beforeBlockedUnlock);
   failUnlock = false;
 
   let releaseOld;
@@ -504,7 +612,7 @@ const flush = () => new Promise(setImmediate);
   await old;
   assert.equal(terminalSpeechUrl, currentUrl);
   assert.equal(dismissals, beforeReplacement + 1);
-  assert.equal(events.at(-1), "Speaking terminal selection.");
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
 
   let releaseBlob;
   fetchResponse = () => Promise.resolve({ ...wav(), blob: () => new Promise(resolve => { releaseBlob = resolve; }) });
@@ -521,7 +629,10 @@ const flush = () => new Promise(setImmediate);
 
   let rejectOldPlay;
   const play = terminalSpeechAudio.play;
-  terminalSpeechAudio.play = function() { return new Promise((_resolve, reject) => { rejectOldPlay = reject; }); };
+  terminalSpeechAudio.play = function() {
+    if (this.src.startsWith("data:")) return play.call(this);
+    return new Promise((_resolve, reject) => { rejectOldPlay = reject; });
+  };
   const delayedPlay = tap();
   await flush();
   terminalSpeechAudio.play = play;
@@ -532,14 +643,15 @@ const flush = () => new Promise(setImmediate);
   await delayedPlay;
   assert.equal(terminalSpeechUrl, playingUrl);
   assert.equal(dismissals, playingDismissals);
-  assert.equal(events.at(-1), "Speaking terminal selection.");
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
 
   const beforeError = dismissals;
+  terminalSpeechAudio.error = { code: 3 };
   terminalSpeechAudio.onerror();
   assert.equal(terminalSpeechUrl, null);
   assertAudioReleased();
   assert.equal(dismissals, beforeError);
-  assert.equal(events.at(-1), "Speech failed: audio element error.");
+  assert.equal(terminalSpeechPlayer.status.textContent, "Speech failed: audio element error.");
 
   await tap();
   const beforeEmpty = requests.length;
@@ -551,7 +663,7 @@ const flush = () => new Promise(setImmediate);
   assert.equal(terminalSpeechUrl, null);
   assert.ok(revoked.includes(beforeEmptyUrl));
   assert.equal(dismissals, beforeEmptyDismissals);
-  assert.equal(events.at(-1), "Select terminal text first.");
+  assert.equal(terminalSpeechPlayer.status.textContent, "Select terminal text first.");
   assertAudioReleased();
 
   for (const result of [{ text: "" }, { error: "Selection unavailable." }]) {
@@ -569,7 +681,7 @@ const flush = () => new Promise(setImmediate);
     authCapability = "";
     const beforeAuthFailure = requests.length;
     await tap();
-    assert.equal(events.at(-1), "Speech failed: no auth token.");
+    assert.equal(terminalSpeechPlayer.status.textContent, "Speech failed: no auth token.");
     assert.equal(requests.length, beforeAuthFailure);
     assertAudioReleased();
   }
@@ -590,6 +702,8 @@ const flush = () => new Promise(setImmediate);
   ordinaryGestures();
   const releaseFailedUnlock = releaseUnlock;
   selection = "replacement";
+  let releaseReplacementSelection;
+  selectionResponse = () => new Promise(resolve => { releaseReplacementSelection = resolve; });
   const beforeUnlocks = events.filter(event => event === "unlock").length;
   const pendingReplacement = tap();
   assert.equal(events.filter(event => event === "unlock").length, beforeUnlocks + 1);
@@ -600,13 +714,121 @@ const flush = () => new Promise(setImmediate);
   assert.equal(terminalSpeechUnlocked, false);
   assert.equal(terminalSpeechAudio.paused, false);
   releaseUnlock();
+  releaseReplacementSelection({ text: selection });
   await pendingReplacement;
   assert.match(terminalSpeechAudio.src, /^blob:/);
+  terminalSpeechAudio.ended = true;
   terminalSpeechAudio.onended();
   assertAudioReleased();
 })().catch(error => { console.error(error); process.exitCode = 1; });
 ''',
         ]))
+
+    def test_speech_player_stays_preparing_through_selection_auth_fetch_and_blob(self):
+        self.run_node_source('const assert = require("node:assert/strict");\n' + speech_player_harness() + r'''
+(async () => {
+  let releaseSelection, releaseAuth, releaseFetch, releaseBlob;
+  selectionResponse = () => new Promise(resolve => { releaseSelection = resolve; });
+  authResponse = () => new Promise(resolve => { releaseAuth = resolve; });
+  fetchResponse = () => new Promise(resolve => { releaseFetch = resolve; });
+  const speaking = tap();
+  const player = terminalSpeechPlayer;
+  const preparing = () => {
+    assert.equal(player.player.hidden, false);
+    assert.equal(player.status.textContent, "Preparing…");
+    assert.equal(player.play.disabled, true);
+    assert.equal(player.seek.disabled, true);
+  };
+  preparing();
+  await flush();
+  preparing();
+  assert.equal(events.some(event => event.type === "auth"), false);
+  releaseSelection({ text: "raw\r\n  text", authority: "terminal-raw" });
+  await flush();
+  preparing();
+  assert.equal(requests.length, 0);
+  releaseAuth("test-capability");
+  await flush();
+  preparing();
+  assert.deepEqual(JSON.parse(requests[0].body), { text: "raw\n  text" });
+  releaseFetch({ ...wav(), blob: () => new Promise(resolve => { releaseBlob = resolve; }) });
+  await flush();
+  preparing();
+  releaseBlob({});
+  await speaking;
+  assert.equal(player.status.textContent, "Playing");
+  assert.equal(player.play.disabled, false);
+  assert.equal(dismissals, 1);
+  assert.equal(document.body.children.length, 1);
+  assert.equal(player.player.attributes.role, "group");
+  assert.equal(player.status.attributes["aria-live"], "polite");
+  assert.equal(player.time.attributes["aria-live"], undefined);
+  assert.equal(player.seek.attributes["aria-label"], "Speech progress");
+  assert.equal(player.play.attributes["aria-label"], "Pause speech");
+  assert.equal(player.player.children.at(-1).attributes["aria-label"], "Dismiss speech player");
+  dismiss();
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''')
+
+    def test_speech_player_dismiss_and_replacement_ignore_every_late_stage(self):
+        self.run_node_source('const assert = require("node:assert/strict");\n' + speech_player_harness() + r'''
+(async () => {
+  for (const stage of ["selection", "auth", "fetch", "blob", "play"]) {
+    for (const replace of [false, true]) {
+      let release;
+      const deferred = () => new Promise(resolve => { release = resolve; });
+      selectionResponse = stage === "selection" ? deferred : () => Promise.resolve({ text: "text" });
+      authResponse = stage === "auth" ? deferred : () => Promise.resolve("test-capability");
+      fetchResponse = stage === "fetch" ? deferred : () => Promise.resolve({ ...wav(), blob: stage === "blob" ? deferred : async () => ({}) });
+      playResponse = stage === "play" ? deferred : () => Promise.resolve();
+      const old = tap();
+      const controller = terminalSpeechRequest;
+      await flush();
+      assert.equal(typeof release, "function", stage);
+      if (replace) {
+        selectionResponse = () => Promise.resolve({ text: "replacement" });
+        authResponse = () => Promise.resolve("test-capability");
+        fetchResponse = () => Promise.resolve(wav());
+        playResponse = () => Promise.resolve();
+        await tap();
+      } else {
+        dismiss();
+      }
+      const url = terminalSpeechUrl, count = dismissals, requestCount = requests.length;
+      assert.equal(controller.signal.aborted, true);
+      assert.equal(pendingSpeechAuth, null);
+      release(stage === "selection" ? { text: "old" } : stage === "auth" ? "test-capability" : stage === "fetch" ? wav() : {});
+      await old;
+      assert.equal(terminalSpeechUrl, url, stage);
+      assert.equal(dismissals, count, stage);
+      assert.equal(requests.length, requestCount, stage);
+      assert.equal(terminalSpeechPlayer.player.hidden, !replace, stage);
+      if (replace) {
+        assert.equal(terminalSpeechPlayer.status.textContent, "Playing", stage);
+        dismiss();
+      }
+      assert.equal(terminalSpeechAudio.src, "");
+      assert.equal(terminalSpeechAudio.paused, true);
+      assert.equal(terminalSpeechBlob, null);
+      assert.equal(new Set(revoked).size, urlCounter);
+      assert.equal(revoked.length, urlCounter);
+    }
+  }
+  assert.equal(document.body.children.length, 1);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''')
+
+    def test_speech_player_controls_have_compact_safe_area_styles(self):
+        player = css_rule(".terminal-speech-player")
+        self.assertIn("var(--app-top) + var(--app-height)", player)
+        self.assertIn("var(--shortcut-reserve)", player)
+        self.assertIn("var(--safe-area-inset-left)", player)
+        self.assertIn("var(--safe-area-inset-right)", player)
+        self.assertIn("minmax(0, 1fr)", player)
+        self.assertIn("display: none", css_rule(".terminal-speech-player[hidden]"))
+        self.assertIn("min-height: 44px", css_rule(".terminal-speech-player button"))
+        self.assertIn("min-height: 44px", css_rule(".terminal-speech-player input"))
+        self.assertIn("outline:", css_rule(".terminal-speech-player :focus-visible"))
 
     def test_speak_chip_is_always_visible_and_preserves_tap_deduplication(self):
         self.run_node_source("\n".join([

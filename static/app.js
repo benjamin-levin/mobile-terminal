@@ -1932,9 +1932,219 @@
   let terminalSpeechRequest = null;
   let terminalSpeechUrl = null;
   let terminalSpeechGeneration = 0;
+  let terminalSpeechPlayAttempt = 0;
+  let terminalSpeechBlob = null;
+  let terminalSpeechPlayer = null;
+  let terminalSpeechState = "";
+  let terminalSpeechSeeking = false;
   let pendingSpeechAuth = null;
   const TERMINAL_SILENT_WAV =
     "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
+
+  function ensureTerminalSpeechPlayer() {
+    if (terminalSpeechPlayer) {
+      return terminalSpeechPlayer;
+    }
+    const player = document.createElement("div");
+    player.className = "terminal-speech-player";
+    player.setAttribute("role", "group");
+    player.setAttribute("aria-label", "Terminal speech player");
+    const status = document.createElement("div");
+    status.className = "terminal-speech-status";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.setAttribute("aria-atomic", "true");
+    const play = document.createElement("button");
+    play.type = "button";
+    play.addEventListener("click", toggleTerminalSpeech);
+    const seek = document.createElement("input");
+    seek.type = "range";
+    seek.min = "0";
+    seek.max = "0";
+    seek.step = "0.1";
+    seek.value = "0";
+    seek.setAttribute("aria-label", "Speech progress");
+    seek.addEventListener("input", () => {
+      if (!seek.disabled && terminalSpeechAudio) {
+        terminalSpeechAudio.currentTime = Number(seek.value);
+        updateTerminalSpeechProgress();
+      }
+    });
+    const beginSeek = (event) => {
+      terminalSpeechSeeking = true;
+      if (event.pointerId !== undefined) {
+        seek.setPointerCapture(event.pointerId);
+      }
+    };
+    const endSeek = () => {
+      terminalSpeechSeeking = false;
+      updateTerminalSpeechProgress();
+    };
+    for (const type of ["pointerdown", "touchstart"]) {
+      seek.addEventListener(type, beginSeek, { passive: true });
+    }
+    for (const type of ["pointerup", "pointercancel", "lostpointercapture", "touchend", "touchcancel", "blur"]) {
+      seek.addEventListener(type, endSeek);
+    }
+    const time = document.createElement("span");
+    time.className = "terminal-speech-time";
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.textContent = "×";
+    dismiss.setAttribute("aria-label", "Dismiss speech player");
+    dismiss.addEventListener("click", dismissTerminalSpeech);
+    // Native controls own their gestures, not terminal selection or keyboard taps.
+    for (const type of ["click", "pointerdown", "pointerup", "touchstart", "touchmove", "touchend", "touchcancel"]) {
+      player.addEventListener(type, (event) => event.stopPropagation(), { passive: true });
+    }
+    player.append(status, play, seek, time, dismiss);
+    document.body.appendChild(player);
+    terminalSpeechPlayer = { player, status, play, seek, time };
+    return terminalSpeechPlayer;
+  }
+
+  function setTerminalSpeechState(state, message = state) {
+    terminalSpeechState = state;
+    const { player, status, play } = ensureTerminalSpeechPlayer();
+    player.hidden = false;
+    status.textContent = message;
+    play.textContent = state === "Playing" ? "Ⅱ" : "▶";
+    play.setAttribute("aria-label", state === "Playing" ? "Pause speech" : "Play speech");
+    play.disabled = !terminalSpeechBlob;
+    updateTerminalSpeechProgress();
+  }
+
+  function updateTerminalSpeechProgress() {
+    if (!terminalSpeechPlayer) {
+      return;
+    }
+    const { seek, time } = terminalSpeechPlayer;
+    const duration = terminalSpeechAudio?.duration;
+    const knownDuration = Number.isFinite(duration) && duration > 0;
+    // Done retains its final position, but never retains an active audio source.
+    if (terminalSpeechState !== "Done") {
+      seek.disabled = !terminalSpeechUrl || !knownDuration;
+      seek.max = knownDuration ? String(duration) : "0";
+      if (!terminalSpeechSeeking) {
+        const current = terminalSpeechAudio?.currentTime;
+        seek.value = knownDuration && Number.isFinite(current) ? String(Math.min(duration, Math.max(0, current))) : "0";
+      }
+    } else {
+      seek.disabled = true;
+    }
+    const format = (seconds) => {
+      const whole = Math.max(0, Math.floor(seconds));
+      return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
+    };
+    const elapsed = format(Number(seek.value));
+    const total = Number(seek.max) > 0 ? format(Number(seek.max)) : "--:--";
+    time.textContent = `${elapsed} / ${total}`;
+    seek.setAttribute("aria-valuetext", `${elapsed} of ${total}`);
+  }
+
+  function dismissTerminalSpeech() {
+    terminalSpeechGeneration += 1;
+    terminalSpeechRequest?.abort();
+    terminalSpeechRequest = null;
+    pendingSpeechAuth?.finish("");
+    terminalSpeechBlob = null;
+    clearTerminalSpeechAudio();
+    terminalSpeechState = "";
+    if (terminalSpeechPlayer) {
+      terminalSpeechPlayer.player.hidden = true;
+    }
+  }
+
+  function failTerminalSpeech(message) {
+    terminalSpeechBlob = null;
+    clearTerminalSpeechAudio();
+    setTerminalSpeechState("Error", message);
+    return false;
+  }
+
+  function attachTerminalSpeechAudio() {
+    terminalSpeechUrl = URL.createObjectURL(terminalSpeechBlob);
+    terminalSpeechAudio.src = terminalSpeechUrl;
+    const generation = terminalSpeechGeneration;
+    const url = terminalSpeechUrl;
+    const current = () => generation === terminalSpeechGeneration && url === terminalSpeechUrl;
+    terminalSpeechAudio.onloadedmetadata = terminalSpeechAudio.ondurationchange = terminalSpeechAudio.ontimeupdate = () => {
+      if (current()) {
+        updateTerminalSpeechProgress();
+      }
+    };
+    terminalSpeechAudio.onplay = () => {
+      if (current() && !terminalSpeechAudio.paused) {
+        setTerminalSpeechState("Playing");
+      }
+    };
+    terminalSpeechAudio.onpause = () => {
+      if (current() && terminalSpeechAudio.paused && terminalSpeechState === "Playing") {
+        terminalSpeechPlayAttempt += 1;
+        setTerminalSpeechState("Paused");
+      }
+    };
+    terminalSpeechAudio.onended = () => {
+      if (current() && terminalSpeechAudio.ended) {
+        terminalSpeechSeeking = false;
+        updateTerminalSpeechProgress();
+        setTerminalSpeechState("Done");
+        clearTerminalSpeechAudio();
+      }
+    };
+    terminalSpeechAudio.onerror = () => {
+      if (current() && terminalSpeechAudio.error) {
+        failTerminalSpeech("Speech failed: audio element error.");
+      }
+    };
+  }
+
+  function playTerminalSpeech(autoplay = false) {
+    if (!terminalSpeechBlob) {
+      return Promise.resolve(false);
+    }
+    const generation = terminalSpeechGeneration;
+    const attempt = ++terminalSpeechPlayAttempt;
+    const current = () => generation === terminalSpeechGeneration && attempt === terminalSpeechPlayAttempt;
+    const rejected = () => {
+      if (current()) {
+        if (autoplay) {
+          terminalSpeechUnlocked = false;
+          setTerminalSpeechState("Ready", "Ready — tap ▶");
+        } else {
+          failTerminalSpeech("Speech failed: playback blocked.");
+        }
+      }
+      return false;
+    };
+    try {
+      if (!terminalSpeechUrl) {
+        attachTerminalSpeechAudio();
+      }
+      // Keep play() on the button's gesture stack, including replay after Done.
+      const playing = terminalSpeechAudio.play();
+      setTerminalSpeechState("Playing");
+      return Promise.resolve(playing).then(() => {
+        if (!current()) {
+          return false;
+        }
+        terminalSpeechUnlocked = true;
+        return true;
+      }, rejected);
+    } catch (_error) {
+      return Promise.resolve(rejected());
+    }
+  }
+
+  function toggleTerminalSpeech() {
+    if (terminalSpeechState === "Playing") {
+      terminalSpeechPlayAttempt += 1;
+      terminalSpeechAudio.pause();
+      setTerminalSpeechState("Paused");
+    } else {
+      return playTerminalSpeech();
+    }
+  }
 
   function unlockTerminalSpeech() {
     if (terminalSpeechUnlocked) {
@@ -1972,11 +2182,20 @@
 
   function clearTerminalSpeechAudio() {
     terminalSpeechUnlockPromise = null;
+    terminalSpeechUnlocked = false;
+    terminalSpeechPlayAttempt += 1;
+    terminalSpeechSeeking = false;
     if (terminalSpeechAudio) {
       terminalSpeechAudio.onended = null;
       terminalSpeechAudio.onerror = null;
+      terminalSpeechAudio.onloadedmetadata = null;
+      terminalSpeechAudio.ondurationchange = null;
+      terminalSpeechAudio.ontimeupdate = null;
+      terminalSpeechAudio.onplay = null;
+      terminalSpeechAudio.onpause = null;
       terminalSpeechAudio.pause();
       terminalSpeechAudio.removeAttribute("src");
+      terminalSpeechAudio.load();
     }
     if (terminalSpeechUrl) {
       URL.revokeObjectURL(terminalSpeechUrl);
@@ -2006,22 +2225,15 @@
   async function speakTerminalSelection() {
     const generation = ++terminalSpeechGeneration;
     terminalSpeechRequest?.abort();
+    pendingSpeechAuth?.finish("");
+    terminalSpeechBlob = null;
     clearTerminalSpeechAudio();
+    setTerminalSpeechState("Preparing", "Preparing…");
     const controller = new AbortController();
     terminalSpeechRequest = controller;
-    // Prime the audio element inside the tap gesture, before any await, so iOS
-    // permits programmatic playback once the synthesized WAV arrives.
-    const unlocked = unlockTerminalSpeech();
-    let failed = false;
-    const fail = (message) => {
-      if (generation === terminalSpeechGeneration && !failed) {
-        failed = true;
-        terminalSpeechUnlocked = false;
-        clearTerminalSpeechAudio();
-        showToast(message);
-      }
-      return false;
-    };
+    // Prime only on Speak's gesture. Idle terminal taps never claim audio.
+    unlockTerminalSpeech();
+    const fail = (message) => generation === terminalSpeechGeneration ? failTerminalSpeech(message) : false;
     try {
       // term.getSelection() is empty on mobile Safari; ask the server for the
       // authoritative selection, the same source Copy and To-tab already use.
@@ -2061,25 +2273,21 @@
         return fail("Speech failed: reply not audio.");
       }
       const audio = await response.blob();
-      await unlocked;
       if (generation !== terminalSpeechGeneration) {
         return false;
       }
-      terminalSpeechUrl = URL.createObjectURL(audio);
-      terminalSpeechAudio.src = terminalSpeechUrl;
-      terminalSpeechAudio.onended = () => {
-        if (generation === terminalSpeechGeneration) {
-          clearTerminalSpeechAudio();
-        }
-      };
-      terminalSpeechAudio.onerror = () => fail("Speech failed: audio element error.");
-      await terminalSpeechAudio.play();
-      if (generation !== terminalSpeechGeneration || failed) {
-        return false;
+      const autoplay = terminalSpeechUnlocked;
+      // A slow/rejected silent play is not permission to auto-play the WAV.
+      // Retire it before attaching real media so a late unlock cannot pause it.
+      terminalSpeechUnlockPromise = null;
+      terminalSpeechAudio.pause();
+      terminalSpeechBlob = audio;
+      attachTerminalSpeechAudio();
+      setTerminalSpeechState("Ready", "Ready — tap ▶");
+      if (autoplay) {
+        await playTerminalSpeech(true);
       }
-      terminalSpeechUnlocked = true;
-      showToast("Speaking terminal selection.");
-      return true;
+      return generation === terminalSpeechGeneration && terminalSpeechState !== "Error";
     } catch (_error) {
       return fail("Speech failed: playback blocked.");
     } finally {
