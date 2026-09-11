@@ -16,7 +16,7 @@ Authority order is:
 2. Provider transcript authority.
 3. Ordinary tmux output outside provider-owned regions.
 
-Copy and To-tab intentionally call the same authoritative selection request. Direct PTY paste flattening is a separate safety boundary. In `enforce`, a provider-owned failure must never fall through to raw tmux text; the public failure is exactly:
+Copy, Speak, and To-tab share the same selection request. For ordinary authoritative requests in `enforce`, a provider-owned failure must never fall through to raw tmux text; the public failure is exactly:
 
 ```text
 Terminal changed; select again.
@@ -44,6 +44,14 @@ scripts/provider-mode.sh off --apply
 Without `--apply`, mode changes are previews. Enforcement is deliberately gated from `prefer` and requires the additional `--confirm-enforce` acknowledgement. Moving directly from `off` to `prefer` is allowed, but `shadow` remains the diagnostic rollout gate before live use. A successful test suite is not a substitute for a real ph/iPhone selection.
 
 In `prefer`, every provider-side rejection falls back to rendered cell extraction and carries only the sanitized `terminal-raw` indicator. Normal-buffer fallback uses the exact tmux cells. Alternate-screen fallback uses the validated client rows on which the selection was made, with physical row boundaries preserved, because the live pane may already have repainted. Copy and To-tab use the indicator for a non-blocking warning that line breaks and spaces may be terminal-rendered. A canonical transcript match carries `provider-exact`. Ordinary unowned selections carry no provider indicator, and no response exposes provider reason codes, transcript identifiers, or content beyond the selected result.
+
+## Explicit raw fallback
+
+Copy, Speak, and To-tab retry a transient stale-selection failure once after a bounded authority/epoch settle, using fresh selection state when the same region is still selected. If that fails, they send `rawFallback: true` with the original selected geometry and client rows, even if a reseed has cleared the visible selection. Ordinary authoritative requests and provider-exact verification remain unchanged; the explicit raw request is available in every provider mode, including `enforce`.
+
+Raw requests retain session/profile/pane isolation, coordinate bounds, and client-row/wire-size validation, but bypass epoch, revision, layout, row-identity, and provider/command provenance gates. Normal-buffer requests reuse the physical and `-J` snapshot extraction for selected subregions and soft-wrap joining. When that capture is unavailable or differs from the selected browser cells, the validated retained client rows supply the raw text; alternate-screen requests always use those rows. Responses carry only `terminal-raw`, never provider-exact authority. Copy retains its raw-text warning, Speak synthesizes the raw text, and To-tab preserves the raw indicator through its existing paste path. Direct PTY paste remains a separate safety boundary.
+
+If a raw request itself times out or fails while the socket is still connected, the browser falls back to the cell-sliced text saved at the original gesture, preserving wrap flags and selected columns. This last local floor cannot produce a server forensics record. Genuine missing selections and disconnected sockets still report errors, as do clipboard, speech authentication, synthesis, and playback failures. Server copy-forensics records include a boolean `rawFallback` marker for explicit raw requests.
 
 ## Rollout gate
 

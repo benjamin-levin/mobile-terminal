@@ -5413,7 +5413,7 @@ class PrivateTmuxSelectionStabilityIntegrationTest(unittest.IsolatedAsyncioTestC
             "/bin/sh -c 'printf \"\\033[2J\\033[H✅❌✨\"; read -r ignored'",
         )
         await harness.wait_for(
-            lambda: harness.run("capture-pane", "-p", "-t", "width").splitlines()[0],
+            lambda: (harness.run("capture-pane", "-p", "-t", "width").splitlines() or [""])[0],
             "✅❌✨", description="private emoji output",
         )
         cursor = int(harness.run("display-message", "-p", "-t", "width", "#{cursor_x}"))
@@ -5490,6 +5490,103 @@ class PrivateTmuxSelectionStabilityIntegrationTest(unittest.IsolatedAsyncioTestC
                 "end": {"x": 8, "y": self.keep_index},
             },
         }
+
+    async def test_explicit_raw_dispatch_bypasses_epoch_and_row_identity_only(self):
+        pane = capture_pane_snapshot(self.session_name, self.bridge.pane_id)
+        payload = self.payload(pane)
+        payload["type"] = "selection-request"
+        payload["selection"]["start"]["x"] = 2
+        payload["selection"]["end"]["x"] = 6
+        app = object.__new__(AppServer)
+        app.send_json = mock.AsyncMock()
+        state = {"session": self.session_name, "user": ""}
+        for stale in ("epoch", "row-identity"):
+            with self.subTest(stale=stale):
+                if stale == "epoch":
+                    payload["epoch"] = -1
+                    payload["cutoff"] = -1
+                    payload["layoutGeneration"] = -1
+                else:
+                    payload.update(epoch=self.bridge.epoch_state["epoch"],
+                                   cutoff=self.bridge.cutoff,
+                                   layoutGeneration=self.bridge.epoch_state["layout"])
+                    self.bridge.provenance_state.row_tracker.epoch += 1
+                payload.pop("rawFallback", None)
+                await app.handle_command(self.connection, self.bridge, state, payload)
+                self.assertEqual(app.send_json.await_args.args[1]["error"], "Terminal changed; select again.")
+                payload["rawFallback"] = True
+                with (
+                    mock.patch.dict(os.environ, {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "enforce"}),
+                    mock.patch("server.provider_selection") as provider,
+                ):
+                    await app.handle_command(self.connection, self.bridge, state, payload)
+                provider.assert_not_called()
+                self.assertEqual(app.send_json.await_args.args[1], {
+                    "type": "selection-result", "requestId": payload["requestId"],
+                    "text": "EP-R", "authority": "terminal-raw",
+                })
+
+    async def test_explicit_raw_capture_joins_wrapped_selected_subregion_and_records_marker(self):
+        await self.bridge.write("printf 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\\n  tail\\n'\r")
+        await self.bridge.quiet(0.08)
+        pane = capture_pane_snapshot(self.session_name, self.bridge.pane_id, server.MAX_HISTORY_SEED_LINES)
+        first = next(i for i, row in enumerate(pane.plain_physical_rows)
+                     if row == "ABCDEFGHIJKLMNOPQRSTUVWX")
+        payload = self.payload(pane)
+        payload.update(rawFallback=True, epoch=-1, revision=-1, layoutGeneration=-1)
+        payload["selection"] = {"start": {"x": 3, "y": first}, "end": {"x": 8, "y": first + 1}}
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                mock.patch("server.COPY_FORENSICS_ENABLED", True),
+                mock.patch("server.FORENSICS_ROOT", Path(temporary)),
+                mock.patch("builtins.print"),
+            ):
+                result = await self.bridge.authoritative_selection_result(payload)
+            record = json.loads(next(Path(temporary).glob("copy-*.jsonl")).read_text())
+        self.assertEqual(result, AuthoritativeSelectionResult("DEFGHIJKLMNOPQRSTUVWXYZ012345", authority="terminal-raw"))
+        self.assertIs(record["rawFallback"], True)
+        self.assertEqual(record["reason"], "raw-request")
+        self.assertEqual(record["authority"], "terminal-raw")
+        self.assertEqual(record["selectedText"], result.text)
+        self.assertEqual(record["resultText"], result.text)
+
+    async def test_explicit_raw_keeps_client_cells_after_repaint_or_capture_failure(self):
+        pane = capture_pane_snapshot(self.session_name, self.bridge.pane_id)
+        payload = self.payload(pane)
+        payload.update(rawFallback=True, epoch=None, revision=None, cutoff=None,
+                       layoutGeneration=None, baseY=0)
+        payload["selection"] = {"start": {"x": 1, "y": 0}, "end": {"x": 4, "y": 0}}
+        payload["clientRows"] = [{"y": 0, "text": "✅❌✨ab", "isWrapped": False,
+                                  "styles": [[0, pane.cols, "plain"]]}]
+        self.bridge.seed_degraded = True
+        self.bridge.seed_history = 20
+        for buffer_type in ("normal", "alternate"):
+            for capture_error in (False, True):
+                with self.subTest(buffer=buffer_type, capture_error=capture_error):
+                    payload["bufferType"] = buffer_type
+                    with mock.patch("server.capture_pane_snapshot", return_value=pane,
+                                    side_effect=RuntimeError("busy") if capture_error else None):
+                        result = await self.bridge.authoritative_selection_result(payload)
+                    self.assertEqual(result, AuthoritativeSelectionResult("❌✨a", authority="terminal-raw"))
+
+    async def test_explicit_raw_still_rejects_wrong_target_and_invalid_geometry(self):
+        pane = capture_pane_snapshot(self.session_name, self.bridge.pane_id)
+        base = self.payload(pane)
+        base.update(rawFallback=True, epoch=-1)
+        mutations = [
+            {"session": "another-session"}, {"paneId": "%99999"}, {"profile": "other"},
+            {"rawFallback": "true"}, {"baseY": -1}, {"bufferType": "invalid"},
+            {"selection": {"start": {"x": -1, "y": 0}, "end": {"x": 2, "y": 0}}},
+            {"selection": {"start": {"x": 0, "y": 0}, "end": {"x": pane.cols + 1, "y": 0}}},
+            {"selection": {"start": {"x": 0, "y": 0}, "end": {"x": 1, "y": pane.history + pane.rows}}},
+            {"clientRows": []}, {"_selectionRequestWireBytes": server.MAX_SELECTION_REQUEST_BYTES + 1},
+        ]
+        with mock.patch("server.capture_pane_snapshot") as capture:
+            for mutation in mutations:
+                with self.subTest(mutation=mutation):
+                    result = await self.bridge.authoritative_selection_result({**base, **mutation})
+                    self.assertEqual(result.error, "Terminal changed; select again.")
+            capture.assert_not_called()
 
     async def test_fresh_output_and_new_history_copy_without_reseed_or_retry(self):
         for command, expected in (

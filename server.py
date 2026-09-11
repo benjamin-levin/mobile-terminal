@@ -725,6 +725,7 @@ def _store_copy_forensics(
             "selectedText": trace.get("selectedText"),
             "resultText": result.text if result.error is None else None,
             "bufferType": str(payload.get("bufferType", "")),
+            "rawFallback": payload.get("rawFallback") is True,
             "clientRowsPresent": isinstance(payload.get("clientRows"), list),
             "clientRows": trace.get("clientRows", []),
             "paneId": str(payload.get("paneId", bridge.pane_id)),
@@ -4281,6 +4282,7 @@ class TmuxBridge:
     ) -> AuthoritativeSelectionResult:
         request_id = str(payload.get("requestId", ""))
         stale_message = "Terminal changed; select again."
+        raw_fallback = payload.get("rawFallback") is True
 
         def reject(reason: str) -> AuthoritativeSelectionResult:
             if forensics_trace is not None:
@@ -4302,10 +4304,10 @@ class TmuxBridge:
                     forensics_trace["rowQuarantineReasons"] = [reason]
 
         try:
-            epoch = int(payload.get("epoch", -1))
-            revision = int(payload.get("revision", -1))
-            cutoff = int(payload.get("cutoff", -1))
-            layout_generation = int(payload.get("layoutGeneration", -1))
+            epoch = int(payload.get("epoch", -1)) if not raw_fallback else -1
+            revision = int(payload.get("revision", -1)) if not raw_fallback else -1
+            cutoff = int(payload.get("cutoff", -1)) if not raw_fallback else -1
+            layout_generation = int(payload.get("layoutGeneration", -1)) if not raw_fallback else -1
             client_cols = int(payload.get("cols", -1))
             client_rows = int(payload.get("rows", -1))
             base_y = int(payload.get("baseY", -1))
@@ -4333,14 +4335,14 @@ class TmuxBridge:
             try:
                 client_selection_rows = _validated_client_selection_rows(
                     payload["clientRows"], client_cols, base_y + client_rows,
-                    start_y, end_y, client_coordinates=False,
+                    start_y, end_y, client_coordinates=raw_fallback,
                 )
                 if any(type(row.get("isWrapped")) is not bool for row in payload["clientRows"]):
                     raise ValueError("missing client wrap provenance")
                 normal_client_wraps = tuple(row["isWrapped"] for row in payload["clientRows"])
             except ValueError:
                 return reject("client-rows-invalid")
-        if buffer_type == "alternate":
+        if raw_fallback or buffer_type == "alternate":
             request_wire_bytes = payload.get("_selectionRequestWireBytes")
             if (
                 request_wire_bytes is not None
@@ -4351,6 +4353,7 @@ class TmuxBridge:
                 )
             ):
                 return reject("client-rows-invalid")
+        if buffer_type == "alternate":
             if base_y != 0 or not 0 <= start_y <= end_y < client_rows:
                 return reject("geometry-buffer-base-mismatch")
             try:
@@ -4370,7 +4373,7 @@ class TmuxBridge:
                     end_x,
                 )
         elif (
-            base_y < self.seed_history
+            base_y < (0 if raw_fallback else self.seed_history)
             or base_y > MAX_HISTORY_SEED_LINES
             or not 0 <= start_y <= base_y + client_rows - 1
             or not 0 <= end_y <= base_y + client_rows - 1
@@ -4385,7 +4388,43 @@ class TmuxBridge:
             payload.get("session") != self.session_name
             or payload.get("profile", "") != self.profile_id
             or payload.get("paneId") != self.pane_id
-            or epoch != self.epoch_state["epoch"]
+        ):
+            return reject("payload-identity")
+        if raw_fallback:
+            # Explicit raw requests retain the selected browser cells, not stale
+            # epoch/row identities. They never claim provider or command authority.
+            selected_text = (
+                _extract_client_selection_rows(client_selection_rows, start_x, end_x)
+                if client_selection_rows else None
+            )
+            if buffer_type == "normal":
+                try:
+                    snapshot = await asyncio.to_thread(
+                        capture_pane_snapshot, self.session_name, self.pane_id,
+                        max(base_y, CONNECT_HISTORY_LINES), require_stable=False,
+                    )
+                    if (
+                        snapshot.pane_id != self.pane_id
+                        or snapshot.cols != client_cols
+                        or snapshot.rows != client_rows
+                        or snapshot.alternate
+                    ):
+                        raise ValueError("raw selection geometry changed")
+                    captured_text = extract_authoritative_selection(
+                        snapshot, start_x, start_y - base_y, end_x, end_y - base_y,
+                    )
+                    if selected_text is None or selected_text == captured_text:
+                        selected_text = captured_text
+                except (RuntimeError, ValueError):
+                    if selected_text is None:
+                        return reject("raw-snapshot-unavailable")
+            if forensics_trace is not None:
+                forensics_trace["selectedText"] = selected_text
+                forensics_trace["decision"] = "fallback"
+                forensics_trace["reason"] = "raw-request"
+            return AuthoritativeSelectionResult(text=selected_text or "", authority="terminal-raw")
+        if (
+            epoch != self.epoch_state["epoch"]
             or cutoff != self.cutoff
             or layout_generation != self.epoch_state["layout"]
         ):
