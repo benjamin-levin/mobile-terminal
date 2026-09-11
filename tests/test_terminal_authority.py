@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -37,6 +38,34 @@ from server import (
     extract_authoritative_selection,
     unwrap_selected_url,
 )
+
+
+def xterm_client_rows(styled_rows, cols):
+    root = Path(__file__).parents[1]
+    source = (root / "static/app.js").read_text()
+    functions = [
+        re.search(rf"^  function {name}\(.*?^  \}}$", source, re.M | re.S)[0]
+        for name in ("terminalCellStyleToken", "terminalSelectionClientRows")
+    ]
+    script = '\n'.join([
+        f'const {{ Terminal }} = require({json.dumps(str(root / "node_modules/@xterm/xterm"))});',
+        f'const term = new Terminal({{cols: {cols}, rows: {max(2, len(styled_rows))}, allowProposedApi: true}});',
+        *functions,
+        '(async () => {',
+        'await new Promise(resolve => term.write("\\x1b[?1049h", resolve));',
+        f'const lines = {json.dumps(styled_rows)};',
+        'for (let y = 0; y < lines.length; y++) {',
+        '  await new Promise(resolve => term.write(`\\x1b[${y + 1};1H` + lines[y], resolve));',
+        '}',
+        'console.log(JSON.stringify(terminalSelectionClientRows(term.buffer.active,',
+        '  {start: {x: 0, y: 0}, end: {x: term.cols, y: lines.length - 1}})));',
+        'term.dispose();',
+        '})().catch(error => { console.error(error); process.exitCode = 1; });',
+    ])
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        raise AssertionError(result.stderr)
+    return json.loads(result.stdout)
 
 
 def snapshot(
@@ -179,13 +208,13 @@ class AuthoritativeSelectionTest(unittest.TestCase):
         )
 
     def test_client_row_slicing_clamps_wide_grapheme_boundaries(self):
-        client_rows = ((0, "😀界X", ((0, 5, "plain"),), False),)
+        client_rows = ((0, "😀界X", ((0, 4, "plain"),), False),)
 
         cases = (
             (0, 1, "😀"),
-            (1, 2, "😀"),
+            (1, 2, "界"),
             (2, 3, "界"),
-            (3, 4, "界"),
+            (3, 4, "X"),
         )
         for start, end, expected in cases:
             with self.subTest(start=start, end=end):
@@ -193,6 +222,57 @@ class AuthoritativeSelectionTest(unittest.TestCase):
                     server._extract_client_selection_rows(client_rows, start, end),
                     expected,
                 )
+
+    def test_provider_client_projection_preserves_source_styles_and_boundaries(self):
+        record = provider_authority.AssistantTextRecord(
+            "claude", "fixture", "fixture", "✅ **alpha** beta gamma delta  \n  ❌ ✨ end  ", 0,
+        )
+        native = provider_authority.render_semantic_candidate(record, version="2.1.263", cols=14)
+        client = provider_authority.render_semantic_candidate(
+            record, version="2.1.263", cols=14, client_coordinates=True,
+        )
+        self.assertEqual(native.plain_rows[0], "● ✅ alpha    ")
+        self.assertEqual(client.plain_rows[0], "● ✅ alpha     ")
+        self.assertEqual(len(client.plain_rows), len(native.plain_rows))
+        self.assertEqual(client.copy_text, "✅ alpha beta gamma delta  \n  ❌ ✨ end  ")
+        self.assertEqual((client.source_start, client.source_end), (0, len(record.text.encode("utf-8"))))
+        for original, projected in zip(native.cells, client.cells):
+            self.assertEqual(
+                (original.row, original.text, original.copy_start, original.copy_end, original.style),
+                (projected.row, projected.text, projected.copy_start, projected.copy_end, projected.style),
+            )
+        for original, projected in zip(native.boundaries, client.boundaries):
+            self.assertEqual(replace(projected, anchor_column=original.anchor_column), original)
+        strong = next(cell for cell in client.cells if cell.style == "strong")
+        self.assertEqual((strong.text, strong.column), ("a", 4))
+        styles = tuple(tuple(
+            (start, end, {"assistant-dot": "plain;fg-indexed-231", "assistant": "plain"}.get(style, style))
+            for start, end, style in spans
+        ) for spans in client.style_rows)
+        result = provider_authority.match_complete_provider_block(
+            (client,), client.plain_rows, client.selection_start, client.selection_end,
+            style_rows=styles, client_coordinates=True,
+        )
+        self.assertTrue(result.matched, result.internal_reason)
+        self.assertEqual(result.text, client.copy_text)
+        bad_styles = tuple(tuple((start, end, "plain" if style == "strong" else style)
+                                 for start, end, style in spans) for spans in styles)
+        rejected = provider_authority.match_complete_provider_block(
+            (client,), client.plain_rows, client.selection_start, client.selection_end,
+            style_rows=bad_styles, client_coordinates=True,
+        )
+        self.assertEqual(rejected.internal_reason, "style-mismatch")
+
+    def test_provider_client_projection_rejects_expansion_and_nonatomic_graphemes(self):
+        for text, reason in (("㉈" * 6, "renderer-width-too-small"),
+                             ("a᪰", "unsupported-grapheme-width"),
+                             ("👩‍💻", "unsupported-grapheme-width")):
+            with self.subTest(text=text):
+                record = provider_authority.AssistantTextRecord("claude", "fixture", "fixture", text, 0)
+                with self.assertRaisesRegex(provider_authority.ProviderAuthorityError, reason):
+                    provider_authority.render_semantic_candidate(
+                        record, version="2.1.263", cols=8, client_coordinates=True,
+                    )
 
     def test_client_row_validation_retains_wrap_flags_and_defaults_to_hard_line(self):
         for wrap_field, expected in (({}, False), ({"isWrapped": False}, False),
@@ -4722,6 +4802,179 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
                     text, error = await bridge.authoritative_selection(payload)
                 self.assertEqual((text, error), ("KEEP", None))
 
+    async def test_alternate_padded_emoji_rows_roundtrip_real_xterm_cells(self):
+        for text in ("✅❌✨" + "x" * 11, "✅❌✨", "😀é界", "👩‍💻🇺🇸"):
+            with self.subTest(text=text):
+                rows = xterm_client_rows([text], 14)
+                pane = replace(snapshot(cols=14, authored_lines=["repaint", ""], rows=2), alternate=True)
+                bridge, payload = self.make_bridge(pane)
+                payload.update({
+                    "bufferType": "alternate", "clientRows": rows,
+                    "selection": {"start": {"x": 0, "y": 0}, "end": {"x": 14, "y": 0}},
+                })
+                with (
+                    mock.patch("server.capture_pane_snapshot", return_value=pane),
+                    mock.patch("provider_authority.provider_authority_mode", return_value="off"),
+                ):
+                    result = await bridge.authoritative_selection_result(payload)
+                self.assertEqual(result, AuthoritativeSelectionResult(text=rows[0]["text"]))
+                validated = server._validated_client_selection_rows(rows, 14, 2, 0, 0)
+                self.assertEqual(server._client_row_display_tokens(rows[0]["text"])[1], 14)
+                self.assertEqual(
+                    server._extract_client_selection_rows(validated, 0, 1),
+                    "👩‍" if text.startswith("👩") else text[0],
+                )
+
+    async def test_emoji_rows_preserve_validation_and_identity_guards(self):
+        pane = replace(snapshot(cols=8, authored_lines=["repaint", ""], rows=2), alternate=True)
+        rows = xterm_client_rows(["✅❌✨"], 8)
+        invalid_styles = (
+            [[0, 8, "plain"]] * 9,
+            [[0, 2, "plain"], [3, 8, "plain"]],
+            [[0, 3, "plain"], [2, 8, "plain"]],
+            [[0, 9, "plain"]],
+            [[0, 7, "plain"]],
+            [[True, 8, "plain"]],
+            [[0, 8, "private"]],
+        )
+        cases = [
+            ({"clientRows": [dict(rows[0], text=rows[0]["text"] + "x")]}, "client-rows-invalid"),
+            ({"clientRows": [dict(rows[0], text="界" * 5)]}, "client-rows-invalid"),
+            *(({"clientRows": [dict(rows[0], styles=styles)]}, "client-rows-invalid") for styles in invalid_styles),
+            ({"_selectionRequestWireBytes": server.MAX_SELECTION_REQUEST_BYTES + 1}, "client-rows-invalid"),
+            ({"paneId": "%2"}, "payload-identity"),
+            ({"session": "other"}, "payload-identity"),
+            ({"epoch": 1}, "payload-identity"),
+            ({"revision": 1}, "revision-phase"),
+        ]
+        for update, reason in cases:
+            with self.subTest(update=update):
+                bridge, payload = self.make_bridge(pane)
+                payload.update({"bufferType": "alternate", "clientRows": rows})
+                payload.update(update)
+                with (
+                    mock.patch("server.capture_pane_snapshot") as capture,
+                    mock.patch("server._record_authoritative_selection_rejection") as rejected,
+                ):
+                    result = await bridge.authoritative_selection_result(payload)
+                self.assertEqual(result.error, "Terminal changed; select again.")
+                rejected.assert_called_once_with(reason)
+                capture.assert_not_called()
+
+        # The normal-buffer validator deliberately retains its prior model.
+        bridge, payload = self.make_bridge(replace(pane, alternate=False))
+        payload["clientRows"] = rows
+        with mock.patch("server.capture_pane_snapshot") as capture:
+            result = await bridge.authoritative_selection_result(payload)
+        self.assertEqual(result.error, "Terminal changed; select again.")
+        capture.assert_not_called()
+        self.assertEqual(provider_authority._captured_grapheme_width("✅"), 2)
+        with self.assertRaises(RuntimeError):
+            server._verified_grapheme_width("✅")
+
+    async def test_alternate_provider_clean_copy_projects_native_wraps_into_xterm(self):
+        from tests.test_provider_authority import binding, claude_text, write_jsonl
+
+        source = "✅ alpha beta gamma delta  \n❌ ✨ end  "
+        styled_rows = [
+            "\x1b[38;5;231m●\x1b[0m ✅ alpha",
+            "  beta gamma", "  delta", "  ❌ ✨ end",
+        ]
+        rows = xterm_client_rows(styled_rows, 14)
+        self.assertEqual(rows[0]["text"], "● ✅ alpha     ")
+        # Live tmux rows are only identity/ownership context for an alternate
+        # selection; their text and columns are not relabelled as browser cells.
+        pane = replace(snapshot(cols=14, authored_lines=["later repaint"] * 4, rows=4), alternate=True)
+        cases = (
+            ({"x": 2, "y": 0}, {"x": 14, "y": 3}, "✅ alpha beta gamma delta  \n❌ ✨ end  "),
+            ({"x": 4, "y": 0}, {"x": 12, "y": 1}, "alpha beta gamma"),
+            ({"x": 2, "y": 3}, {"x": 9, "y": 3}, "❌ ✨ end  "),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            path = home / ".claude/projects/fixture/transcript.jsonl"
+            write_jsonl(path, [claude_text(source)])
+            identity = binding("claude", path, version="2.1.263", pane="%1")
+            for start, end, expected in cases:
+                with self.subTest(start=start, end=end):
+                    bridge, payload = self.make_bridge(pane)
+                    payload.update({
+                        "bufferType": "alternate",
+                        "selection": {"start": start, "end": end},
+                        "clientRows": rows[start["y"]:end["y"] + 1],
+                    })
+                    with (
+                        mock.patch("server.capture_pane_snapshot", return_value=pane),
+                        mock.patch("provider_authority.provider_authority_mode", return_value="prefer"),
+                        mock.patch("provider_authority._load_binding_cache", return_value=None),
+                        mock.patch("provider_authority.resolve_provider_binding", return_value=(identity, {})) as resolve,
+                        mock.patch("provider_authority.validate_binding_process") as process,
+                        mock.patch("provider_authority.revalidate_transcript_fence", wraps=provider_authority.revalidate_transcript_fence) as fence,
+                        mock.patch.object(Path, "home", return_value=home),
+                    ):
+                        result = await bridge.authoritative_selection_result(payload)
+                    self.assertEqual(result, AuthoritativeSelectionResult(text=expected, authority="provider-exact"))
+                    self.assertEqual(resolve.call_count, 2)
+                    self.assertEqual(process.call_count, 2)
+                    self.assertEqual(fence.call_count, 2)
+
+            for failure in ("style", "duplicate", "binding", "transcript", "bold"):
+                with self.subTest(failure=failure):
+                    transcript_source = source.replace("alpha", "**alpha**") if failure == "bold" else source
+                    write_jsonl(path, [claude_text(transcript_source)] + (
+                        [claude_text(source, message_id="msg_2", record_uuid="record-2")]
+                        if failure == "duplicate" else []
+                    ))
+                    bridge, payload = self.make_bridge(pane)
+                    selected_rows = copy.deepcopy(rows)
+                    if failure == "bold":
+                        selected_rows = xterm_client_rows([
+                            styled_rows[0].replace("alpha", "\x1b[1malpha\x1b[0m"), *styled_rows[1:],
+                        ], 14)
+                    if failure == "style":
+                        selected_rows[0]["styles"] = [[0, 14, "plain"]]
+                    payload.update({
+                        "bufferType": "alternate", "clientRows": selected_rows,
+                        "selection": {"start": {"x": 2, "y": 0}, "end": {"x": 14, "y": 3}},
+                    })
+                    calls = 0
+                    def resolve_binding(*_args, **_kwargs):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 2:
+                            if failure == "binding":
+                                raise provider_authority.ProviderAuthorityError("binding-changed")
+                            if failure == "transcript":
+                                with path.open("ab") as stream:
+                                    stream.write(b"{}\n")
+                        return identity, {}
+                    with (
+                        mock.patch("server.capture_pane_snapshot", return_value=pane),
+                        mock.patch("provider_authority.provider_authority_mode", return_value="prefer" if failure == "bold" else "enforce"),
+                        mock.patch("provider_authority._load_binding_cache", return_value=None),
+                        mock.patch("provider_authority.resolve_provider_binding", side_effect=resolve_binding),
+                        mock.patch("provider_authority._transcript_index", return_value=provider_authority.TranscriptIndex()),
+                        mock.patch("provider_authority._record_provider_diagnostic") as diagnostic,
+                        mock.patch("provider_authority.validate_binding_process"),
+                        mock.patch.object(Path, "home", return_value=home),
+                    ):
+                        result = await bridge.authoritative_selection_result(payload)
+                    if failure == "bold":
+                        # Existing xterm numeric style flags serialize as plain.
+                        # Prefer still gives Copy/Speak a successful raw result.
+                        self.assertEqual(result, AuthoritativeSelectionResult(
+                            text="✅ alpha     \n  beta gamma  \n  delta       \n  ❌ ✨ end     ",
+                            authority="terminal-raw",
+                        ))
+                        diagnostic.assert_called_once_with("prefer", "fallback", "style-mismatch")
+                        continue
+                    self.assertEqual(result.error, "Terminal changed; select again.")
+                    self.assertIsNone(result.text)
+                    diagnostic.assert_called_once_with("enforce", "rejected", {
+                        "style": "style-mismatch", "duplicate": "placement-ambiguous",
+                        "binding": "binding-changed", "transcript": "transcript-changed",
+                    }[failure])
+
     async def test_alternate_client_rows_are_strictly_bounded_before_capture(self):
         pane = replace(
             snapshot(cols=8, authored_lines=["KEEP"], rows=1),
@@ -5153,6 +5406,21 @@ class SelectionRowStabilityTest(unittest.IsolatedAsyncioTestCase):
 
 
 class PrivateTmuxSelectionStabilityIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_private_tmux_and_browser_keep_distinct_emoji_cell_geometry(self):
+        harness = TmuxHarness(self, prefix="mt-width-")
+        harness.start_session(
+            "width", "-x", "40", "-y", "6",
+            "/bin/sh -c 'printf \"\\033[2J\\033[H✅❌✨\"; read -r ignored'",
+        )
+        await harness.wait_for(
+            lambda: harness.run("capture-pane", "-p", "-t", "width").splitlines()[0],
+            "✅❌✨", description="private emoji output",
+        )
+        cursor = int(harness.run("display-message", "-p", "-t", "width", "#{cursor_x}"))
+        self.assertEqual(cursor, 6)
+        self.assertEqual(server.wcswidth("✅❌✨"), 6)
+        self.assertEqual(server._client_row_display_tokens("✅❌✨")[1], 3)
+
     async def asyncSetUp(self):
         self.tmux = TmuxHarness(self, prefix="mts-")
         self.session_name = f"mt-selection-{os.getpid()}-{uuid.uuid4().hex[:8]}"

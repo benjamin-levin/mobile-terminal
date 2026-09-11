@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest import mock
 
+import provider_authority
 import server
 from tests.test_terminal_authority import QueuedConnection, RecordingConnection, snapshot
 from tests.tmux_harness import TmuxHarness
@@ -35,6 +36,48 @@ class ClientGeometryProtocolTest(unittest.TestCase):
         ])
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_server_width_table_matches_installed_xterm_unicode_provider(self):
+        script = '\n'.join([
+            f'const {{ Terminal }} = require({json.dumps(str(ROOT / "node_modules/@xterm/xterm"))});',
+            'const term = new Terminal({allowProposedApi: true});',
+            'require("node:assert/strict").equal(term.unicode.activeVersion, "6");',
+            'const widths = Buffer.alloc(0x110000);',
+            'for (let value = 0; value < widths.length; value++) {',
+            '  widths[value] = term._core.unicodeService.wcwidth(value);',
+            '}',
+            'process.stdout.write(widths); term.dispose();',
+        ])
+        result = subprocess.run(["node", "-e", script], capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = bytes(provider_authority.xterm_cell_width(chr(value)) for value in range(0x110000))
+        self.assertEqual(result.stdout, expected)
+
+    def test_real_xterm_cells_match_server_tokens_for_sequences(self):
+        values = ["✅❌✨", "😀界é", "♥︎♥️", "🇺🇸", "👩‍💻", "1️⃣", "👍🏽",
+                  "AःB", "A\U0001d167B", "\U00020000", "A​B"]
+        script = '\n'.join([
+            f'const {{ Terminal }} = require({json.dumps(str(ROOT / "node_modules/@xterm/xterm"))});',
+            'const term = new Terminal({cols: 40, rows: 2, allowProposedApi: true});',
+            '(async () => { const results = [];',
+            f'for (const text of {json.dumps(values)}) {{',
+            '  await new Promise(resolve => term.write("\\x1b[2J\\x1b[H" + text, resolve));',
+            '  const line = term.buffer.active.getLine(0); const cells = [];',
+            '  for (let x = 0; x < term.buffer.active.cursorX; x++) {',
+            '    const cell = line.getCell(x);',
+            '    if (cell.getWidth()) cells.push([cell.getChars(), x, x + cell.getWidth()]);',
+            '  }',
+            '  results.push([cells, term.buffer.active.cursorX]);',
+            '}',
+            'console.log(JSON.stringify(results)); term.dispose();',
+            '})().catch(error => { console.error(error); process.exitCode = 1; });',
+        ])
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for text, (cells, width) in zip(values, json.loads(result.stdout)):
+            with self.subTest(text=text):
+                tokens, actual_width = server._client_row_display_tokens(text)
+                self.assertEqual(([list(token) for token in tokens], actual_width), (cells, width))
 
     def test_real_xterm_queries_have_one_owner_and_reply_shaped_paste_survives(self):
         self.node(["installTmuxQueryOwnership"], r'''

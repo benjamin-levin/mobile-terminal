@@ -1358,6 +1358,137 @@ def lex_user_echo_source(source: str, *, source_byte_offset: int = 0) -> tuple[S
     return tuple(tokens)
 
 
+# xterm.js 6.0.0 UnicodeV6.
+# Copyright (c) 2017-2019, The xterm.js authors (https://github.com/xtermjs/xterm.js)
+# Copyright (c) 2014-2016, SourceLair Private Company (https://www.sourcelair.com)
+# Copyright (c) 2012-2013, Christopher Jeffrey (https://github.com/chjj/)
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# Keep browser coordinates independent of Python wcwidth and captured tmux cells.
+# The installed xterm provider is exhaustively checked by the parity test.
+_XTERM_COMBINING = (
+    (0x0300, 0x036F), (0x0483, 0x0486), (0x0488, 0x0489),
+    (0x0591, 0x05BD), (0x05BF, 0x05BF), (0x05C1, 0x05C2),
+    (0x05C4, 0x05C5), (0x05C7, 0x05C7), (0x0600, 0x0603),
+    (0x0610, 0x0615), (0x064B, 0x065E), (0x0670, 0x0670),
+    (0x06D6, 0x06E4), (0x06E7, 0x06E8), (0x06EA, 0x06ED),
+    (0x070F, 0x070F), (0x0711, 0x0711), (0x0730, 0x074A),
+    (0x07A6, 0x07B0), (0x07EB, 0x07F3), (0x0901, 0x0902),
+    (0x093C, 0x093C), (0x0941, 0x0948), (0x094D, 0x094D),
+    (0x0951, 0x0954), (0x0962, 0x0963), (0x0981, 0x0981),
+    (0x09BC, 0x09BC), (0x09C1, 0x09C4), (0x09CD, 0x09CD),
+    (0x09E2, 0x09E3), (0x0A01, 0x0A02), (0x0A3C, 0x0A3C),
+    (0x0A41, 0x0A42), (0x0A47, 0x0A48), (0x0A4B, 0x0A4D),
+    (0x0A70, 0x0A71), (0x0A81, 0x0A82), (0x0ABC, 0x0ABC),
+    (0x0AC1, 0x0AC5), (0x0AC7, 0x0AC8), (0x0ACD, 0x0ACD),
+    (0x0AE2, 0x0AE3), (0x0B01, 0x0B01), (0x0B3C, 0x0B3C),
+    (0x0B3F, 0x0B3F), (0x0B41, 0x0B43), (0x0B4D, 0x0B4D),
+    (0x0B56, 0x0B56), (0x0B82, 0x0B82), (0x0BC0, 0x0BC0),
+    (0x0BCD, 0x0BCD), (0x0C3E, 0x0C40), (0x0C46, 0x0C48),
+    (0x0C4A, 0x0C4D), (0x0C55, 0x0C56), (0x0CBC, 0x0CBC),
+    (0x0CBF, 0x0CBF), (0x0CC6, 0x0CC6), (0x0CCC, 0x0CCD),
+    (0x0CE2, 0x0CE3), (0x0D41, 0x0D43), (0x0D4D, 0x0D4D),
+    (0x0DCA, 0x0DCA), (0x0DD2, 0x0DD4), (0x0DD6, 0x0DD6),
+    (0x0E31, 0x0E31), (0x0E34, 0x0E3A), (0x0E47, 0x0E4E),
+    (0x0EB1, 0x0EB1), (0x0EB4, 0x0EB9), (0x0EBB, 0x0EBC),
+    (0x0EC8, 0x0ECD), (0x0F18, 0x0F19), (0x0F35, 0x0F35),
+    (0x0F37, 0x0F37), (0x0F39, 0x0F39), (0x0F71, 0x0F7E),
+    (0x0F80, 0x0F84), (0x0F86, 0x0F87), (0x0F90, 0x0F97),
+    (0x0F99, 0x0FBC), (0x0FC6, 0x0FC6), (0x102D, 0x1030),
+    (0x1032, 0x1032), (0x1036, 0x1037), (0x1039, 0x1039),
+    (0x1058, 0x1059), (0x1160, 0x11FF), (0x135F, 0x135F),
+    (0x1712, 0x1714), (0x1732, 0x1734), (0x1752, 0x1753),
+    (0x1772, 0x1773), (0x17B4, 0x17B5), (0x17B7, 0x17BD),
+    (0x17C6, 0x17C6), (0x17C9, 0x17D3), (0x17DD, 0x17DD),
+    (0x180B, 0x180D), (0x18A9, 0x18A9), (0x1920, 0x1922),
+    (0x1927, 0x1928), (0x1932, 0x1932), (0x1939, 0x193B),
+    (0x1A17, 0x1A18), (0x1B00, 0x1B03), (0x1B34, 0x1B34),
+    (0x1B36, 0x1B3A), (0x1B3C, 0x1B3C), (0x1B42, 0x1B42),
+    (0x1B6B, 0x1B73), (0x1DC0, 0x1DCA), (0x1DFE, 0x1DFF),
+    (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2063),
+    (0x206A, 0x206F), (0x20D0, 0x20EF), (0x302A, 0x302F),
+    (0x3099, 0x309A), (0xA806, 0xA806), (0xA80B, 0xA80B),
+    (0xA825, 0xA826), (0xFB1E, 0xFB1E), (0xFE00, 0xFE0F),
+    (0xFE20, 0xFE23), (0xFEFF, 0xFEFF), (0xFFF9, 0xFFFB),
+    (0x10A01, 0x10A03), (0x10A05, 0x10A06), (0x10A0C, 0x10A0F),
+    (0x10A38, 0x10A3A), (0x10A3F, 0x10A3F), (0x1D167, 0x1D169),
+    (0x1D173, 0x1D182), (0x1D185, 0x1D18B), (0x1D1AA, 0x1D1AD),
+    (0x1D242, 0x1D244), (0xE0001, 0xE0001), (0xE0020, 0xE007F),
+    (0xE0100, 0xE01EF),
+)
+_XTERM_COMBINING_ENDS = tuple(end for _, end in _XTERM_COMBINING)
+
+
+def xterm_cell_width(character: str) -> int:
+    value = ord(character)
+    if value < 32 or 0x7F <= value < 0xA0:
+        return 0
+    index = bisect_left(_XTERM_COMBINING_ENDS, value)
+    if index < len(_XTERM_COMBINING) and _XTERM_COMBINING[index][0] <= value:
+        return 0
+    if (
+        0x1100 <= value <= 0x115F
+        or value in (0x2329, 0x232A)
+        or (0x2E80 <= value <= 0xA4CF and value != 0x303F)
+        or 0xAC00 <= value <= 0xD7A3
+        or 0xF900 <= value <= 0xFAFF
+        or 0xFE10 <= value <= 0xFE19
+        or 0xFE30 <= value <= 0xFE6F
+        or 0xFF00 <= value <= 0xFF60
+        or 0xFFE0 <= value <= 0xFFE6
+        or 0x20000 <= value <= 0x2FFFD
+        or 0x30000 <= value <= 0x3FFFD
+    ):
+        return 2
+    return 1
+
+
+def xterm_row_display_tokens(text: str) -> tuple[list[tuple[str, int, int]], int]:
+    tokens: list[tuple[str, int, int]] = []
+    column = 0
+    for character in text:
+        value = ord(character)
+        if value < 32 or 0x7F <= value < 0xA0 or 0xD800 <= value <= 0xDFFF:
+            raise ValueError("invalid client selection row")
+        width = xterm_cell_width(character)
+        if width:
+            tokens.append((character, column, column + width))
+            column += width
+        elif tokens:
+            previous, start, end = tokens[-1]
+            tokens[-1] = (previous + character, start, end)
+    return tokens, column
+
+
+def _client_grapheme_width(value: str) -> int:
+    try:
+        tokens, width = xterm_row_display_tokens(value)
+    except ValueError as exc:
+        raise ProviderAuthorityError("unsupported-grapheme-width") from exc
+    # A source grapheme spanning multiple browser cells is not an atomic
+    # provider selection unit (e.g. flags and ZWJ sequences in UnicodeV6).
+    if len(tokens) != 1 or tokens[0][0] != value:
+        raise ProviderAuthorityError("unsupported-grapheme-width")
+    return width
+
+
 def _grapheme_width(value: str) -> int:
     widths = [wcwidth(character) for character in value]
     if not widths or widths[0] <= 0 or any(width < 0 for width in widths):
@@ -1546,6 +1677,7 @@ def render_semantic_candidate(
     allow_unsupported: bool = False,
     source_byte_offset: int = 0,
     first_record_island: bool = True,
+    client_coordinates: bool = False,
 ) -> RenderCandidate:
     if record.unsupported and not allow_unsupported:
         raise ProviderAuthorityError("unsupported-assistant-record")
@@ -1902,7 +2034,7 @@ def render_semantic_candidate(
             )
         )
 
-    return RenderCandidate(
+    candidate = RenderCandidate(
         provider=record.provider,
         version=version,
         record_id=record.record_id,
@@ -1923,6 +2055,63 @@ def render_semantic_candidate(
         unsupported=record.unsupported,
         source_start=source_byte_offset,
         source_end=source_byte_offset + len(record.text.encode("utf-8")),
+    )
+    return _client_render_candidate(candidate, cols) if client_coordinates else candidate
+
+
+def _client_render_candidate(candidate: RenderCandidate, cols: int) -> RenderCandidate:
+    # The provider chooses word wraps before xterm sees its output. Project
+    # transcript-derived rows, never tmux rows, without reflowing those breaks.
+    content_ends = [0] * len(candidate.plain_rows)
+    for cell in candidate.cells:
+        content_ends[cell.row] = max(content_ends[cell.row], cell.column + cell.width)
+    rows = []
+    columns = []
+    for row_index, row in enumerate(candidate.plain_rows):
+        native_column = client_column = 0
+        mapping = {0: 0}
+        parts = []
+        for grapheme in GRAPHEME_RE.findall(row):
+            if native_column >= content_ends[row_index]:
+                break
+            native_column += _unit_width(grapheme)
+            client_column += _client_grapheme_width(grapheme)
+            mapping[native_column] = client_column
+            parts.append(grapheme)
+        if native_column != content_ends[row_index] or client_column > cols:
+            raise ProviderAuthorityError("renderer-width-too-small")
+        # Only renderer-owned padding is replaced; authored trailing spaces
+        # remain in the candidate's source/boundary provenance.
+        rows.append("".join(parts) + " " * (cols - client_column))
+        columns.append(mapping)
+
+    def position(row: int, column: int) -> int:
+        try:
+            return columns[row][column]
+        except (IndexError, KeyError) as exc:
+            raise ProviderAuthorityError("unsupported-boundary-layout") from exc
+
+    return replace(
+        candidate,
+        plain_rows=tuple(rows),
+        cells=tuple(
+            replace(
+                cell,
+                column=position(cell.row, cell.column),
+                width=position(cell.row, cell.column + cell.width) - position(cell.row, cell.column),
+            )
+            for cell in candidate.cells
+        ),
+        style_rows=tuple(
+            tuple((position(row, start), position(row, end), style) for start, end, style in spans)
+            for row, spans in enumerate(candidate.style_rows)
+        ),
+        boundaries=tuple(
+            replace(boundary, anchor_column=position(boundary.anchor_row, boundary.anchor_column))
+            for boundary in candidate.boundaries
+        ),
+        selection_start=(candidate.selection_start[0], position(*candidate.selection_start)),
+        selection_end=(candidate.selection_end[0], position(*candidate.selection_end)),
     )
 
 
@@ -2097,6 +2286,7 @@ def _render_record_candidates(
     version: str,
     cols: int,
     profile: RendererProfile,
+    client_coordinates: bool = False,
 ) -> tuple[tuple[RenderCandidate, ...], tuple[str, ...]]:
     try:
         return (
@@ -2107,6 +2297,7 @@ def _render_record_candidates(
                     cols=cols,
                     profile=profile,
                     allow_unsupported=record.unsupported,
+                    client_coordinates=client_coordinates,
                 ),
             ),
             (),
@@ -2142,6 +2333,7 @@ def _render_record_candidates(
                     cols=cols,
                     profile=profile,
                     allow_unsupported=record.unsupported,
+                    client_coordinates=client_coordinates,
                     source_byte_offset=byte_offsets[start],
                     first_record_island=start == 0,
                 )
@@ -2169,6 +2361,7 @@ def _render_record_candidates(
                         cols=cols,
                         profile=profile,
                         allow_unsupported=record.unsupported,
+                        client_coordinates=client_coordinates,
                         source_byte_offset=byte_offsets[start + fence_start],
                         first_record_island=start + fence_start == 0,
                     )
@@ -2334,6 +2527,8 @@ def normalize_styled_rows(
 def normalize_plain_rows(
     plain_rows: Sequence[str | _QuarantinedCapturedRow],
     cols: int,
+    *,
+    client_coordinates: bool = False,
 ) -> tuple[str | _QuarantinedCapturedRow, ...]:
     if cols <= 0:
         raise ProviderAuthorityError("invalid-captured-geometry")
@@ -2348,7 +2543,10 @@ def normalize_plain_rows(
         for grapheme in GRAPHEME_RE.findall(row):
             if any(ord(character) < 32 for character in grapheme):
                 raise ProviderAuthorityError("invalid-captured-cell")
-            width += _captured_grapheme_width(grapheme)
+            width += (
+                _client_grapheme_width(grapheme)
+                if client_coordinates else _captured_grapheme_width(grapheme)
+            )
             if width > cols:
                 raise ProviderAuthorityError("captured-row-overflow")
         normalized.append(row + " " * (cols - width))
@@ -2663,8 +2861,9 @@ def _candidate_selection_index(candidate: RenderCandidate) -> _CandidateSelectio
     )
 
 
-def _candidate_row_width(row: str) -> int:
-    return sum(_grapheme_width(grapheme) for grapheme in GRAPHEME_RE.findall(row))
+def _candidate_row_width(row: str, client_coordinates: bool = False) -> int:
+    width = _client_grapheme_width if client_coordinates else _grapheme_width
+    return sum(width(grapheme) for grapheme in GRAPHEME_RE.findall(row))
 
 
 def _candidate_selection_text(
@@ -2674,10 +2873,13 @@ def _candidate_selection_text(
     selection_end: tuple[int, int],
     *,
     index: _CandidateSelectionIndex | None = None,
+    client_coordinates: bool = False,
 ) -> _CandidateSelection:
     first_row = placement
     last_row = placement + len(candidate.plain_rows) - 1
-    row_widths = tuple(_candidate_row_width(row) for row in candidate.plain_rows)
+    row_widths = tuple(
+        _candidate_row_width(row, client_coordinates) for row in candidate.plain_rows
+    )
     if (
         selection_start >= selection_end
         or selection_start[0] < first_row
@@ -2809,6 +3011,7 @@ def match_complete_provider_block(
     ]
     | None = None,
     allow_partial_context: bool = False,
+    client_coordinates: bool = False,
 ) -> MatchResult:
     try:
         context_start, context_end = _selection_safe_context(
@@ -2879,6 +3082,7 @@ def match_complete_provider_block(
                         selection_start,
                         selection_end,
                         index=selection_index,
+                        client_coordinates=client_coordinates,
                     )
                 except ProviderAuthorityError:
                     continue
@@ -2974,6 +3178,7 @@ def authoritative_provider_match(
     ]
     | None = None,
     allow_partial_context: bool = False,
+    client_coordinates: bool = False,
     owner_uid: int | None = None,
     proc_start_reader: Callable[[int], str] = _read_proc_start,
     proc_environ_reader: Callable[[int], Mapping[str, str]] = _read_proc_environ,
@@ -2989,7 +3194,9 @@ def authoritative_provider_match(
         fence = open_transcript_fence(binding, root=transcript_root, owner_uid=owner_uid)
         records = index.update(fence, binding)
         renderer_profile(binding.provider, binding.version)
-        normalized_plain_rows = normalize_plain_rows(plain_rows, cols)
+        normalized_plain_rows = normalize_plain_rows(
+            plain_rows, cols, client_coordinates=client_coordinates,
+        )
         selected_quarantine = _selected_quarantine_reason(
             normalized_plain_rows,
             selection_start,
@@ -3024,6 +3231,7 @@ def authoritative_provider_match(
                         binding.version,
                         role=record.role,
                     ),
+                    client_coordinates=client_coordinates,
                 )
                 candidates.extend(rendered)
                 unsupported_collision_texts.extend(unsupported_texts)
@@ -3038,6 +3246,7 @@ def authoritative_provider_match(
             selection_end,
             style_rows=style_rows,
             allow_partial_context=allow_partial_context,
+            client_coordinates=client_coordinates,
         )
         if not result.matched:
             return result
@@ -3450,9 +3659,12 @@ def _provider_selection_locked(
             match_end = (end_row + snapshot.seed_history, end_x)
         else:
             first_client_row = client_rows[0][0]
+            # Match transcript-derived logical content in browser cells, not
+            # a relabelled tmux snapshot: the two width models may disagree.
             normalized_plain_rows = normalize_plain_rows(
                 tuple(row[1] for row in client_rows),
                 snapshot.cols,
+                client_coordinates=True,
             )
             style_rows = tuple(row[2] for row in client_rows)
             match_start = (start_row - first_client_row, start_x)
@@ -3469,6 +3681,7 @@ def _provider_selection_locked(
             selection_end=match_end,
             style_rows=style_rows,
             allow_partial_context=client_rows is not None,
+            client_coordinates=client_rows is not None,
             before_final_revalidation=lambda: _revalidate_runtime_binding(
                 binding, cache, provider_home
             ),

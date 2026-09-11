@@ -44,6 +44,7 @@ from provider_authority import (
     ProviderAuthorityError,
     provider_authority_mode,
     provider_selection,
+    xterm_row_display_tokens,
 )
 from webauthn_auth import (
     PendingDeviceEnrollment,
@@ -1628,7 +1629,11 @@ def _selection_request_wire_bytes(raw_message: str) -> int:
     return len(raw_message.encode("utf-8", "surrogatepass"))
 
 
-def _client_row_display_tokens(text: str) -> tuple[list[tuple[str, int, int]], int]:
+def _client_row_display_tokens(
+    text: str, *, client_coordinates: bool = True,
+) -> tuple[list[tuple[str, int, int]], int]:
+    if client_coordinates:
+        return xterm_row_display_tokens(text)
     tokens: list[tuple[str, int, int]] = []
     column = 0
     for grapheme in GRAPHEME_RE.findall(text):
@@ -1657,6 +1662,8 @@ def _validated_client_selection_rows(
     rows: int,
     start_y: int,
     end_y: int,
+    *,
+    client_coordinates: bool = True,
 ) -> tuple[tuple[int, str, tuple[tuple[int, int, str], ...], bool], ...]:
     if (
         not isinstance(value, list)
@@ -1693,7 +1700,7 @@ def _validated_client_selection_rows(
             or "\r" in text
         ):
             raise ValueError("invalid client selection row")
-        _, width = _client_row_display_tokens(text)
+        _, width = _client_row_display_tokens(text, client_coordinates=client_coordinates)
         if width > cols or not isinstance(styles, list) or len(styles) > cols:
             raise ValueError("invalid client selection row")
         validated_styles = []
@@ -4326,7 +4333,7 @@ class TmuxBridge:
             try:
                 client_selection_rows = _validated_client_selection_rows(
                     payload["clientRows"], client_cols, base_y + client_rows,
-                    start_y, end_y,
+                    start_y, end_y, client_coordinates=False,
                 )
                 if any(type(row.get("isWrapped")) is not bool for row in payload["clientRows"]):
                     raise ValueError("missing client wrap provenance")
