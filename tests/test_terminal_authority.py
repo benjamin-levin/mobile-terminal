@@ -6201,7 +6201,7 @@ class ClientProtocolSourceTest(unittest.TestCase):
         copy_start = self.source.index("  async function copyTerminalSelection()")
         copy_end = self.source.index("  // The most recent tab other than the current one.", copy_start)
         copy = self.source[copy_start:copy_end]
-        self.assertIn("selectionPromise = Promise.resolve(requestAuthoritativeSelection());", copy)
+        self.assertIn("selectionPromise = Promise.resolve(requestSelectionWithFallback());", copy)
         self.assertIn("beginAuthoritativeClipboardWrite(selectionPromise)", copy)
         self.assertIn("result = await selectionPromise;", copy)
         self.assertIn("if (result.error)", copy)

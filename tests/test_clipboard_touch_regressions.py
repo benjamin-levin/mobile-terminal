@@ -188,7 +188,7 @@ assert.equal(selectWordAt(15, 5), false);
         self.run_node(["normalizeTerminalCopyText", "copyTerminalSelection", "copyTerminalSelectionAndDismiss"], r'''
 let selectionResult = { error: "Selection timed out." }, clipboardAllowed = false, dismissals = 0;
 const toasts = [], writes = [];
-function requestAuthoritativeSelection() { return Promise.resolve(selectionResult); }
+function requestSelectionWithFallback() { return Promise.resolve(selectionResult); }
 function beginAuthoritativeClipboardWrite() { return null; }
 async function copyClipboardTextWithFallback(text) { writes.push(text); return clipboardAllowed; }
 function showToast(message) { toasts.push(message); }

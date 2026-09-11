@@ -41,6 +41,200 @@ class CopyNormalizationTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
+    def fallback_harness(self):
+        return r'''
+const stale = "Terminal changed; select again.";
+let terminalAuthoritative = true, terminalEpoch = 1, selectionRequestCounter = 0;
+let socket = { readyState: 1 };
+const WebSocket = { OPEN: 1 };
+const pendingSelectionRequests = new Map(), timers = new Map(), sent = [];
+let timerId = 0, replies = [], onSettle = () => {}, selectionReads = 0;
+const initial = {
+  profile: "", session: "selected", paneId: "%1", epoch: 1,
+  cols: 8, rows: 3, baseY: 0, bufferType: "normal",
+  selection: { start: { x: 2, y: 0 }, end: { x: 4, y: 2 } },
+  clientRows: [
+    { y: 0, text: "abcdefgh", isWrapped: false },
+    { y: 1, text: "ijklmnop", isWrapped: true },
+    { y: 2, text: "  tail  ", isWrapped: false },
+  ],
+};
+let state = initial;
+function terminalSelectionState() { selectionReads += 1; return state; }
+const term = { buffer: { active: { getLine(y) {
+  const row = initial.clientRows[y];
+  return { isWrapped: row.isWrapped, translateToString(trim, start, end) {
+    assert.equal(trim, false); return row.text.slice(start, end);
+  } };
+} } } };
+const window = {
+  setTimeout(callback, delay) {
+    const id = ++timerId;
+    timers.set(id, callback);
+    if (delay === 50) queueMicrotask(() => {
+      if (timers.delete(id)) { onSettle(); callback(); }
+    });
+    return id;
+  },
+  clearTimeout(id) { timers.delete(id); },
+};
+function sendMessage(payload) {
+  sent.push(payload);
+  const reply = replies.shift();
+  if (reply === "throw") throw Error("socket closed while sending");
+  if (reply === "send-false") return false;
+  if (reply === "timeout") {
+    queueMicrotask(() => {
+      const pending = pendingSelectionRequests.get(payload.requestId);
+      const callback = timers.get(pending.timer);
+      timers.delete(pending.timer);
+      callback();
+    });
+  } else {
+    queueMicrotask(() => handleServerMessage({
+      type: "selection-result", requestId: payload.requestId, ...reply,
+    }));
+  }
+  return true;
+}
+function reset() {
+  assert.equal(pendingSelectionRequests.size, 0);
+  assert.equal(timers.size, 0);
+  sent.length = 0;
+  replies = [];
+  state = initial;
+  terminalAuthoritative = true;
+  terminalEpoch = 1;
+  socket = { readyState: 1 };
+  onSettle = () => {};
+}
+'''
+
+    def test_selection_retries_once_then_raw_with_retained_cells_and_clean_transport(self):
+        self.run_node(
+            ["requestAuthoritativeSelection", "requestSelectionWithFallback", "handleServerMessage"],
+            self.fallback_harness() + r'''
+(async () => {
+  const raw = { text: "cdefghijklmnop\n  ta", authority: "terminal-raw" };
+  replies = [{ text: "exact", authority: "provider-exact" }];
+  assert.equal((await requestSelectionWithFallback()).text, "exact");
+  assert.equal(sent.length, 1);
+  reset();
+
+  replies = [{ error: stale }, { text: "retried", authority: "provider-exact" }];
+  onSettle = () => { terminalEpoch = 2; state = { ...initial, epoch: 2 }; };
+  assert.equal((await requestSelectionWithFallback()).text, "retried");
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].epoch, 2);
+  assert.equal(sent.some(message => message.rawFallback), false);
+  reset();
+
+  for (const failure of [{ error: stale }, "timeout", "send-false", "throw"]) {
+    replies = [failure, failure, raw];
+    onSettle = () => { state = null; };
+    assert.deepEqual(await requestSelectionWithFallback(), raw);
+    assert.equal(sent.length, 3);
+    assert.equal(sent[0].rawFallback, undefined);
+    assert.equal(sent[1].rawFallback, undefined);
+    assert.equal(sent[2].rawFallback, true);
+    assert.deepEqual(sent[2].selection, initial.selection);
+    assert.deepEqual(sent[2].clientRows, initial.clientRows);
+    assert.equal(new Set(sent.map(message => message.requestId)).size, 3);
+    reset();
+  }
+
+  terminalAuthoritative = false;
+  replies = [raw];
+  assert.deepEqual(await requestSelectionWithFallback(), raw);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].rawFallback, true);
+  reset();
+
+  for (const failure of ["timeout", "send-false", "throw", { error: stale }]) {
+    replies = [{ error: stale }, { error: stale }, failure];
+    assert.deepEqual(await requestSelectionWithFallback(), raw);
+    assert.equal(sent.length, 3);
+    reset();
+  }
+
+  replies = [{ error: stale }, { error: stale }];
+  assert.deepEqual(await requestSelectionWithFallback({ allowRaw: false }), { error: stale });
+  assert.equal(sent.length, 2);
+  reset();
+
+  state = null;
+  assert.deepEqual(await requestSelectionWithFallback(), { error: "Select terminal text first." });
+  assert.equal(sent.length, 0);
+  reset();
+
+  replies = [{ error: "Select terminal text first." }];
+  assert.deepEqual(await requestSelectionWithFallback(), { error: "Select terminal text first." });
+  assert.equal(sent.length, 1);
+  reset();
+
+  socket = null;
+  assert.match((await requestSelectionWithFallback()).error, /disconnected/);
+  assert.equal(sent.length, 0);
+  reset();
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+''',
+        )
+
+    def test_copy_speak_and_recent_tab_use_raw_after_authority_failure(self):
+        speech = app_section(
+            "  let terminalSpeechAudio = null;",
+            "  // The most recent tab other than the current one.",
+        )
+        self.run_node(
+            ["requestAuthoritativeSelection", "requestSelectionWithFallback", "handleServerMessage",
+             "normalizeTerminalCopyText", "beginAuthoritativeClipboardWrite",
+             "copyClipboardTextWithFallback", "copyTerminalSelection", "pasteSelectionToRecentTab"],
+            self.fallback_harness() + speech + r'''
+const toasts = [], writes = [], speechTexts = [], switched = [];
+let pendingPasteAfterSwitch = null;
+function showToast(message) { toasts.push(message); }
+function recentOtherSession() { return "other"; }
+function isBtopSession() { return false; }
+function switchSession(session) { switched.push(session); }
+Object.defineProperty(global, "navigator", { value: {
+  clipboard: { async writeText(text) { writes.push(text); } },
+}, configurable: true });
+class Audio {
+  play() { return Promise.resolve(); }
+  pause() {}
+  removeAttribute() {}
+}
+const URL = { createObjectURL() { return "blob:test"; }, revokeObjectURL() {} };
+requestTerminalSpeechAuth = async () => "test-capability";
+async function fetch(url, options) {
+  assert.equal(url, "/tts");
+  speechTexts.push(JSON.parse(options.body).text);
+  return { ok: true, headers: { get: () => "audio/wav" }, blob: async () => ({}) };
+}
+(async () => {
+  const raw = { text: "cdefghijklmnop\n  ta", authority: "terminal-raw" };
+  for (const rawReply of [raw, "timeout", "throw"]) {
+    replies = [{ error: stale }, { error: stale }, rawReply];
+    assert.equal(await copyTerminalSelection(), true);
+    assert.equal(writes.at(-1), raw.text);
+    assert.equal(toasts.at(-1), "Copied raw terminal text — line breaks and spaces may be included.");
+    reset();
+    replies = [{ error: stale }, { error: stale }, rawReply];
+    assert.equal(await speakTerminalSelection(), true);
+    assert.equal(speechTexts.at(-1), raw.text);
+    assert.equal(toasts.at(-1), "Speaking terminal selection.");
+    reset();
+    replies = [{ error: stale }, { error: stale }, rawReply];
+    assert.equal(await pasteSelectionToRecentTab(), true);
+    assert.equal(pendingPasteAfterSwitch.text, raw.text);
+    assert.equal(pendingPasteAfterSwitch.authority, "terminal-raw");
+    reset();
+  }
+  assert.equal(toasts.includes(stale), false);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+''',
+        )
+
     def test_terminal_copy_normalization_preserves_selection_fidelity(self):
         self.run_node(
             ["normalizeTerminalCopyText"],
@@ -62,10 +256,10 @@ assert.equal(normalizeTerminalCopyText("crlf\r\nlone-cr\rfinal\r\n"),
         # Speak normalizes authoritative server text before authenticated TTS.
         speech = extract_function("speakTerminalSelection")
         self.assertIn("async function speakTerminalSelection", speech)
-        self.assertIn("const selection = await requestAuthoritativeSelection();", speech)
+        self.assertIn("const selection = await requestSelectionWithFallback();", speech)
         self.assertIn("const text = normalizeTerminalCopyText(selection.text);", speech)
         self.assertLess(
-            speech.index("await requestAuthoritativeSelection()"),
+            speech.index("await requestSelectionWithFallback()"),
             speech.index("normalizeTerminalCopyText(selection.text)"),
         )
         self.assertLess(
@@ -233,7 +427,7 @@ async function resolveResult(payload) {
             "  async function copyTerminalSelection()",
             "  // The most recent tab other than the current one.",
         )
-        self.assertIn("selectionPromise = Promise.resolve(requestAuthoritativeSelection());", copy)
+        self.assertIn("selectionPromise = Promise.resolve(requestSelectionWithFallback());", copy)
         self.assertIn("beginAuthoritativeClipboardWrite(selectionPromise)", copy)
         self.assertIn("result = await selectionPromise;", copy)
         self.assertIn("const text = normalizeTerminalCopyText(result.text);", copy)
@@ -244,7 +438,7 @@ async function resolveResult(payload) {
             "  async function pasteSelectionToRecentTab()",
             "  // --- Touch text selection",
         )
-        self.assertIn("const result = await requestAuthoritativeSelection();", pending)
+        self.assertIn("const result = await requestSelectionWithFallback();", pending)
         self.assertIn("text: normalizeTerminalCopyText(result.text),", pending)
         self.assertIn('authority: result.authority === "terminal-raw"', pending)
         self.assertIn("if (result.error)", pending)
@@ -282,7 +476,7 @@ let pendingPasteAfterSwitch = null;
     value: { clipboard: { async writeText(text) { writes.push(text); } } },
     configurable: true,
   });
-  global.requestAuthoritativeSelection = () => Promise.resolve({
+  global.requestSelectionWithFallback = () => Promise.resolve({
     text: url,
     authority: "terminal-raw",
   });
@@ -328,17 +522,17 @@ let pendingPasteAfterSwitch = null;
   global.showToast = (message) => { toasts.push(message); };
   global.dismissTerminalSelection = () => { dismissals += 1; };
 
-  global.requestAuthoritativeSelection = () => Promise.resolve({ error: "Exact selection failed." });
+  global.requestSelectionWithFallback = () => Promise.resolve({ error: "Exact selection failed." });
   await copyTerminalSelectionAndDismiss();
   assert.equal(dismissals, 0);
   assert.deepEqual(toasts, ["Exact selection failed."]);
 
-  global.requestAuthoritativeSelection = () => Promise.resolve({ text: null });
+  global.requestSelectionWithFallback = () => Promise.resolve({ text: null });
   await assert.rejects(copyTerminalSelectionAndDismiss(), TypeError);
   assert.equal(dismissals, 0);
 
   navigator.clipboard.writeText = async () => { throw new Error("clipboard denied"); };
-  global.requestAuthoritativeSelection = () => Promise.resolve({ text: "selected" });
+  global.requestSelectionWithFallback = () => Promise.resolve({ text: "selected" });
   await copyTerminalSelectionAndDismiss();
   assert.equal(dismissals, 0);
   assert.equal(toasts.at(-1), "Clipboard copy is blocked by this browser.");
@@ -363,12 +557,12 @@ let pendingPasteAfterSwitch = null;
   global.recentOtherSession = () => "other";
   global.switchSession = () => {};
 
-  global.requestAuthoritativeSelection = () => Promise.resolve({ error: "Selection unavailable." });
+  global.requestSelectionWithFallback = () => Promise.resolve({ error: "Selection unavailable." });
   await pasteSelectionToRecentTabAndDismiss();
   assert.equal(dismissals, 0);
   assert.deepEqual(toasts, ["Selection unavailable."]);
 
-  global.requestAuthoritativeSelection = () => { throw new Error("selection request crashed"); };
+  global.requestSelectionWithFallback = () => { throw new Error("selection request crashed"); };
   await assert.rejects(pasteSelectionToRecentTabAndDismiss(), /selection request crashed/);
   assert.equal(dismissals, 0);
 })().catch((error) => { console.error(error); process.exitCode = 1; });
@@ -427,7 +621,7 @@ let pendingPasteAfterSwitch = null;
     } },
     configurable: true,
   });
-  global.requestAuthoritativeSelection = () => Promise.resolve({ text: "" });
+  global.requestSelectionWithFallback = () => Promise.resolve({ text: "" });
   global.showToast = (message) => { toasts.push(message); };
   await copyTerminalSelection();
   assert.ok(capturedBlob instanceof Blob);
@@ -456,7 +650,7 @@ let pendingPasteAfterSwitch = null;
   const toasts = [];
   global.showToast = (message) => { toasts.push(message); };
 
-  global.requestAuthoritativeSelection = () => Promise.resolve({
+  global.requestSelectionWithFallback = () => Promise.resolve({
     text: "raw terminal text",
     authority: "terminal-raw",
   });
@@ -466,7 +660,7 @@ let pendingPasteAfterSwitch = null;
   ]);
 
   toasts.length = 0;
-  global.requestAuthoritativeSelection = () => Promise.resolve({
+  global.requestSelectionWithFallback = () => Promise.resolve({
     text: "provider text",
     authority: "provider-exact",
   });
@@ -474,7 +668,7 @@ let pendingPasteAfterSwitch = null;
   assert.deepEqual(toasts, ["Copied terminal selection."]);
 
   toasts.length = 0;
-  global.requestAuthoritativeSelection = () => Promise.resolve({ text: "ordinary" });
+  global.requestSelectionWithFallback = () => Promise.resolve({ text: "ordinary" });
   await copyTerminalSelection();
   assert.deepEqual(toasts, ["Copied terminal selection."]);
 })().catch((error) => { console.error(error); process.exitCode = 1; });
@@ -506,14 +700,14 @@ let pendingPasteAfterSwitch = null;
     configurable: true,
   });
   global.showToast = (message) => { toasts.push(message); };
-  global.requestAuthoritativeSelection = () => Promise.resolve({ error: "Exact server selection error." });
+  global.requestSelectionWithFallback = () => Promise.resolve({ error: "Exact server selection error." });
   await copyTerminalSelection();
   assert.deepEqual(toasts, ["Exact server selection error."]);
   assert.equal(writeTextCalls, 0);
 
   toasts.length = 0;
   navigator.clipboard.write = () => Promise.reject(new Error("permission denied"));
-  global.requestAuthoritativeSelection = () => Promise.resolve({ text: "fallback text" });
+  global.requestSelectionWithFallback = () => Promise.resolve({ text: "fallback text" });
   await copyTerminalSelection();
   assert.equal(writeTextCalls, 1);
   assert.deepEqual(toasts, ["Copied terminal selection."]);
@@ -533,7 +727,7 @@ let pendingPasteAfterSwitch = null;
     body: { appendChild() {} },
     execCommand(command) { execCalls += 1; assert.equal(command, "copy"); return true; },
   };
-  global.requestAuthoritativeSelection = () => Promise.resolve({ text: "legacy fallback" });
+  global.requestSelectionWithFallback = () => Promise.resolve({ text: "legacy fallback" });
   await copyTerminalSelection();
   assert.equal(execCalls, 1);
   assert.equal(textarea.value, "legacy fallback");

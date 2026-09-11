@@ -1695,13 +1695,13 @@
     );
   }
 
-  function requestAuthoritativeSelection() {
-    const state = terminalSelectionState();
+  function requestAuthoritativeSelection(state, { rawFallback = false } = {}) {
+    state = state || terminalSelectionState();
     if (!state) {
       return Promise.resolve({ error: "Select terminal text first." });
     }
     if (
-      !terminalAuthoritative ||
+      (!rawFallback && !terminalAuthoritative) ||
       !socket ||
       socket.readyState !== WebSocket.OPEN
     ) {
@@ -1715,13 +1715,74 @@
         resolve({ error: "Terminal changed; select again." });
       }, 6000);
       pendingSelectionRequests.set(requestId, { resolve, timer, state });
-      const sent = sendMessage({ type: "selection-request", requestId, ...state });
+      let sent = false;
+      try {
+        sent = sendMessage({
+          type: "selection-request", requestId, ...state,
+          ...(rawFallback ? { rawFallback: true } : {}),
+        });
+      } catch (_error) {
+        // A socket can close between the readyState check and send.
+      }
       if (!sent) {
         window.clearTimeout(timer);
         pendingSelectionRequests.delete(requestId);
         resolve({ error: "Terminal changed; select again." });
       }
     });
+  }
+
+  async function requestSelectionWithFallback({ allowRaw = true } = {}) {
+    const state = terminalSelectionState();
+    if (!state) {
+      return { error: "Select terminal text first." };
+    }
+    // Retain the tapped cells before a reseed can clear the live selection.
+    const { start, end } = state.selection;
+    const pieces = [];
+    for (let y = start.y; y <= end.y; y += 1) {
+      const line = term.buffer.active.getLine(y);
+      if (y > start.y && !line.isWrapped) {
+        pieces.push("\n");
+      }
+      pieces.push(line.translateToString(false, y === start.y ? start.x : 0,
+        y === end.y ? end.x : state.cols));
+    }
+    const rawText = pieces.join("");
+    let result = await requestAuthoritativeSelection(state);
+    if (!result.error || result.error === "Select terminal text first.") {
+      return result;
+    }
+    if (result.error === "Terminal changed; select again.") {
+      let epoch = terminalEpoch;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+        if (terminalAuthoritative && terminalEpoch === epoch) {
+          break;
+        }
+        epoch = terminalEpoch;
+      }
+      const fresh = terminalSelectionState();
+      const sameSelection = fresh && fresh.profile === state.profile &&
+        fresh.session === state.session && fresh.paneId === state.paneId &&
+        JSON.stringify(fresh.selection) === JSON.stringify(state.selection);
+      result = await requestAuthoritativeSelection(sameSelection ? fresh : state);
+      if (!result.error) {
+        return result;
+      }
+    }
+    if (!allowRaw) {
+      return result;
+    }
+    result = await requestAuthoritativeSelection(state, { rawFallback: true });
+    if (!result.error) {
+      return result;
+    }
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return { error: "Terminal is disconnected. Reconnect to copy or speak." };
+    }
+    // A connected but busy server must not make the selected text unavailable.
+    return { text: rawText, authority: "terminal-raw" };
   }
 
   function copyTextWithFallback(text) {
@@ -1820,7 +1881,7 @@
   async function copyTerminalSelection() {
     let selectionPromise;
     try {
-      selectionPromise = Promise.resolve(requestAuthoritativeSelection());
+      selectionPromise = Promise.resolve(requestSelectionWithFallback());
     } catch (_error) {
       showToast("Terminal changed; select again.");
       return false;
@@ -1964,7 +2025,7 @@
     try {
       // term.getSelection() is empty on mobile Safari; ask the server for the
       // authoritative selection, the same source Copy and To-tab already use.
-      const selection = await requestAuthoritativeSelection();
+      const selection = await requestSelectionWithFallback();
       if (generation !== terminalSpeechGeneration) {
         return false;
       }
@@ -2066,7 +2127,7 @@
   // drop the text into its composer once it's ready. The paste lands in the
   // prompt for review — it is not auto-executed.
   async function pasteSelectionToRecentTab() {
-    const result = await requestAuthoritativeSelection();
+    const result = await requestSelectionWithFallback();
     if (result.error) {
       showToast(result.error);
       return false;

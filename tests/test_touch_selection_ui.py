@@ -325,7 +325,7 @@ assert.deepEqual(empty, { left: 20, top: 20, right: 20, bottom: 20, width: 0, he
             "  let terminalSpeechAudio = null;",
             "  // The most recent tab other than the current one.",
         )
-        self.assertIn("const selection = await requestAuthoritativeSelection();", speech)
+        self.assertIn("const selection = await requestSelectionWithFallback();", speech)
         self.assertIn("const text = normalizeTerminalCopyText(selection.text);", speech)
         self.assertNotIn("speechSynthesis", APP_JS)
         self.assertNotIn("SpeechSynthesisUtterance", APP_JS)
@@ -348,7 +348,7 @@ const document = { addEventListener(type, callback, options) {
 } };
 const term = { getSelection() { events.push("client-selection"); return ""; } };
 let selectionResponse = () => Promise.resolve({ text: selection });
-function requestAuthoritativeSelection() {
+function requestSelectionWithFallback() {
   events.push("selection");
   assert.equal(inGesture, true);
   return selectionResponse();
