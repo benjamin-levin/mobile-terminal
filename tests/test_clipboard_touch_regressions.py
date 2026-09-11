@@ -193,8 +193,13 @@ class ClipboardClientTest(unittest.TestCase):
     playResponse = () => Promise.resolve();
     const before = events.filter(event => event.type === "play" && event.src.startsWith("blob:")).length;
     await tap();
+    assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+    assert.equal(events.filter(event => event.type === "play" && event.src.startsWith("blob:")).length, before + 1,
+      "silent unlock failure must not veto a real WAV the browser allows");
+    playResponse = () => { throw Error("autoplay denied"); };
+    await tap();
     assert.equal(terminalSpeechPlayer.status.textContent, "Ready — tap ▶");
-    assert.equal(events.filter(event => event.type === "play" && event.src.startsWith("blob:")).length, before);
+    playResponse = () => Promise.resolve();
     await clickPlay();
     assert.equal(events.at(-1).inGesture, true);
     assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
@@ -202,10 +207,9 @@ class ClipboardClientTest(unittest.TestCase):
 
   let releaseUnlock;
   unlockResponse = () => new Promise(resolve => { releaseUnlock = resolve; });
-  await tap(); // A hung unlock cannot strand a synthesized WAV in Preparing.
-  assert.equal(terminalSpeechPlayer.status.textContent, "Ready — tap ▶");
-  assert.equal(terminalSpeechUnlocked, false);
-  await clickPlay();
+  await tap(); // A hung unlock cannot strand a synthesized WAV or require another tap.
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+  assert.equal(terminalSpeechUnlocked, true);
   const beforeLateUnlock = events.length;
   releaseUnlock();
   await flush();

@@ -2064,6 +2064,7 @@
 
   function attachTerminalSpeechAudio() {
     terminalSpeechUrl = URL.createObjectURL(terminalSpeechBlob);
+    terminalSpeechAudio.loop = false;
     terminalSpeechAudio.src = terminalSpeechUrl;
     const generation = terminalSpeechGeneration;
     const url = terminalSpeechUrl;
@@ -2155,15 +2156,14 @@
         terminalSpeechAudio = new Audio();
         terminalSpeechAudio.preload = "auto";
       }
+      // Keep the gesture-started audio session alive through selection and TTS.
+      terminalSpeechAudio.loop = true;
       terminalSpeechAudio.src = TERMINAL_SILENT_WAV;
       const unlockPromise = Promise.resolve(terminalSpeechAudio.play()).then(() => {
         if (terminalSpeechUnlockPromise !== unlockPromise) {
           return false;
         }
         terminalSpeechUnlocked = true;
-        if (terminalSpeechAudio.src === TERMINAL_SILENT_WAV) {
-          terminalSpeechAudio.pause();
-        }
         return true;
       }).catch(() => false).finally(() => {
         if (terminalSpeechUnlockPromise === unlockPromise) {
@@ -2190,6 +2190,7 @@
       terminalSpeechAudio.ontimeupdate = null;
       terminalSpeechAudio.onplay = null;
       terminalSpeechAudio.onpause = null;
+      terminalSpeechAudio.loop = false;
       terminalSpeechAudio.pause();
       terminalSpeechAudio.removeAttribute("src");
       terminalSpeechAudio.load();
@@ -2273,17 +2274,12 @@
       if (generation !== terminalSpeechGeneration) {
         return false;
       }
-      const autoplay = terminalSpeechUnlocked;
-      // A slow/rejected silent play is not permission to auto-play the WAV.
-      // Retire it before attaching real media so a late unlock cannot pause it.
+      // Retire late unlock results, but do not pause the gesture-primed element.
+      // Let the real play() decide autoplay permission, even if unlock is pending.
       terminalSpeechUnlockPromise = null;
-      terminalSpeechAudio.pause();
       terminalSpeechBlob = audio;
       attachTerminalSpeechAudio();
-      setTerminalSpeechState("Ready", "Ready — tap ▶");
-      if (autoplay) {
-        await playTerminalSpeech(true);
-      }
+      await playTerminalSpeech(true);
       return generation === terminalSpeechGeneration && terminalSpeechState !== "Error";
     } catch (_error) {
       return fail("Speech failed: playback blocked.");

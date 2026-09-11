@@ -73,7 +73,7 @@ class Audio {
   constructor() { audioCount += 1; this.src = ""; this.paused = true; this.currentTime = 0; this.duration = NaN; this.ended = false; this.error = null; }
   play() {
     this.paused = false;
-    events.push({ type: "play", src: this.src, inGesture });
+    events.push({ type: "play", src: this.src, inGesture, audio: this, loop: this.loop });
     if (this.src.startsWith("data:")) {
       assert.equal(inGesture, true, "silent unlock must be on Speak's gesture stack");
       return unlockResponse();
@@ -509,6 +509,7 @@ function ordinaryGestures() {
   assert.equal(events.length, beforeEvents);
 }
 function assertAudioReleased() {
+  assert.equal(terminalSpeechAudio.loop, false);
   assert.equal(terminalSpeechAudio.paused, true);
   assert.equal(terminalSpeechAudio.src, "");
   assert.equal(terminalSpeechAudio.onended, null);
@@ -592,10 +593,10 @@ const flush = () => new Promise(setImmediate);
   failPlay = false;
   failUnlock = true;
   const beforeBlockedUnlock = events.filter(event => event === "play").length;
-  await tap(); // Rejected silent unlock waits for a direct Play tap.
+  await tap(); // Real playback decides permission even if silent unlock rejected.
   assert.equal(dismissals, beforeFailure + 2);
-  assert.equal(terminalSpeechPlayer.status.textContent, "Ready — tap ▶");
-  assert.equal(events.filter(event => event === "play").length, beforeBlockedUnlock);
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+  assert.equal(events.filter(event => event === "play").length, beforeBlockedUnlock + 1);
   failUnlock = false;
 
   let releaseOld;
@@ -724,6 +725,47 @@ const flush = () => new Promise(setImmediate);
 ''',
         ]))
 
+    def test_speech_keeps_silent_gesture_play_until_same_element_wav_handoff(self):
+        self.run_node_source('const assert = require("node:assert/strict");\n' + speech_player_harness() + r'''
+(async () => {
+  let releaseFetch;
+  fetchResponse = () => new Promise(resolve => { releaseFetch = resolve; });
+  const speaking = tap();
+  const audio = terminalSpeechAudio;
+  assert.equal(events[0].type, "play", "silent play must precede selection's first await");
+  assert.equal(events[0].inGesture, true);
+  assert.equal(events[0].audio, audio);
+  assert.match(events[0].src, /^data:audio\/wav;base64,/);
+  const silent = Buffer.from(events[0].src.split(",")[1], "base64");
+  assert.equal(silent.toString("ascii", 0, 4), "RIFF");
+  assert.equal(silent.toString("ascii", 8, 12), "WAVE");
+  assert.equal(silent.toString("ascii", 36, 40), "data");
+  assert.ok(silent.subarray(44).length > 0);
+  assert.ok(silent.subarray(44).every(sample => sample === 0));
+  await flush();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Preparing…");
+  assert.equal(audio.paused, false, "unlock resolution must not pause the silent source");
+  assert.equal(events[0].loop, true);
+  assert.equal(audio.loop, true, "silence must not end while TTS is pending");
+  releaseFetch(wav());
+  await speaking;
+  const plays = events.filter(event => event.type === "play");
+  assert.equal(plays.length, 2);
+  assert.equal(plays[1].audio, audio, "real WAV reuses the gesture-primed element");
+  assert.match(plays[1].src, /^blob:/);
+  assert.equal(plays[1].inGesture, false, "real play happens after async synthesis");
+  assert.equal(plays[1].loop, false, "real speech must still end naturally");
+  assert.equal(events.some(event => ["pause", "load"].includes(event.type)), false,
+    "handoff must not interrupt the primed audio session");
+  assert.equal(audioCount, 1);
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+  dismiss();
+  assert.equal(audio.loop, false);
+  assert.equal(audio.src, "");
+  assert.equal(audio.paused, true);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''')
+
     def test_speech_player_stays_preparing_through_selection_auth_fetch_and_blob(self):
         self.run_node_source('const assert = require("node:assert/strict");\n' + speech_player_harness() + r'''
 (async () => {
@@ -738,6 +780,8 @@ const flush = () => new Promise(setImmediate);
     assert.equal(player.status.textContent, "Preparing…");
     assert.equal(player.play.disabled, true);
     assert.equal(player.seek.disabled, true);
+    assert.equal(terminalSpeechAudio.loop, true);
+    assert.equal(terminalSpeechAudio.paused, false);
   };
   preparing();
   await flush();
@@ -795,6 +839,7 @@ const flush = () => new Promise(setImmediate);
         dismiss();
       }
       const url = terminalSpeechUrl, count = dismissals, requestCount = requests.length;
+      const playCount = events.filter(event => event.type === "play").length;
       assert.equal(controller.signal.aborted, true);
       assert.equal(pendingSpeechAuth, null);
       release(stage === "selection" ? { text: "old" } : stage === "auth" ? "test-capability" : stage === "fetch" ? wav() : {});
@@ -802,12 +847,15 @@ const flush = () => new Promise(setImmediate);
       assert.equal(terminalSpeechUrl, url, stage);
       assert.equal(dismissals, count, stage);
       assert.equal(requests.length, requestCount, stage);
+      assert.equal(events.filter(event => event.type === "play").length, playCount,
+        `stale ${stage} must not autoplay`);
       assert.equal(terminalSpeechPlayer.player.hidden, !replace, stage);
       if (replace) {
         assert.equal(terminalSpeechPlayer.status.textContent, "Playing", stage);
         dismiss();
       }
       assert.equal(terminalSpeechAudio.src, "");
+      assert.equal(terminalSpeechAudio.loop, false);
       assert.equal(terminalSpeechAudio.paused, true);
       assert.equal(terminalSpeechBlob, null);
       assert.equal(new Set(revoked).size, urlCounter);
