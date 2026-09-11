@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import datetime
 import fcntl
 import json
 import os
@@ -20,6 +21,24 @@ PROVIDER_EXECUTABLES = {
 PANE_RE = re.compile(r"^%[0-9]+$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 END_EVENTS = {"SessionEnd", "session_end"}
+# Match provider_authority.UUID_RE for independently discovered Claude transcripts.
+CLAUDE_SESSION_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+FORENSICS_FILE_MAX_BYTES = 1_000_000
+FORENSICS_FILE_RETENTION = 5
+
+
+class _BindingHookError(ValueError):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _HookArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _BindingHookError("invalid-arguments")
 
 
 def _proc_fields(pid: int, proc_root: Path = Path("/proc")) -> tuple[int, int]:
@@ -208,6 +227,76 @@ def _safe_transcript(provider: str, transcript: Path, home: Path) -> Path:
     return transcript
 
 
+def _claude_transcript(event: dict[str, Any], home: Path) -> Path:
+    transcript_value = event.get("transcript_path") or event.get("transcriptPath") or event.get("rollout_path")
+    if any(event.get(key) is not None for key in ("transcript_path", "transcriptPath", "rollout_path")):
+        if not isinstance(transcript_value, str) or not transcript_value:
+            raise _BindingHookError("invalid-transcript-path")
+        try:
+            return _safe_transcript("claude", Path(transcript_value), home)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise _BindingHookError("invalid-transcript-path") from exc
+    session_id = event.get("session_id")
+    if not isinstance(session_id, str) or not CLAUDE_SESSION_RE.fullmatch(session_id):
+        raise _BindingHookError("invalid-session")
+    # Do not guess cwd encoding or choose by recency. Only the event's exact
+    # session filename, directly under one project directory, may fill the gap.
+    try:
+        paths = tuple((home / ".claude" / "projects").glob(f"*/{session_id}.jsonl"))
+        if not paths:
+            raise _BindingHookError("transcript-missing")
+        if len(paths) != 1:
+            raise _BindingHookError("transcript-ambiguous")
+        transcript = _safe_transcript("claude", paths[0], home)
+        if not transcript.is_file():
+            raise _BindingHookError("transcript-missing")
+        return transcript
+    except _BindingHookError:
+        raise
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise _BindingHookError("transcript-unavailable") from exc
+
+
+def _record_failure(
+    reason: str, provider: str, event: dict[str, Any], state_root: Path | None,
+) -> None:
+    pane_id = os.environ.get("TMUX_PANE", "")
+    session_id = (event.get("session_id") or event.get("sessionId")
+                  or event.get("thread_id") or event.get("threadId"))
+    session_pattern = CLAUDE_SESSION_RE if provider == "claude" else SESSION_RE
+    now = datetime.datetime.now(datetime.timezone.utc)
+    record = {
+        "reason": reason,
+        "pane": pane_id if PANE_RE.fullmatch(pane_id) else None,
+        "provider": provider if provider in PROVIDER_EXECUTABLES else None,
+        "sessionId": session_id if isinstance(session_id, str) and session_pattern.fullmatch(session_id) else None,
+        "ts": now.isoformat(timespec="milliseconds"),
+    }
+    encoded = (json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+    root = (state_root or Path(__file__).resolve().parent) / "state" / "forensics"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = root / f"provider-binding-hook-{now.strftime('%Y%m%d')}.jsonl"
+    with (root / ".provider-binding-hook.lock").open("a+") as lock:
+        os.chmod(lock.name, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            current_size = path.stat().st_size
+        except FileNotFoundError:
+            current_size = 0
+        if current_size and current_size + len(encoded) > FORENSICS_FILE_MAX_BYTES:
+            path.replace(root / f"{path.stem}-{time.time_ns()}.jsonl")
+        with path.open("ab") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(encoded)
+        candidates = sorted(
+            root.glob("provider-binding-hook-*.jsonl"),
+            key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name),
+            reverse=True,
+        )
+        for stale in candidates[FORENSICS_FILE_RETENTION:]:
+            stale.unlink()
+
+
 def _atomic_write(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -237,13 +326,13 @@ def update_binding(
     state_root: Path | None = None,
     claude_registry: Any = None,
     claude_process: Any = None,
-) -> None:
+) -> str | None:
     pane_id = os.environ.get("TMUX_PANE", "")
     if not PANE_RE.fullmatch(pane_id):
-        raise ValueError
+        raise _BindingHookError("invalid-pane")
     input_pane = event.get("pane_id", event.get("paneId"))
     if input_pane is not None and input_pane != pane_id:
-        raise ValueError
+        raise _BindingHookError("pane-mismatch")
     session_id = str(
         event.get("session_id")
         or event.get("sessionId")
@@ -252,30 +341,36 @@ def update_binding(
         or ""
     )
     if not SESSION_RE.fullmatch(session_id):
-        raise ValueError
-    transcript_value = event.get("transcript_path") or event.get("transcriptPath") or event.get("rollout_path")
-    if not isinstance(transcript_value, str):
-        raise ValueError
-    transcript = _safe_transcript(provider, Path(transcript_value), home)
+        raise _BindingHookError("invalid-session")
     if provider == "claude":
+        transcript = _claude_transcript(event, home)
         registry_reader = claude_registry or _claude_registry
         try:
             pid, proc_start, registry_version = registry_reader(home, pane_id, session_id)
-        except _AmbiguousClaudeRegistry:
-            raise
+        except _AmbiguousClaudeRegistry as exc:
+            raise _BindingHookError("claude-registry-ambiguous") from exc
         except Exception:
             process_reader = claude_process or _claude_process
-            pid, proc_start = process_reader(pane_id)
+            try:
+                pid, proc_start = process_reader(pane_id)
+            except Exception as exc:
+                raise _BindingHookError("claude-process-unavailable") from exc
+            binding_source = "process-walk"
             payload_version = event.get("version")
             if isinstance(payload_version, str) and payload_version:
                 version = payload_version
             if not isinstance(version, str) or not version:
-                raise ValueError
+                raise _BindingHookError("invalid-version")
         else:
+            binding_source = "native-registry"
             if registry_version:
                 version = registry_version
         coordinates = None
     else:
+        transcript_value = event.get("transcript_path") or event.get("transcriptPath") or event.get("rollout_path")
+        if not isinstance(transcript_value, str):
+            raise ValueError
+        transcript = _safe_transcript(provider, Path(transcript_value), home)
         pid, proc_start = _provider_process(provider, pane_id)
         try:
             coordinates = pane_coordinates(pane_id)
@@ -304,10 +399,10 @@ def update_binding(
             and str(existing.get("procStart", "")) == str(proc_start)
             and existing.get("terminalEvent") == "SessionEnd"
         ):
-            return
+            return "session-ended"
         event_time = int(event.get("event_time_ns") or event.get("timestamp_ns") or time.time_ns())
         if event_time <= int(existing.get("eventTimeNs", 0)):
-            return
+            return "stale-event-time"
         generation = int(existing.get("generation", 0)) + 1
         data: dict[str, Any] = {
             "schema": 1,
@@ -323,6 +418,8 @@ def update_binding(
             "terminalEvent": "SessionEnd" if event_name in END_EVENTS else "",
             "version": version,
         }
+        if provider == "claude":
+            data["bindingSource"] = binding_source
         if provider == "codex":
             ranges = existing.get("ownershipRanges", [])
             if not isinstance(ranges, list):
@@ -378,30 +475,43 @@ def update_binding(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--provider", choices=("claude", "codex"), required=True)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--state-root")
-    arguments = parser.parse_args()
+    provider = ""
+    event: dict[str, Any] = {}
+    state_root = None
+    reason = "hook-update-failed"
     try:
+        parser = _HookArgumentParser(add_help=False)
+        parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+        parser.add_argument("--version", required=True)
+        parser.add_argument("--state-root")
+        arguments = parser.parse_args()
+        provider = arguments.provider
+        state_value = arguments.state_root or os.environ.get(
+            "MOBILE_TERMINAL_PROVIDER_BINDING_STATE_ROOT"
+        )
+        state_root = Path(state_value).resolve() if state_value else None
+        reason = "input-read-failed"
         raw = os.read(0, MAX_INPUT_BYTES + 1)
         if len(raw) > MAX_INPUT_BYTES:
-            return 0
-        event = json.loads(raw)
-        if isinstance(event, dict):
-            state_value = arguments.state_root or os.environ.get(
-                "MOBILE_TERMINAL_PROVIDER_BINDING_STATE_ROOT"
-            )
-            state_root = Path(state_value).resolve() if state_value else None
-            update_binding(
-                arguments.provider,
-                event,
-                arguments.version,
-                Path.home().resolve(),
-                state_root=state_root,
-            )
-    except Exception:
-        pass
+            raise _BindingHookError("input-oversized")
+        reason = "input-invalid"
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise _BindingHookError("input-invalid")
+        event = parsed
+        reason = "hook-update-failed"
+        skipped_reason = update_binding(
+            provider, event, arguments.version, Path.home().resolve(), state_root=state_root,
+        )
+        if skipped_reason is not None:
+            raise _BindingHookError(skipped_reason)
+    except Exception as exc:
+        if isinstance(exc, _BindingHookError):
+            reason = exc.reason
+        try:
+            _record_failure(reason, provider, event, state_root)
+        except Exception:
+            pass
     return 0
 
 

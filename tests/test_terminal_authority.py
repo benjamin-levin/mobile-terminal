@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import io
 import json
 import os
 import shutil
@@ -600,6 +601,233 @@ class ClaudeHookAncestorFallbackTest(unittest.TestCase):
         self.assertEqual(list(self.registry.iterdir()), [])
         self.assertEqual(self.cache_path.stat().st_mode & 0o777, 0o600)
 
+    def test_missing_transcript_path_advances_session_on_same_process_without_registry(self):
+        self.update()
+        previous = json.loads(self.cache_path.read_text())
+        session_b = str(uuid.uuid4())
+        transcript_b = self.path.with_name(f"{session_b}.jsonl")
+        transcript_b.write_text("{}\n", encoding="utf-8")
+        event = dict(self.event, session_id=session_b, event_time_ns=101)
+        del event["transcript_path"]
+        self.update(event)
+        cached = json.loads(self.cache_path.read_text())
+        self.assertEqual(cached["sessionId"], session_b)
+        self.assertEqual(cached["transcriptPath"], str(transcript_b))
+        self.assertEqual(cached["generation"], previous["generation"] + 1)
+        self.assertEqual((cached["pid"], cached["paneId"], cached["procStart"]),
+                         (previous["pid"], previous["paneId"], previous["procStart"]))
+        self.assertEqual(cached["bindingSource"], "process-walk")
+        self.assertEqual(self.bind().session_id, session_b)
+        self.assertEqual(self.bind().transcript_path, transcript_b)
+        self.assertEqual(list(self.registry.iterdir()), [])
+
+    def test_missing_new_session_transcript_leaves_old_cache_unchanged(self):
+        self.update()
+        previous = self.cache_path.read_bytes()
+        session_b = str(uuid.uuid4())
+        event = dict(self.event, session_id=session_b, event_time_ns=101)
+        del event["transcript_path"]
+        for name in (f"prefix-{session_b}.jsonl", f"{session_b}.jsonl.backup", "newest.jsonl"):
+            self.path.with_name(name).write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "transcript-missing"):
+            self.update(event)
+        self.assertEqual(self.cache_path.read_bytes(), previous)
+        self.assertEqual(self.bind().session_id, self.session_id)
+        self.assertEqual(list(self.registry.iterdir()), [])
+
+    def test_null_path_derives_but_invalid_supplied_path_never_falls_back(self):
+        self.update(dict(self.event, transcript_path=None))
+        self.assertEqual(json.loads(self.cache_path.read_text())["transcriptPath"], str(self.path))
+        previous = self.cache_path.read_bytes()
+        for value in ("", False, 0, [], {}, "relative.jsonl", str(self.home / "outside.jsonl")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "invalid-transcript-path"):
+                    self.update(dict(self.event, transcript_path=value, event_time_ns=101))
+                self.assertEqual(self.cache_path.read_bytes(), previous)
+
+    def test_explicit_transcript_aliases_keep_first_truthy_selection(self):
+        for key in ("transcriptPath", "rollout_path"):
+            with self.subTest(key=key):
+                self.update(dict(self.event, transcript_path="", **{key: str(self.path)}))
+                self.assertEqual(json.loads(self.cache_path.read_text())["transcriptPath"], str(self.path))
+                self.cache_path.unlink()
+
+    def test_derived_path_requires_actual_valid_event_session_id(self):
+        event = dict(self.event, transcript_path=None)
+        for value in (None, "", 123, True, [], {}, "not-a-uuid", "../escape", "*", "a" * 257):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "invalid-session"):
+                    self.update(dict(event, session_id=value))
+                self.assertFalse(self.cache_path.exists())
+        del event["session_id"]
+        event["sessionId"] = self.session_id
+        with self.assertRaisesRegex(ValueError, "invalid-session"):
+            self.update(event)
+        self.assertFalse(self.cache_path.exists())
+
+    def test_derived_path_rejects_duplicate_exact_matches_even_with_cwd(self):
+        self.update()
+        previous = self.cache_path.read_bytes()
+        other = self.path.parent.parent / "other-project" / self.path.name
+        other.parent.mkdir()
+        other.write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "transcript-ambiguous"):
+            self.update(dict(self.event, transcript_path=None, cwd=str(other.parent), event_time_ns=101))
+        self.assertEqual(self.cache_path.read_bytes(), previous)
+
+    def test_derived_path_ignores_nested_transcripts_and_requires_regular_file(self):
+        self.path.unlink()
+        nested = self.path.parent / "subagents" / self.path.name
+        nested.parent.mkdir()
+        nested.write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "transcript-missing"):
+            self.update(dict(self.event, transcript_path=None))
+        self.path.mkdir()
+        with self.assertRaisesRegex(ValueError, "transcript-missing"):
+            self.update(dict(self.event, transcript_path=None))
+        self.assertFalse(self.cache_path.exists())
+
+    def test_derived_path_uses_safe_transcript_and_rejects_symlinks(self):
+        original = provider_binding_hook._safe_transcript
+        with mock.patch("provider_binding_hook._safe_transcript", wraps=original) as safe:
+            self.update(dict(self.event, transcript_path=None))
+        safe.assert_called_once_with("claude", self.path, self.home)
+        previous = self.cache_path.read_bytes()
+        self.path.unlink()
+        target = self.path.with_name("other.jsonl")
+        target.write_text("{}\n", encoding="utf-8")
+        self.path.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "transcript-unavailable"):
+            self.update(dict(self.event, transcript_path=None, event_time_ns=101))
+        self.assertEqual(self.cache_path.read_bytes(), previous)
+        self.path.unlink()
+        target.unlink()
+        self.path.parent.rmdir()
+        outside = self.home / "outside"
+        outside.mkdir()
+        (outside / self.path.name).write_text("{}\n", encoding="utf-8")
+        self.path.parent.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "transcript-unavailable"):
+            self.update(dict(self.event, transcript_path=None, event_time_ns=101))
+        self.assertEqual(self.cache_path.read_bytes(), previous)
+
+    def test_derived_path_preserves_event_time_guard_and_session_end_tombstone(self):
+        event = dict(self.event, transcript_path=None)
+        self.update(event)
+        previous = self.cache_path.read_bytes()
+        for timestamp in (99, 100):
+            self.update(dict(event, event_time_ns=timestamp))
+            self.assertEqual(self.cache_path.read_bytes(), previous)
+        self.update(dict(event, hook_event_name="SessionEnd", event_time_ns=101))
+        closed = self.cache_path.read_bytes()
+        self.assertFalse(json.loads(closed)["active"])
+        self.update(dict(event, event_time_ns=102))
+        self.assertEqual(self.cache_path.read_bytes(), closed)
+        self.assertEqual(list(self.registry.iterdir()), [])
+
+    def test_codex_missing_transcript_is_not_derived(self):
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%9"}, clear=False):
+            with self.assertRaises(ValueError):
+                provider_binding_hook.update_binding(
+                    "codex", dict(self.event, transcript_path=None), "0.153.3", self.home,
+                )
+        self.assertFalse(self.cache_path.exists())
+
+    def run_main(self, raw, arguments=None):
+        with (
+            mock.patch("sys.argv", ["provider_binding_hook.py", *(
+                arguments if arguments is not None else [
+                    "--provider", "claude", "--version", "2.1.261", "--state-root", str(self.home),
+                ]
+            )]),
+            mock.patch.dict(os.environ, {"TMUX_PANE": "%9"}, clear=False),
+            mock.patch("provider_binding_hook.__file__", str(self.home / "provider_binding_hook.py")),
+            mock.patch("provider_binding_hook.Path.home", return_value=self.home),
+            mock.patch("provider_binding_hook.os.getpid", return_value=100),
+            mock.patch("provider_binding_hook.os.read", return_value=raw) as read,
+            mock.patch("provider_binding_hook._claude_process", return_value=(98, "00444")),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(provider_binding_hook.main(), 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        return read
+
+    def failure_records(self):
+        return [json.loads(line) for path in (self.home / "state" / "forensics").glob(
+            "provider-binding-hook-*.jsonl"
+        ) for line in path.read_text().splitlines()]
+
+    def test_main_records_only_sanitized_failure_fields_and_keeps_old_cache(self):
+        self.update()
+        previous = self.cache_path.read_bytes()
+        session_b = str(uuid.uuid4())
+        event = dict(self.event, session_id=session_b, transcript_path=None,
+                     prompt="PRIVATE-PAYLOAD", cwd="/PRIVATE-PATH", token="PRIVATE-TOKEN")
+        self.run_main(json.dumps(event).encode())
+        records = self.failure_records()
+        self.assertEqual(len(records), 1)
+        timestamp = records[0].pop("ts")
+        self.assertIsInstance(timestamp, str)
+        self.assertEqual(records, [{"reason": "transcript-missing", "pane": "%9",
+                                   "provider": "claude", "sessionId": session_b}])
+        self.assertEqual(self.cache_path.read_bytes(), previous)
+        for path in (self.home / "state" / "forensics").iterdir():
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("PRIVATE", path.read_text())
+
+    def test_main_sanitizes_unexpected_errors_and_invalid_identifiers(self):
+        with mock.patch("provider_binding_hook.update_binding", side_effect=OSError("PRIVATE-ERROR")):
+            self.run_main(json.dumps(dict(self.event, prompt="PRIVATE-PAYLOAD")).encode())
+        self.assertEqual(self.failure_records()[0]["reason"], "hook-update-failed")
+        self.run_main(json.dumps(dict(self.event, session_id="PRIVATE\nPAYLOAD")).encode())
+        records = self.failure_records()
+        self.assertEqual(records[-1]["reason"], "invalid-session")
+        self.assertIsNone(records[-1]["sessionId"])
+        self.assertNotIn("PRIVATE", json.dumps(records))
+
+    def test_main_input_guard_bad_json_and_arguments_always_return_zero(self):
+        for raw, reason in ((b"x" * (provider_binding_hook.MAX_INPUT_BYTES + 1), "input-oversized"),
+                            (b'{"prompt":"PRIVATE', "input-invalid"), (b"[]", "input-invalid")):
+            with self.subTest(reason=reason):
+                read = self.run_main(raw)
+                read.assert_called_once_with(0, provider_binding_hook.MAX_INPUT_BYTES + 1)
+                self.assertEqual(self.failure_records()[-1]["reason"], reason)
+        self.run_main(b"{}", arguments=["--provider", "PRIVATE-ARGUMENT"])
+        self.assertEqual(self.failure_records()[-1]["reason"], "invalid-arguments")
+        self.assertNotIn("PRIVATE", json.dumps(self.failure_records()))
+        with mock.patch("provider_binding_hook._record_failure", side_effect=OSError("PRIVATE")):
+            self.run_main(b"{")
+        self.assertFalse(self.cache_path.exists())
+
+    def test_main_reports_stale_event_and_tombstone_without_changing_cache(self):
+        self.update()
+        previous = self.cache_path.read_bytes()
+        self.run_main(json.dumps(dict(self.event, transcript_path=None)).encode())
+        self.assertEqual(self.failure_records()[-1]["reason"], "stale-event-time")
+        self.assertEqual(self.cache_path.read_bytes(), previous)
+        self.update(dict(self.event, hook_event_name="SessionEnd", event_time_ns=101))
+        closed = self.cache_path.read_bytes()
+        self.run_main(json.dumps(dict(self.event, transcript_path=None, event_time_ns=102)).encode())
+        self.assertEqual(self.failure_records()[-1]["reason"], "session-ended")
+        self.assertEqual(self.cache_path.read_bytes(), closed)
+
+    def test_main_success_has_no_failure_record(self):
+        self.run_main(json.dumps(dict(self.event, transcript_path=None)).encode())
+        self.assertEqual(json.loads(self.cache_path.read_text())["bindingSource"], "process-walk")
+        self.assertEqual(self.failure_records(), [])
+        self.assertFalse((self.home / "state" / "forensics").exists())
+
+    def test_hook_failure_forensics_are_bounded_and_retain_newest(self):
+        with mock.patch("provider_binding_hook.FORENSICS_FILE_MAX_BYTES", 300):
+            for _ in range(16):
+                self.run_main(b"{")
+        paths = list((self.home / "state" / "forensics").glob("provider-binding-hook-*.jsonl"))
+        self.assertEqual(len(paths), provider_binding_hook.FORENSICS_FILE_RETENTION)
+        self.assertTrue(all(path.stat().st_size <= 300 for path in paths))
+        self.assertTrue(all(record["reason"] == "input-invalid" for record in self.failure_records()))
+
     def test_ancestor_raw_start_matches_authority_parser_byte_for_byte(self):
         self.process(99, 98, "500", "/bin/sh", "wrapper (with) spaces")
         self.update()
@@ -659,7 +887,7 @@ class ClaudeHookAncestorFallbackTest(unittest.TestCase):
                     "sessionId": self.session_id, "transcriptPath": str(self.path),
                     "pid": 321, "procStart": "444", "generation": 1,
                     "eventTimeNs": 100, "active": True, "terminalEvent": "",
-                    "version": expected,
+                    "version": expected, "bindingSource": "native-registry",
                 }
                 self.assertEqual(self.cache_path.read_text(), json.dumps(
                     expected_cache, separators=(",", ":"), sort_keys=True,

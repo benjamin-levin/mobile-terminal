@@ -248,6 +248,7 @@ class ProviderHookLifecycleIntegrationTest(unittest.IsolatedAsyncioTestCase):
             "while not (home / 'exit').exists(): time.sleep(.01)\n"
         )
         tmux.environment["HOME"] = str(home)
+        tmux.environment["MOBILE_TERMINAL_PROVIDER_BINDING_STATE_ROOT"] = str(home)
         pane_id = tmux.run("new-session", "-d", "-P", "-F", "#{pane_id}",
                            "-s", "hook-lifecycle", shlex.join([str(executable), str(driver)]))
         await tmux.wait_for(lambda: (home / "SessionStart").exists(), True, description="start hook")
@@ -479,7 +480,8 @@ class ProviderBindingHookTest(unittest.TestCase):
     def test_malformed_hook_input_is_provider_safe(self):
         script = Path(__file__).resolve().parents[1] / "provider_binding_hook.py"
         result = subprocess.run(
-            [sys.executable, str(script), "--provider", "claude", "--version", "2.1.241"],
+            [sys.executable, str(script), "--provider", "claude", "--version", "2.1.241",
+             "--state-root", str(self.home)],
             input=b"not-json",
             env={
                 **{
