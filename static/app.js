@@ -2086,10 +2086,7 @@
     };
     terminalSpeechAudio.onended = () => {
       if (current() && terminalSpeechAudio.ended) {
-        terminalSpeechSeeking = false;
-        updateTerminalSpeechProgress();
-        setTerminalSpeechState("Done");
-        clearTerminalSpeechAudio();
+        dismissTerminalSpeech();
       }
     };
     terminalSpeechAudio.onerror = () => {

@@ -271,7 +271,7 @@ class ClipboardClientTest(unittest.TestCase):
 })().catch(error => { console.error(error); process.exitCode = 1; });
 ''')
 
-    def test_speech_done_releases_audio_and_replay_ignores_old_events(self):
+    def test_speech_ended_dismisses_and_new_speech_ignores_old_events(self):
         self.run_node([], speech_player_harness() + r'''
 (async () => {
   assert.equal(audioCount, 0);
@@ -282,13 +282,16 @@ class ClipboardClientTest(unittest.TestCase):
   audio.currentTime = 80;
   const oldEvents = [audio.onended, audio.onerror, audio.onplay, audio.onpause, audio.ontimeupdate];
   const firstUrl = terminalSpeechUrl;
+  const generation = terminalSpeechGeneration;
+  terminalSpeechSeeking = true;
   audio.ended = true;
   audio.onended();
-  assert.equal(terminalSpeechPlayer.status.textContent, "Done");
-  assert.equal(terminalSpeechPlayer.time.textContent, "1:20 / 1:20");
-  assert.equal(terminalSpeechPlayer.player.hidden, false);
-  assert.equal(terminalSpeechPlayer.play.disabled, false);
-  assert.equal(terminalSpeechPlayer.seek.disabled, true);
+  assert.equal(terminalSpeechPlayer.player.hidden, true);
+  assert.equal(terminalSpeechState, "");
+  assert.equal(terminalSpeechGeneration, generation + 1);
+  assert.equal(terminalSpeechSeeking, false);
+  assert.equal(terminalSpeechUrl, null);
+  assert.equal(terminalSpeechBlob, null);
   assert.equal(audio.src, "");
   assert.equal(audio.paused, true);
   assert.equal(audio.onended, null);
@@ -297,15 +300,16 @@ class ClipboardClientTest(unittest.TestCase):
   assert.equal(events.at(-1).type, "load");
   assert.ok(revoked.includes(firstUrl));
   const plays = events.filter(event => event.type === "play").length;
+  oldEvents.forEach(callback => callback());
   await flush();
+  assert.equal(terminalSpeechPlayer.player.hidden, true);
   assert.equal(events.filter(event => event.type === "play").length, plays);
   assert.equal(requests.length, 1);
-  const replay = clickPlay();
-  assert.equal(events.at(-1).inGesture, true);
+  const speaking = tap();
   assert.equal(audio.currentTime, 0);
-  await replay;
+  await speaking;
   assert.notEqual(terminalSpeechUrl, firstUrl);
-  const replayUrl = terminalSpeechUrl;
+  const nextUrl = terminalSpeechUrl;
   oldEvents.forEach(callback => callback());
   // Queued events can also dispatch the newly installed same-element handler.
   assert.equal(audio.ended, false);
@@ -313,19 +317,47 @@ class ClipboardClientTest(unittest.TestCase):
   audio.onended();
   audio.onerror();
   assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
-  assert.equal(terminalSpeechUrl, replayUrl);
-  assert.equal(requests.length, 1, "replay uses retained WAV, not another request");
-  const replayEvents = [audio.onended, audio.onerror, audio.onplay, audio.onpause, audio.ontimeupdate];
+  assert.equal(terminalSpeechPlayer.player.hidden, false);
+  assert.equal(terminalSpeechUrl, nextUrl);
+  assert.equal(requests.length, 2, "Speak requests a new WAV after dismissal");
+  const nextEvents = [audio.onended, audio.onerror, audio.onplay, audio.onpause, audio.ontimeupdate];
   dismiss();
-  replayEvents.forEach(callback => callback());
+  nextEvents.forEach(callback => callback());
   assert.equal(terminalSpeechPlayer.player.hidden, true);
   assert.equal(terminalSpeechUrl, null);
   assert.equal(terminalSpeechBlob, null);
   assert.equal(audio.paused, true);
   assert.equal(audio.src, "");
-  assert.ok(revoked.includes(replayUrl));
+  assert.ok(revoked.includes(nextUrl));
   assert.equal(new Set(revoked).size, urlCounter);
   assert.equal(revoked.length, urlCounter);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''')
+
+    def test_speech_pause_keeps_player_and_audio_for_resume(self):
+        self.run_node([], speech_player_harness() + r'''
+(async () => {
+  await tap();
+  const audio = terminalSpeechAudio;
+  const url = terminalSpeechUrl, blob = terminalSpeechBlob;
+  const generation = terminalSpeechGeneration;
+  audio.currentTime = 32;
+  audio.pause();
+  audio.onpause();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Paused");
+  assert.equal(terminalSpeechPlayer.player.hidden, false);
+  assert.equal(terminalSpeechPlayer.play.disabled, false);
+  assert.equal(terminalSpeechGeneration, generation);
+  assert.equal(terminalSpeechUrl, url);
+  assert.equal(terminalSpeechBlob, blob);
+  assert.equal(audio.src, url);
+  assert.equal(revoked.includes(url), false);
+  await clickPlay();
+  assert.equal(terminalSpeechPlayer.status.textContent, "Playing");
+  assert.equal(audio.currentTime, 32);
+  assert.equal(terminalSpeechUrl, url);
+  assert.equal(requests.length, 1);
+  dismiss();
 })().catch(error => { console.error(error); process.exitCode = 1; });
 ''')
 
