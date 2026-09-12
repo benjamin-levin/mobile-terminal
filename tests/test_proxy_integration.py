@@ -972,9 +972,10 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
         connection.request.headers["Tailscale-Funnel-Request"] = "1"
         self.assertIsNone(proxy._identity_principal(connection, profile))
 
-    async def test_profile_relay_internal_headers_and_down_stub(self):
+    async def test_profile_relay_internal_headers_speech_and_down_stub(self):
         backend_requests = []
         backend_messages = []
+        speech_audio = base64.b64encode(b"\0" * 800000).decode("ascii")
 
         async def backend_handler(connection):
             backend_requests.append(connection.request)
@@ -1003,6 +1004,15 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                             }
                         )
                     )
+                elif payload.get("type") == "tts-request":
+                    await connection.send(json.dumps({"type": "terminal-output", "start": 0, "end": 5}))
+                    await connection.send(b"shell")
+                    result = {"type": "tts-result", "requestId": payload["requestId"]}
+                    if payload["text"]:
+                        result.update(contentType="audio/wav", audio=speech_audio)
+                    else:
+                        result["error"] = "Invalid text."
+                    await connection.send(json.dumps(result))
 
         async with serve(backend_handler, "127.0.0.1", 0) as backend_server:
             backend_port = backend_server.sockets[0].getsockname()[1]
@@ -1070,7 +1080,7 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                     process_request=proxy.process_request,
                 ) as proxy_server:
                     proxy_port = proxy_server.sockets[0].getsockname()[1]
-                    async with connect(f"ws://127.0.0.1:{proxy_port}/_ws?profile=powerhouse") as client:
+                    async with connect(f"ws://127.0.0.1:{proxy_port}/_ws?profile=powerhouse", max_size=64 * 1024 * 1024) as client:
                         challenge = await self.receive_json(client)
                         self.assertEqual((challenge["type"], challenge["realm"]), ("auth-challenge", "mine"))
                         await client.send(json.dumps({"type": "auth", "token": "external-secret"}))
@@ -1089,6 +1099,17 @@ class ProxyRelayTest(unittest.IsolatedAsyncioTestCase):
                         )
                         self.assertEqual(backend_requests[0].headers[PRINCIPAL_HEADER], "ben")
                         self.assertEqual(backend_requests[0].headers[PROFILE_HEADER], "powerhouse")
+
+                        for text in ("selected text", ""):
+                            request = {"type": "tts-request", "requestId": f"speech-{bool(text)}", "text": text}
+                            await client.send(json.dumps(request))
+                            self.assertEqual((await self.receive_json(client))["type"], "terminal-output")
+                            self.assertEqual(await asyncio.wait_for(client.recv(), 2), b"shell")
+                            result = await self.receive_json(client)
+                            expected = {"type": "tts-result", "requestId": request["requestId"]}
+                            expected.update({"contentType": "audio/wav", "audio": speech_audio} if text else {"error": "Invalid text."})
+                            self.assertEqual(result, expected)
+                            self.assertEqual(backend_messages[-1], request)
 
                         await client.send(
                             json.dumps(

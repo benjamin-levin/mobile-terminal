@@ -208,12 +208,10 @@ class Audio {
   removeAttribute() {}
 }
 const URL = { createObjectURL() { return "blob:test"; }, revokeObjectURL() {} };
-requestTerminalSpeechAuth = async () => "test-capability";
-async function fetch(url, options) {
-  assert.equal(url, "/tts");
-  speechTexts.push(JSON.parse(options.body).text);
-  return { ok: true, headers: { get: () => "audio/wav" }, blob: async () => ({}) };
-}
+requestTerminalSpeech = async (text) => {
+  speechTexts.push(text);
+  return { contentType: "audio/wav", audio: TERMINAL_SILENT_WAV.split(",")[1] };
+};
 (async () => {
   const raw = { text: "cdefghijklmnop\n  ta", authority: "terminal-raw" };
   for (const rawReply of [raw, "timeout", "throw"]) {
@@ -267,10 +265,9 @@ assert.equal(normalizeTerminalCopyText("crlf\r\nlone-cr\rfinal\r\n"),
         )
         self.assertLess(
             speech.index("normalizeTerminalCopyText(selection.text)"),
-            speech.index("await requestTerminalSpeechAuth()"),
+            speech.index("await requestTerminalSpeech(text, controller.signal)"),
         )
-        self.assertIn('fetch("/tts", {', speech)
-        self.assertIn("body: JSON.stringify({ text })", speech)
+        self.assertIn('type: "tts-request", requestId, text', extract_function("requestTerminalSpeech"))
         self.assertNotIn("normalizeTerminalCopyText(term.getSelection())", speech)
         self.assertNotIn(
             "term.getSelection()", APP_JS.replace(extract_function("speakTerminalSelection"), "")

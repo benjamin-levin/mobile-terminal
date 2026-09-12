@@ -1937,7 +1937,7 @@
   let terminalSpeechPlayer = null;
   let terminalSpeechState = "";
   let terminalSpeechSeeking = false;
-  let pendingSpeechAuth = null;
+  let pendingSpeechRequest = null;
   const TERMINAL_SILENT_WAV =
     "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
 
@@ -2046,7 +2046,7 @@
     terminalSpeechGeneration += 1;
     terminalSpeechRequest?.abort();
     terminalSpeechRequest = null;
-    pendingSpeechAuth?.finish("");
+    pendingSpeechRequest?.finish({ error: "Speech cancelled." });
     terminalSpeechBlob = null;
     clearTerminalSpeechAudio();
     terminalSpeechState = "";
@@ -2201,21 +2201,33 @@
     }
   }
 
-  function requestTerminalSpeechAuth() {
-    if (pendingSpeechAuth) {
-      pendingSpeechAuth.finish("");
-    }
+  function requestTerminalSpeech(text, signal) {
+    pendingSpeechRequest?.finish({ error: "Speech cancelled." });
     const requestId = `tts-${Date.now()}-${terminalSpeechGeneration}`;
     return new Promise((resolve) => {
-      const timer = window.setTimeout(() => finish(""), 6000);
-      const finish = (capability) => {
+      const timer = window.setTimeout(() => finish({ error: "Speech request timed out." }), 15000);
+      const abort = () => finish({ error: "Speech cancelled." });
+      const finish = (result) => {
+        if (pendingSpeechRequest?.requestId !== requestId) {
+          return;
+        }
         window.clearTimeout(timer);
-        pendingSpeechAuth = null;
-        resolve(capability);
+        signal.removeEventListener("abort", abort);
+        pendingSpeechRequest = null;
+        resolve(result);
       };
-      pendingSpeechAuth = { requestId, finish };
-      if (!sendMessage({ type: "tts-auth", requestId })) {
-        finish("");
+      pendingSpeechRequest = { requestId, finish };
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      try {
+        if (!sendMessage({ type: "tts-request", requestId, text })) {
+          finish({ error: "Terminal disconnected. Try again." });
+        }
+      } catch (_error) {
+        finish({ error: "Terminal disconnected. Try again." });
       }
     });
   }
@@ -2223,7 +2235,7 @@
   async function speakTerminalSelection() {
     const generation = ++terminalSpeechGeneration;
     terminalSpeechRequest?.abort();
-    pendingSpeechAuth?.finish("");
+    pendingSpeechRequest?.finish({ error: "Speech cancelled." });
     terminalSpeechBlob = null;
     clearTerminalSpeechAudio();
     setTerminalSpeechState("Preparing", "Preparing…");
@@ -2246,33 +2258,22 @@
       if (!text.trim()) {
         return fail("Select terminal text first.");
       }
-      const capability = await requestTerminalSpeechAuth();
+      const response = await requestTerminalSpeech(text, controller.signal);
       if (generation !== terminalSpeechGeneration) {
         return false;
       }
-      if (!capability) {
-        return fail("Speech failed: no auth token.");
+      if (response.error) {
+        return fail(response.error);
       }
-      const response = await fetch("/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${capability}` },
-        credentials: "same-origin",
-        cache: "no-store",
-        body: JSON.stringify({ text }),
-        signal: controller.signal,
-      });
-      if (generation !== terminalSpeechGeneration) {
-        return false;
-      }
-      if (!response.ok) {
-        return fail(response.status === 503 ? "Speech service unavailable." : `Speech failed: HTTP ${response.status}.`);
-      }
-      if (response.headers.get("Content-Type")?.split(";")[0] !== "audio/wav") {
+      if (response.contentType !== "audio/wav" || typeof response.audio !== "string" || !response.audio) {
         return fail("Speech failed: reply not audio.");
       }
-      const audio = await response.blob();
-      if (generation !== terminalSpeechGeneration) {
-        return false;
+      let audio;
+      try {
+        const bytes = Uint8Array.from(atob(response.audio), (char) => char.charCodeAt(0));
+        audio = new Blob([bytes], { type: "audio/wav" });
+      } catch (_error) {
+        return fail("Speech failed: reply not audio.");
       }
       // Retire late unlock results, but do not pause the gesture-primed element.
       // Let the real play() decide autoplay permission, even if unlock is pending.
@@ -8790,6 +8791,7 @@
       pending.resolve({ error: "Terminal changed; select again." });
     }
     pendingSelectionRequests.clear();
+    pendingSpeechRequest?.finish({ error: "Terminal disconnected. Try again." });
     updateProfileConnectionState();
 
     // Auth is challenge-driven now: the server sends {type:"auth-challenge",
@@ -8916,6 +8918,7 @@
         return;
       }
       applicationProtocolReady = false;
+      pendingSpeechRequest?.finish({ error: "Terminal disconnected. Try again." });
       connectionGeneration += 1;
       cancelPasskeyCeremony();
       clearActiveShortcutRepeatTimers();
@@ -9273,9 +9276,9 @@
       enrollDeviceKey(payload, socket);
       return;
     }
-    if (payload.type === "tts-auth") {
-      if (pendingSpeechAuth?.requestId === payload.requestId) {
-        pendingSpeechAuth.finish(typeof payload.capability === "string" ? payload.capability : "");
+    if (payload.type === "tts-result") {
+      if (pendingSpeechRequest?.requestId === payload.requestId) {
+        pendingSpeechRequest.finish(payload);
       }
       return;
     }
