@@ -1,13 +1,17 @@
+import io
 import json
 import os
 import random
+import socket
+import stat
+import subprocess
 import tempfile
 import time
 import unittest
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import provider_authority as provider_authority_module
 from provider_authority import (
@@ -3055,6 +3059,392 @@ class ProviderSelectionQuarantineTest(unittest.TestCase):
         with self.assertRaises(ProviderAuthorityError) as raised:
             self.select(plain_rows, styled_rows, start, end)
         self.assertEqual(raised.exception.reason, "placement-ambiguous")
+
+
+class FleetProviderSelectionTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name)
+        self.jobs = [
+            self.worker(SESSION_ID, 123),
+            self.worker(OTHER_SESSION_ID, 456),
+        ]
+        self.write_transcript(SESSION_ID, "old apple answer")
+        self.write_transcript(OTHER_SESSION_ID, "fresh banana answer")
+        self.connections = []
+        self.payloads = []
+        self.start = patch("provider_authority._read_proc_start", return_value="77").start()
+        self.viewer = patch("provider_authority._fleet_pane_identity", return_value=(999, "88")).start()
+        self.paths = patch(
+            "provider_authority._fleet_socket_paths", return_value=(self.home / "control.sock",),
+        ).start()
+        self.sockets = patch("provider_authority.socket.socket", side_effect=self.connection).start()
+        patch.dict(os.environ, {"MOBILE_TERMINAL_PROVIDER_AUTHORITY": "prefer"}).start()
+        self.addCleanup(patch.stopall)
+        _TRANSCRIPT_INDEXES.clear()
+        self.addCleanup(_TRANSCRIPT_INDEXES.clear)
+        provider_authority_module._FLEET_VIEWERS.clear()
+        self.addCleanup(provider_authority_module._FLEET_VIEWERS.clear)
+
+    def worker(self, session_id, pid):
+        return {
+            "short": session_id[:8], "sessionId": session_id, "pid": pid,
+            "cliVersion": "2.1.263", "nonce": f"nonce-{pid}", "attempt": 0,
+            "backend": "daemon",
+        }
+
+    def write_transcript(self, session_id, text):
+        path = self.home / ".claude" / "projects" / "-home-powerhouse-mobile-terminal" / f"{session_id}.jsonl"
+        record = claude_text(text)
+        record["sessionId"] = session_id
+        write_jsonl(path, [record])
+        return path
+
+    def connection(self, *args):
+        self.assertEqual(args, (socket.AF_UNIX, socket.SOCK_STREAM))
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        payload = self.payloads.pop(0) if self.payloads else json.dumps(
+            {"ok": True, "op": "list", "jobs": self.jobs},
+        ).encode() + b"\n"
+        if isinstance(payload, BaseException):
+            connection.connect.side_effect = payload
+        else:
+            connection.recv.side_effect = [payload, b""]
+        self.connections.append(connection)
+        return connection
+
+    def select(self, text, *, cols=24, client=True, alternate=True):
+        candidate = render_semantic_candidate(
+            AssistantTextRecord("claude", "selected", "selected", text, 1),
+            version="2.1.263", cols=cols,
+        )
+        styled = verified_styled_rows(candidate)
+        snapshot = SimpleNamespace(
+            pane_id="%99", alternate=alternate, cols=cols, seed_history=0,
+            physical_rows=styled, plain_physical_rows=candidate.plain_rows,
+        )
+        style_rows = normalize_styled_rows(styled, candidate.plain_rows)
+        client_rows = tuple(
+            (index, row, style_rows[index]) for index, row in enumerate(candidate.plain_rows)
+        ) if client else None
+        return provider_selection(
+            snapshot, candidate.selection_start[1], candidate.selection_start[0],
+            candidate.selection_end[1], candidate.selection_end[0],
+            home=self.home, client_rows=client_rows,
+        )
+
+    def assert_raw(self, result, reason):
+        self.assertFalse(result.owned)
+        self.assertIsNone(result.text)
+        self.assertEqual((result.authority, result.decision, result.reason), ("terminal-raw", "fallback", reason))
+
+    def test_stale_pane_cache_cannot_pin_worker_a_when_b_is_selected(self):
+        cache = self.home / ".mobile-terminal" / "provider-bindings" / "99.json"
+        cache.parent.mkdir(parents=True)
+        cache.write_text(json.dumps({"schema": 1, "paneId": "%99", "active": False, "sessionId": SESSION_ID}))
+        with patch("provider_authority._load_binding_cache", side_effect=AssertionError("stale cache consulted")):
+            result = self.select("fresh banana answer")
+        self.assertEqual((result.text, result.authority), ("fresh banana answer", "provider-exact"))
+        self.assertEqual(json.loads(cache.read_text())["sessionId"], SESSION_ID)
+
+    def test_hookless_worker_switch_matches_current_content_on_every_request(self):
+        for text in ("old apple answer", "fresh banana answer", "old apple answer"):
+            with self.subTest(text=text):
+                result = self.select(text)
+                self.assertEqual((result.text, result.authority), (text, "provider-exact"))
+        self.assertFalse((self.home / ".mobile-terminal").exists())
+        for connection in self.connections:
+            connection.sendall.assert_called_once_with(b'{"proto":1,"op":"list"}\n')
+            self.assertTrue(all(0 < call.args[0] <= 0.4 for call in connection.settimeout.call_args_list))
+
+    def test_daemon_tmux_null_needs_no_registry_or_fabricated_process_environment(self):
+        registry = self.home / ".claude" / "sessions" / "456.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(json.dumps({"pid": 456, "sessionId": OTHER_SESSION_ID, "tmux": None}))
+        with patch("provider_authority.validate_binding_process", side_effect=AssertionError("ordinary validator used")), patch(
+            "provider_authority._read_proc_environ", side_effect=AssertionError("environment read"),
+        ):
+            result = self.select("fresh banana answer")
+        self.assertEqual(result.authority, "provider-exact")
+
+    def test_snapshot_matching_keeps_authored_hard_breaks_and_removes_visual_wraps(self):
+        text = "a long source line that wraps\nnext authored line"
+        self.write_transcript(OTHER_SESSION_ID, text)
+        result = self.select(text, cols=20, client=False)
+        self.assertEqual((result.text, result.authority), (text, "provider-exact"))
+
+    def test_identical_clean_results_from_multiple_workers_stay_clean(self):
+        self.write_transcript(OTHER_SESSION_ID, "old apple answer")
+        result = self.select("old apple answer")
+        self.assertEqual((result.text, result.authority), ("old apple answer", "provider-exact"))
+
+    def test_near_identical_rendering_with_different_hard_breaks_is_ambiguous(self):
+        self.write_transcript(SESSION_ID, "alpha beta gamma delta")
+        self.write_transcript(OTHER_SESSION_ID, "alpha beta\ngamma delta")
+        self.assert_raw(self.select("alpha beta gamma delta", cols=14), "placement-ambiguous")
+
+    def test_no_matching_worker_keeps_no_plain_placement_raw_floor(self):
+        self.assert_raw(self.select("neither transcript"), "no-plain-placement")
+
+    def test_empty_worker_list_is_raw(self):
+        self.jobs = []
+        self.assert_raw(self.select("fresh banana answer"), "no-plain-placement")
+
+    def test_multiple_listeners_are_all_considered_and_duplicate_workers_deduped(self):
+        self.paths.return_value = (self.home / "one.sock", self.home / "two.sock")
+        first = json.dumps({"ok": True, "op": "list", "jobs": self.jobs[:1]}).encode() + b"\n"
+        second = json.dumps({"ok": True, "op": "list", "jobs": self.jobs}).encode() + b"\n"
+        self.payloads = [first, second, first, second]
+        result = self.select("fresh banana answer")
+        self.assertEqual(result.authority, "provider-exact")
+        self.assertEqual(len(self.connections), 4)
+
+    def test_divergent_matches_across_listeners_are_raw(self):
+        self.write_transcript(SESSION_ID, "alpha beta gamma delta")
+        self.write_transcript(OTHER_SESSION_ID, "alpha beta\ngamma delta")
+        self.paths.return_value = (self.home / "one.sock", self.home / "two.sock")
+        self.payloads = [json.dumps({"ok": True, "op": "list", "jobs": [job]}).encode() + b"\n" for job in self.jobs]
+        self.assert_raw(self.select("alpha beta gamma delta", cols=14), "placement-ambiguous")
+
+    def test_stale_listener_does_not_hide_another_live_listener(self):
+        self.paths.return_value = (self.home / "stale.sock", self.home / "live.sock")
+        valid = json.dumps({"ok": True, "op": "list", "jobs": self.jobs}).encode() + b"\n"
+        self.payloads = [ConnectionRefusedError(), valid, FileNotFoundError(), valid]
+        self.assertEqual(self.select("fresh banana answer").authority, "provider-exact")
+
+    def test_unavailable_timeout_and_malformed_lists_are_bounded_raw_fallbacks(self):
+        for payload, reason in (
+            (ConnectionRefusedError(), "fleet-list-unavailable"),
+            (TimeoutError(), "fleet-list-timeout"),
+            (b"not json\n", "fleet-list-invalid"),
+            (b'{"ok":true,"op":"list","jobs":{}}\n', "fleet-list-invalid"),
+            (b'{"ok":true,"op":"other","jobs":[]}\n', "fleet-list-invalid"),
+            (b'{"ok":false,"op":"list","jobs":[]}\n', "fleet-list-invalid"),
+            (b'{"ok":true', "fleet-list-invalid"),
+        ):
+            with self.subTest(reason=reason, payload=type(payload).__name__):
+                self.payloads = [payload]
+                self.assert_raw(self.select("fresh banana answer"), reason)
+
+    def test_malformed_second_listener_cannot_be_ignored(self):
+        self.paths.return_value = (self.home / "good.sock", self.home / "bad.sock")
+        self.payloads = [json.dumps({"ok": True, "op": "list", "jobs": self.jobs}).encode() + b"\n", b"bad\n"]
+        self.assert_raw(self.select("fresh banana answer"), "fleet-list-invalid")
+
+    def test_total_deadline_expires_even_when_reads_keep_delivering_bytes(self):
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.return_value = b" "
+        self.sockets.side_effect = None
+        self.sockets.return_value = connection
+        with patch("provider_authority.time.monotonic", side_effect=[0, 0.1, 0.2, 0.3, 0.41]):
+            self.assert_raw(self.select("fresh banana answer"), "fleet-list-timeout")
+        connection.recv.assert_called_once()
+
+    def test_response_byte_and_worker_count_limits_fall_back_raw(self):
+        for payload in (
+            b" " * (provider_authority_module.MAX_FLEET_LIST_BYTES + 1),
+            json.dumps({"ok": True, "op": "list", "jobs": [self.jobs[0]] * 33}).encode() + b"\n",
+        ):
+            self.payloads = [payload]
+            self.assert_raw(self.select("fresh banana answer"), "fleet-list-limit")
+
+    def test_invalid_worker_identity_fails_closed(self):
+        for key, value in (("sessionId", "not-a-uuid"), ("short", "wrong"), ("pid", True), ("pid", 0), ("attempt", -1), ("nonce", ""), ("cliVersion", None)):
+            with self.subTest(key=key, value=value):
+                job = dict(self.jobs[0], **{key: value})
+                self.payloads = [json.dumps({"ok": True, "op": "list", "jobs": [job]}).encode() + b"\n"]
+                self.assert_raw(self.select("fresh banana answer"), "fleet-list-invalid")
+
+    def test_conflicting_session_identity_across_listeners_is_raw(self):
+        self.jobs.append(dict(self.jobs[0], pid=789))
+        self.assert_raw(self.select("fresh banana answer"), "fleet-changed")
+
+    def test_worker_list_change_during_matching_invalidates_result(self):
+        self.payloads = [json.dumps({"ok": True, "op": "list", "jobs": jobs}).encode() + b"\n" for jobs in (self.jobs, self.jobs[:1])]
+        self.assert_raw(self.select("fresh banana answer"), "fleet-changed")
+
+    def test_viewer_change_during_matching_invalidates_result(self):
+        self.viewer.side_effect = [(999, "88"), (999, "89")]
+        self.assert_raw(self.select("fresh banana answer"), "fleet-changed")
+
+    def test_worker_process_reuse_invalidates_result(self):
+        starts = {123: 0, 456: 0}
+        def read_start(pid):
+            starts[pid] += 1
+            return "77" if starts[pid] < 2 else "78"
+        self.start.side_effect = read_start
+        self.assert_raw(self.select("fresh banana answer"), "process-start-mismatch")
+
+    def test_nonmatching_transcript_append_is_caught_by_final_fence(self):
+        original = provider_authority_module.authoritative_provider_match
+        path = self.home / ".claude/projects/-home-powerhouse-mobile-terminal" / f"{SESSION_ID}.jsonl"
+        def match(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if args[0].session_id == OTHER_SESSION_ID:
+                with path.open("ab") as handle:
+                    handle.write(b'{}\n')
+            return result
+        with patch("provider_authority.authoritative_provider_match", side_effect=match):
+            self.assert_raw(self.select("fresh banana answer"), "transcript-changed")
+
+    def test_transcript_symlinks_session_mismatch_and_renderer_gates_remain_strict(self):
+        self.jobs = self.jobs[1:]
+        path = self.write_transcript(OTHER_SESSION_ID, "fresh banana answer")
+        for kind, reason in (("session", "schema-drift"), ("version", "unsupported-provider-version"), ("symlink", "unsafe-transcript-open")):
+            with self.subTest(kind=kind):
+                self.write_transcript(OTHER_SESSION_ID, "fresh banana answer")
+                self.jobs[0]["cliVersion"] = "2.1.263"
+                if kind == "session":
+                    write_jsonl(path, [claude_text("fresh banana answer")])
+                elif kind == "version":
+                    self.jobs[0]["cliVersion"] = "unverified"
+                else:
+                    target = path.with_suffix(".source")
+                    path.rename(target)
+                    path.symlink_to(target)
+                self.assert_raw(self.select("fresh banana answer"), reason)
+                _TRANSCRIPT_INDEXES.clear()
+
+    def test_normal_buffer_never_discovers_fleet_workers(self):
+        with patch("provider_authority.resolve_provider_binding", return_value=(None, None)):
+            result = self.select("fresh banana answer", alternate=False)
+        self.assertFalse(result.owned)
+        self.viewer.assert_not_called()
+        self.sockets.assert_not_called()
+
+    def test_detection_failure_preserves_ordinary_resolver(self):
+        self.viewer.return_value = None
+        with patch("provider_authority.resolve_provider_binding", return_value=(None, None)) as resolve:
+            result = self.select("fresh banana answer")
+        self.assertFalse(result.owned)
+        resolve.assert_called_once_with("%99", home=self.home)
+        self.sockets.assert_not_called()
+
+    def test_known_fleet_detection_timeout_never_consults_stale_cache(self):
+        self.assertEqual(self.select("fresh banana answer").authority, "provider-exact")
+        self.viewer.side_effect = ProviderAuthorityError("fleet-detection-unavailable")
+        with patch("provider_authority._load_binding_cache", side_effect=AssertionError("stale fleet cache consulted")):
+            self.assert_raw(self.select("fresh banana answer"), "fleet-detection-unavailable")
+
+    def test_detection_timeout_rejects_daemon_style_cache_or_registry(self):
+        self.viewer.side_effect = ProviderAuthorityError("fleet-detection-unavailable")
+        path = self.home / ".mobile-terminal" / "provider-bindings" / "99.json"
+        path.parent.mkdir(parents=True)
+        cache = {
+            "schema": 1, "provider": "claude", "paneId": "%99", "sessionId": SESSION_ID,
+            "transcriptPath": str(self.home / ".claude/projects" / f"{SESSION_ID}.jsonl"),
+            "pid": 123, "procStart": "77", "version": "2.1.263", "generation": 1, "active": True,
+        }
+        registry = self.home / ".claude/sessions/123.json"
+        for location in ("cache", "registry"):
+            with self.subTest(location=location):
+                path.write_text(json.dumps(dict(cache, tmux=None) if location == "cache" else cache))
+                if location == "registry":
+                    registry.parent.mkdir(parents=True)
+                    registry.write_text(json.dumps({"pid": 123, "sessionId": SESSION_ID, "tmux": None}))
+                with patch("provider_authority.resolve_provider_binding", side_effect=AssertionError("daemon cache resolved as ordinary")):
+                    self.assert_raw(self.select("fresh banana answer"), "fleet-detection-unavailable")
+
+    def test_detection_timeout_without_fleet_evidence_preserves_ordinary_resolution(self):
+        self.viewer.side_effect = ProviderAuthorityError("fleet-detection-unavailable")
+        with patch("provider_authority.resolve_provider_binding", return_value=(None, None)) as resolve:
+            result = self.select("fresh banana answer")
+        self.assertEqual((result.decision, result.reason), ("unowned", "binding-unavailable"))
+        resolve.assert_called_once_with("%99", home=self.home)
+
+    def test_ordinary_claude_and_codex_still_match_with_real_process_validation(self):
+        for provider, version in (("claude", "2.1.263"), ("codex", "0.153.3")):
+            with self.subTest(provider=provider):
+                path = self.home / provider / f"{SESSION_ID}.jsonl"
+                records = [claude_text("ordinary answer")] if provider == "claude" else [codex_meta(), codex_text("ordinary answer")]
+                write_jsonl(path, records)
+                current = binding(provider, path, version=version)
+                candidate = render_semantic_candidate(
+                    AssistantTextRecord(provider, "ordinary", "ordinary", "ordinary answer", 1),
+                    version=version, cols=24,
+                )
+                result = authoritative_provider_match(
+                    current, TranscriptIndex(), transcript_root=path.parent, cols=24,
+                    plain_rows=candidate.plain_rows, selection_start=candidate.selection_start,
+                    selection_end=candidate.selection_end, proc_start_reader=lambda pid: "77",
+                    proc_environ_reader=lambda pid: {"TMUX_PANE": "%9"},
+                )
+                self.assertEqual((result.matched, result.text), (True, "ordinary answer"))
+        self.sockets.assert_not_called()
+
+    def test_ordinary_process_validator_still_requires_tmux_pane_for_claude_and_codex(self):
+        for provider in ("claude", "codex"):
+            current = binding(provider, self.home / "unused.jsonl")
+            with self.subTest(provider=provider), self.assertRaisesRegex(ProviderAuthorityError, "process-pane-mismatch"):
+                provider_authority_module.validate_binding_process(
+                    current, proc_start_reader=lambda pid: "77", proc_environ_reader=lambda pid: {},
+                )
+
+
+class FleetDiscoveryTest(unittest.TestCase):
+    def test_foreground_exact_command_detection_is_bounded_and_not_a_title_guess(self):
+        for argv, expected in (
+            (b"/usr/bin/claude\0agents\0", True),
+            (b"claude agents\0", True),
+            (b"node\0/opt/claude/cli.js\0agents\0", True),
+            (b"claude\0", False),
+            (b"codex\0agents\0", False),
+            (b"bash\0-c\0claude agents\0", False),
+            (b"claude\0--resume\0agents\0", False),
+        ):
+            with self.subTest(argv=argv), patch(
+                "provider_authority.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="123\n"),
+            ) as run, patch(
+                "provider_authority.Path.read_text", return_value="123 (shell with spaces) S 1 123 1 7 456 " + "0 " * 20,
+            ), patch("provider_authority.Path.open", return_value=io.BytesIO(argv)), patch(
+                "provider_authority._read_proc_start", return_value="77",
+            ):
+                identity = provider_authority_module._fleet_pane_identity("%99")
+            self.assertEqual(identity, (456, "77") if expected else None)
+            self.assertEqual(run.call_args.args[0], ["tmux", "display-message", "-p", "-t", "%99", "#{pane_pid}"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
+
+    def test_detection_errors_are_distinct_from_positively_ordinary_panes(self):
+        for error in (OSError(), subprocess.TimeoutExpired("tmux", 0.25)):
+            with patch("provider_authority.subprocess.run", side_effect=error):
+                with self.assertRaisesRegex(ProviderAuthorityError, "fleet-detection-unavailable"):
+                    provider_authority_module._fleet_pane_identity("%99")
+        with patch("provider_authority.subprocess.run") as run:
+            self.assertIsNone(provider_authority_module._fleet_pane_identity("not-a-pane"))
+        run.assert_not_called()
+
+    def test_missing_foreground_process_is_unavailable_not_ordinary(self):
+        for pid in (0, -1):
+            with self.subTest(pid=pid), patch(
+                "provider_authority.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="123\n"),
+            ), patch("provider_authority.Path.read_text", return_value=f"123 (shell) S 1 123 1 7 {pid} " + "0 " * 20):
+                with self.assertRaisesRegex(ProviderAuthorityError, "fleet-detection-unavailable"):
+                    provider_authority_module._fleet_pane_identity("%99")
+
+    def test_discovery_prefers_namespaced_socket_then_legacy_and_enforces_limits(self):
+        root = Path("/tmp") / f"cc-daemon-{os.geteuid()}"
+        child = root / "instance" / "control.sock"
+        def metadata(path):
+            mode = stat.S_IFSOCK | 0o600 if path.name == "control.sock" else stat.S_IFDIR | 0o700
+            return SimpleNamespace(st_mode=mode, st_uid=os.geteuid())
+        with patch("provider_authority.Path.lstat", autospec=True, side_effect=metadata), patch(
+            "provider_authority.Path.glob", return_value=iter([child]),
+        ), patch("provider_authority.Path.exists", return_value=True):
+            self.assertEqual(provider_authority_module._fleet_socket_paths(), (child, root / "control.sock"))
+        with patch("provider_authority.Path.lstat", autospec=True, side_effect=metadata), patch(
+            "provider_authority.Path.glob", return_value=iter([root / str(i) / "control.sock" for i in range(9)]),
+        ):
+            with self.assertRaisesRegex(ProviderAuthorityError, "fleet-list-limit"):
+                provider_authority_module._fleet_socket_paths()
+
+    def test_socket_discovery_rejects_untrusted_roots(self):
+        for mode, uid in ((stat.S_IFLNK | 0o700, os.geteuid()), (stat.S_IFDIR | 0o777, os.geteuid()), (stat.S_IFDIR | 0o700, os.geteuid() + 1)):
+            with patch("provider_authority.Path.lstat", return_value=SimpleNamespace(st_mode=mode, st_uid=uid)):
+                with self.assertRaisesRegex(ProviderAuthorityError, "fleet-list-unavailable"):
+                    provider_authority_module._fleet_socket_paths()
 
 
 class CodexOwnershipTest(unittest.TestCase):

@@ -3,8 +3,11 @@ import html
 import json
 import os
 import re
+import socket
 import stat
+import subprocess
 import threading
+import time
 import unicodedata
 from bisect import bisect_left
 from collections import OrderedDict, deque
@@ -22,6 +25,11 @@ DEFAULT_MAX_SCAN_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_IRRELEVANT_RECORD_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_INDEX_RECORDS = 128
 MAX_TRANSCRIPT_INDEXES = 32
+MAX_FLEET_LISTENERS = 8
+MAX_FLEET_WORKERS = 32
+MAX_FLEET_VIEWERS = 32
+MAX_FLEET_LIST_BYTES = 256 * 1024
+FLEET_LIST_TIMEOUT = 0.4
 MAX_PROVIDER_DIAGNOSTIC_REASONS = 64
 PROVIDER_DIAGNOSTIC_FLUSH_EVERY = 128
 _PROVIDER_MATCH_REJECTION_REASONS = frozenset(
@@ -45,6 +53,12 @@ _PROVIDER_DIAGNOSTIC_REASONS = frozenset(
         "binding-cache-unavailable",
         "binding-changed",
         "binding-unavailable",
+        "fleet-list-unavailable",
+        "fleet-list-invalid",
+        "fleet-list-limit",
+        "fleet-list-timeout",
+        "fleet-changed",
+        "fleet-detection-unavailable",
         "canonical-match",
         "captured-row-overflow",
         "claude-binding-unavailable",
@@ -3183,14 +3197,22 @@ def authoritative_provider_match(
     proc_start_reader: Callable[[int], str] = _read_proc_start,
     proc_environ_reader: Callable[[int], Mapping[str, str]] = _read_proc_environ,
     before_final_revalidation: Callable[[], None] | None = None,
+    process_validator: Callable[[ProviderBinding], None] | None = None,
 ) -> MatchResult:
     fence: TranscriptFence | None = None
+
+    def validate_process() -> None:
+        if process_validator is not None:
+            process_validator(binding)
+        else:
+            validate_binding_process(
+                binding,
+                proc_start_reader=proc_start_reader,
+                proc_environ_reader=proc_environ_reader,
+            )
+
     try:
-        validate_binding_process(
-            binding,
-            proc_start_reader=proc_start_reader,
-            proc_environ_reader=proc_environ_reader,
-        )
+        validate_process()
         fence = open_transcript_fence(binding, root=transcript_root, owner_uid=owner_uid)
         records = index.update(fence, binding)
         renderer_profile(binding.provider, binding.version)
@@ -3274,11 +3296,7 @@ def authoritative_provider_match(
             return MatchResult.failure("no-canonical-candidate")
         if before_final_revalidation is not None:
             before_final_revalidation()
-        validate_binding_process(
-            binding,
-            proc_start_reader=proc_start_reader,
-            proc_environ_reader=proc_environ_reader,
-        )
+        validate_process()
         revalidate_transcript_fence(fence)
         return result
     except ProviderAuthorityError as exc:
@@ -3300,6 +3318,7 @@ class ProviderSelectionResult:
 
 
 _TRANSCRIPT_INDEXES: OrderedDict[tuple[str, Path, int], TranscriptIndex] = OrderedDict()
+_FLEET_VIEWERS: OrderedDict[tuple[Path, str], tuple[int, str]] = OrderedDict()
 _PROVIDER_SELECTION_LOCK = threading.Lock()
 _PROVIDER_DIAGNOSTIC_LOCK = threading.Lock()
 _PROVIDER_DIAGNOSTICS: OrderedDict[tuple[str, str, str], int] = OrderedDict()
@@ -3467,12 +3486,187 @@ def _cache_binding(data: Mapping[str, Any], *, require_active: bool = True) -> P
     )
 
 
+@dataclass(frozen=True)
+class _FleetWorker:
+    session_id: str
+    pid: int
+    version: str
+    nonce: str
+    attempt: int
+
+
+def _fleet_pane_identity(pane_id: str) -> tuple[int, str] | None:
+    if not PANE_RE.fullmatch(pane_id):
+        return None
+    try:
+        pane = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
+            capture_output=True, text=True, check=False, timeout=0.25,
+        )
+        if pane.returncode or not pane.stdout.strip().isdigit():
+            raise ProviderAuthorityError("fleet-detection-unavailable")
+        shell_stat = Path(f"/proc/{int(pane.stdout)}/stat").read_text(encoding="utf-8")
+        fields = shell_stat[shell_stat.rfind(")") + 2 :].split()
+        foreground_pid = int(fields[5])
+        if foreground_pid <= 0:
+            raise ProviderAuthorityError("fleet-detection-unavailable")
+        start = _read_proc_start(foreground_pid)
+        with Path(f"/proc/{foreground_pid}/cmdline").open("rb") as handle:
+            raw = handle.read(4097)
+        if not raw or len(raw) > 4096:
+            raise ProviderAuthorityError("fleet-detection-unavailable")
+        args = raw.decode("utf-8").rstrip("\0").split("\0")
+        executable = Path(args[0]).name
+        fleet = (
+            (executable == "claude" and args[1:2] == ["agents"])
+            or args == ["claude agents"]
+            or (
+                executable in ("node", "bun")
+                and len(args) >= 3
+                and Path(args[1]).name in ("cli.js", "claude")
+                and args[2] == "agents"
+            )
+        )
+        if fleet:
+            if _read_proc_start(foreground_pid) != start:
+                raise ProviderAuthorityError("fleet-detection-unavailable")
+            return foreground_pid, start
+    except (OSError, ValueError, IndexError, UnicodeError, subprocess.TimeoutExpired, ProviderAuthorityError) as exc:
+        raise ProviderAuthorityError("fleet-detection-unavailable") from exc
+    return None
+
+
+def _fleet_socket_paths() -> tuple[Path, ...]:
+    root = Path("/tmp") / f"cc-daemon-{os.geteuid()}"
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        return ()
+    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.geteuid() or root_stat.st_mode & 0o022:
+        raise ProviderAuthorityError("fleet-list-unavailable")
+    paths = []
+    for path in root.glob("*/control.sock"):
+        parent_stat = path.parent.lstat()
+        if not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid != os.geteuid() or parent_stat.st_mode & 0o022:
+            raise ProviderAuthorityError("fleet-list-unavailable")
+        paths.append(path)
+        if len(paths) > MAX_FLEET_LISTENERS:
+            raise ProviderAuthorityError("fleet-list-limit")
+    paths.sort()
+    legacy = root / "control.sock"
+    if legacy.exists():
+        paths.append(legacy)
+    if len(paths) > MAX_FLEET_LISTENERS:
+        raise ProviderAuthorityError("fleet-list-limit")
+    for path in paths:
+        metadata = path.lstat()
+        if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise ProviderAuthorityError("fleet-list-unavailable")
+    return tuple(paths)
+
+
+def _fleet_workers() -> tuple[_FleetWorker, ...]:
+    deadline = time.monotonic() + FLEET_LIST_TIMEOUT
+    workers: dict[str, _FleetWorker] = {}
+    listeners = 0
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise ProviderAuthorityError("fleet-list-timeout")
+        return value
+
+    try:
+        for path in _fleet_socket_paths():
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.settimeout(remaining())
+                    connection.connect(str(path))
+                    connection.settimeout(remaining())
+                    connection.sendall(b'{"proto":1,"op":"list"}\n')
+                    raw = bytearray()
+                    while b"\n" not in raw:
+                        connection.settimeout(remaining())
+                        chunk = connection.recv(min(65536, MAX_FLEET_LIST_BYTES + 1 - len(raw)))
+                        if not chunk:
+                            raise ProviderAuthorityError("fleet-list-invalid")
+                        raw.extend(chunk)
+                        if len(raw) > MAX_FLEET_LIST_BYTES:
+                            raise ProviderAuthorityError("fleet-list-limit")
+                    remaining()
+            except (FileNotFoundError, ConnectionRefusedError):
+                continue
+            data = json.loads(raw.split(b"\n", 1)[0])
+            if not isinstance(data, dict) or data.get("ok") is not True or data.get("op") != "list":
+                raise ProviderAuthorityError("fleet-list-invalid")
+            jobs = data.get("jobs")
+            if not isinstance(jobs, list):
+                raise ProviderAuthorityError("fleet-list-invalid")
+            if len(jobs) > MAX_FLEET_WORKERS:
+                raise ProviderAuthorityError("fleet-list-limit")
+            listeners += 1
+            for job in jobs:
+                if not isinstance(job, dict):
+                    raise ProviderAuthorityError("fleet-list-invalid")
+                session_id = job.get("sessionId")
+                pid = job.get("pid")
+                version = job.get("cliVersion")
+                nonce = job.get("nonce")
+                attempt = job.get("attempt")
+                if (
+                    not isinstance(session_id, str) or not UUID_RE.fullmatch(session_id)
+                    or job.get("short") != session_id[:8]
+                    or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+                    or not isinstance(version, str) or not version
+                    or not isinstance(nonce, str) or not nonce
+                    or isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0
+                ):
+                    raise ProviderAuthorityError("fleet-list-invalid")
+                worker = _FleetWorker(session_id, pid, version, nonce, attempt)
+                if session_id in workers and workers[session_id] != worker:
+                    raise ProviderAuthorityError("fleet-changed")
+                workers[session_id] = worker
+                if len(workers) > MAX_FLEET_WORKERS:
+                    raise ProviderAuthorityError("fleet-list-limit")
+        if not listeners:
+            raise ProviderAuthorityError("fleet-list-unavailable")
+        return tuple(workers[key] for key in sorted(workers))
+    except TimeoutError as exc:
+        raise ProviderAuthorityError("fleet-list-timeout") from exc
+    except (UnicodeError, ValueError) as exc:
+        raise ProviderAuthorityError("fleet-list-invalid") from exc
+    except OSError as exc:
+        raise ProviderAuthorityError("fleet-list-unavailable") from exc
+
+
+def _validate_fleet_process(binding: ProviderBinding) -> None:
+    # Daemon workers have no tmux pane. Their live PID/start identity is fenced
+    # separately from the foreground fleet viewer and its complete worker list.
+    if _read_proc_start(binding.pid) != binding.proc_start:
+        raise ProviderAuthorityError("process-start-mismatch")
+
+
 def resolve_provider_binding(
     pane_id: str,
     *,
     home: Path | str | None = None,
+    fleet_worker: _FleetWorker | None = None,
 ) -> tuple[ProviderBinding | None, Mapping[str, Any] | None]:
     provider_home = Path(home) if home is not None else Path.home()
+    if fleet_worker is not None:
+        if not PANE_RE.fullmatch(pane_id):
+            raise ProviderAuthorityError("invalid-pane")
+        renderer_profile("claude", fleet_worker.version)
+        root = provider_home / ".claude" / "projects"
+        paths = _default_transcript_paths(root, fleet_worker.session_id)
+        if len(paths) != 1 or paths[0].name != f"{fleet_worker.session_id}.jsonl":
+            raise ProviderAuthorityError("claude-binding-unavailable")
+        _relative_transcript_path(root, paths[0])
+        return ProviderBinding(
+            "claude", pane_id, fleet_worker.pid, _read_proc_start(fleet_worker.pid),
+            fleet_worker.session_id, fleet_worker.session_id, paths[0],
+            fleet_worker.version, fleet_worker.attempt + 1,
+        ), None
     cache = _load_binding_cache(provider_home, pane_id)
     if cache is None:
         try:
@@ -3577,6 +3771,74 @@ def _transcript_root(binding: ProviderBinding, home: Path) -> Path:
     return home / ".codex" / "sessions"
 
 
+def _fleet_provider_match(
+    snapshot: Any,
+    start_x: int,
+    start_row: int,
+    end_x: int,
+    end_row: int,
+    *,
+    home: Path,
+    viewer: tuple[int, str],
+    client_rows: Sequence[tuple[int, str, tuple[tuple[int, int, str], ...]]] | None,
+) -> tuple[ProviderBinding, MatchResult]:
+    workers = _fleet_workers()
+    if not workers:
+        raise ProviderAuthorityError("no-plain-placement")
+    if client_rows is None:
+        plain_rows, style_rows = _normalize_captured_rows(
+            snapshot.physical_rows, snapshot.plain_physical_rows, snapshot.cols,
+        )
+        match_start = (start_row + snapshot.seed_history, start_x)
+        match_end = (end_row + snapshot.seed_history, end_x)
+    else:
+        plain_rows = normalize_plain_rows(
+            tuple(row[1] for row in client_rows), snapshot.cols, client_coordinates=True,
+        )
+        style_rows = tuple(row[2] for row in client_rows)
+        match_start = (start_row - client_rows[0][0], start_x)
+        match_end = (end_row - client_rows[0][0], end_x)
+    matches: list[tuple[ProviderBinding, MatchResult]] = []
+    fences: list[tuple[ProviderBinding, TranscriptFence]] = []
+    try:
+        for worker in workers:
+            binding, _ = resolve_provider_binding(
+                snapshot.pane_id, home=home, fleet_worker=worker,
+            )
+            if binding is None:
+                raise ProviderAuthorityError("claude-binding-unavailable")
+            root = _transcript_root(binding, home)
+            # Keep even non-matching transcripts fenced until the cross-worker
+            # uniqueness decision; a concurrent append could introduce an alias.
+            fences.append((binding, open_transcript_fence(binding, root=root)))
+            key = (binding.provider, binding.transcript_path.absolute(), binding.generation)
+            result = authoritative_provider_match(
+                binding, _transcript_index(key), transcript_root=root,
+                cols=snapshot.cols, plain_rows=plain_rows,
+                selection_start=match_start, selection_end=match_end,
+                style_rows=style_rows, allow_partial_context=client_rows is not None,
+                client_coordinates=client_rows is not None,
+                process_validator=_validate_fleet_process,
+            )
+            if result.matched:
+                matches.append((binding, result))
+                if len({match.text for _, match in matches}) > 1:
+                    raise ProviderAuthorityError("placement-ambiguous")
+            elif result.internal_reason not in ("no-plain-placement", "style-mismatch"):
+                raise ProviderAuthorityError(result.internal_reason or "no-canonical-candidate")
+        if not matches:
+            raise ProviderAuthorityError("no-plain-placement")
+        if _fleet_workers() != workers or _fleet_pane_identity(snapshot.pane_id) != viewer:
+            raise ProviderAuthorityError("fleet-changed")
+        for binding, fence in fences:
+            _validate_fleet_process(binding)
+            revalidate_transcript_fence(fence)
+        return matches[0]
+    finally:
+        for _, fence in fences:
+            close_transcript_fence(fence)
+
+
 def _provider_selection_locked(
     snapshot: Any,
     start_x: int,
@@ -3619,10 +3881,47 @@ def _provider_selection_locked(
     owned = False
     provider_signal = False
     try:
+        viewer_key = (provider_home.absolute(), snapshot.pane_id)
+        detection_failed = False
+        try:
+            viewer = _fleet_pane_identity(snapshot.pane_id) if bool(snapshot.alternate) else None
+        except ProviderAuthorityError:
+            if viewer_key in _FLEET_VIEWERS:
+                provider_signal = True
+                raise
+            detection_failed = True
+            viewer = None
+        if viewer is not None:
+            _FLEET_VIEWERS[viewer_key] = viewer
+            _FLEET_VIEWERS.move_to_end(viewer_key)
+            while len(_FLEET_VIEWERS) > MAX_FLEET_VIEWERS:
+                _FLEET_VIEWERS.popitem(last=False)
+            provider_signal = True
+            owned = True
+            binding, result = _fleet_provider_match(
+                snapshot, start_x, start_row, end_x, end_row,
+                home=provider_home, viewer=viewer, client_rows=client_rows,
+            )
+            binding_reason = "bound"
+            return decision("matched", True, "canonical-match", result.text, "provider-exact")
+        if not detection_failed:
+            _FLEET_VIEWERS.pop(viewer_key, None)
         cache = _load_binding_cache(provider_home, snapshot.pane_id)
         if cache is not None:
             provider_signal = True
             cached = _cache_binding(cache, require_active=False)
+            if detection_failed and cached.provider == "claude":
+                if "tmux" in cache and cache["tmux"] is None:
+                    raise ProviderAuthorityError("fleet-detection-unavailable")
+                registry_path = provider_home / ".claude" / "sessions" / f"{cached.pid}.json"
+                try:
+                    with registry_path.open("rb") as handle:
+                        raw = handle.read(64 * 1024 + 1)
+                    registry = json.loads(raw) if len(raw) <= 64 * 1024 else None
+                except (OSError, ValueError):
+                    registry = None
+                if isinstance(registry, dict) and "tmux" in registry and registry["tmux"] is None:
+                    raise ProviderAuthorityError("fleet-detection-unavailable")
             if not cache["active"]:
                 binding_reason = "binding-cache-stale"
             if cached.provider == "codex":
