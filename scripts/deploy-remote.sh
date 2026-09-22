@@ -24,7 +24,7 @@ validate_runtime_tuple() {
   [[ "$repo" == /* && "$interpreter" == "$repo/.venv/bin/python" ]] || fail "invalid repository interpreter"
 
   case "$scope|$service|$runtime_user" in
-    "user-systemd|mobile-terminal.service|powerhouse"|"user-systemd|mobile-terminal-proxy.service|powerhouse"|"system-systemd|mobile-terminal@ben.service|ben"|"system-systemd|mobile-terminal@bperritt.service|bperritt"|"launchd|com.mobile-terminal.server|powerhouse") ;;
+    "user-systemd|mobile-terminal.service|powerhouse"|"user-systemd|mobile-terminal-proxy.service|powerhouse"|"system-systemd|mobile-terminal@ben.service|ben"|"system-systemd|mobile-terminal@bperritt.service|bperritt"|"system-systemd|mobile-terminal@behuman.service|behuman"|"launchd|com.mobile-terminal.server|powerhouse") ;;
     *) fail "service is not allowlisted for runtime user" ;;
   esac
 
@@ -33,7 +33,16 @@ validate_runtime_tuple() {
       [[ "$ssh_user" == "$runtime_user" ]] || fail "direct service target identity mismatch"
       ;;
     system-systemd)
-      [[ "$ssh_user" == "ubuntu" ]] || fail "system service SSH identity mismatch"
+      # A system unit means installing into another account's home, so which
+      # identity may do it is pinned per host rather than left to whoever holds an
+      # ssh key. lat is reached as ubuntu. On ps the only account with the sudo to
+      # install for another user is powerhouse, and behuman is the single runtime
+      # user it may install for -- the allowlist above is what bounds that pair, so
+      # widening this case alone cannot reach a service that is not already listed.
+      case "$ssh_user|$runtime_user" in
+        "ubuntu|ben"|"ubuntu|bperritt"|"powerhouse|behuman") ;;
+        *) fail "system service SSH identity mismatch" ;;
+      esac
       ;;
   esac
 }
