@@ -1148,6 +1148,16 @@ body[data-keyboard-open="true"] .shortcut-bar {
   box-shadow: var(--shadow);
 }
 
+#sessionMenu {
+  align-content: start;
+  max-height: calc(100dvh - 96px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+}
+
 .tab-menu-button {
   justify-content: flex-start;
   text-align: left;

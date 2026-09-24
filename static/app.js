@@ -9742,6 +9742,8 @@
     const position = clientPointToFixedPosition(left, rect.bottom + 8, geometry);
     sessionMenu.style.left = `${position.left}px`;
     sessionMenu.style.top = `${position.top}px`;
+    // Long session lists scroll inside the menu instead of running off-screen.
+    sessionMenu.style.maxHeight = `${Math.max(120, geometry.viewportHeight - (rect.bottom + 8) - 12)}px`;
   }
 
   function closeSessionMenu() {
